@@ -49,7 +49,7 @@ def load_suiren() -> Qwen3ForCausalLM:
     return model.to(device="cuda:0", dtype=torch.bfloat16).eval()
 
 
-def load_hf():
+def load_hf() -> transformers.PreTrainedModel:
     return transformers.AutoModelForCausalLM.from_pretrained(
         QWEN3_8B,
         dtype=torch.bfloat16,
@@ -78,22 +78,35 @@ def test_golden_alignment():
 
     # 第二阶段:HF 复现(显式关闭采样与 KV cache,与 oracle 路径对齐)
     hf_model = load_hf()
-    for prompt in PROMPTS:
-        hf_ids = hf_tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(
-            "cuda:0"
-        )
-        hf_out = hf_model.generate(
-            hf_ids,
-            do_sample=False,
-            use_cache=False,
-            max_new_tokens=GEN_TOKENS,
-        )
-        hf_new = hf_out[0][hf_ids.shape[1]:].tolist()
-        ours_new = ours_by_prompt[prompt]
+    try:
+        # 逐 prompt 独立判定,一个失败不掩盖其余 prompt 的结果
+        failures: list[str] = []
+        for prompt in PROMPTS:
+            hf_ids = hf_tok(
+                prompt, return_tensors="pt", add_special_tokens=False
+            ).input_ids.to("cuda:0")
+            hf_out = hf_model.generate(
+                hf_ids,
+                do_sample=False,
+                use_cache=False,
+                max_new_tokens=GEN_TOKENS,
+            )
+            hf_new = hf_out[0][hf_ids.shape[1]:].tolist()
+            ours_new = ours_by_prompt[prompt]
 
-        matched = sum(a == b for a, b in zip(hf_new, ours_new))
-        assert matched >= ACCEPT_TOKENS, (
-            f"prompt={prompt!r} matched {matched}/{ACCEPT_TOKENS};\n"
-            f"hf  = {hf_new[:60]}\nours= {ours_new[:60]}"
-        )
-    _free(hf_model)
+            common = min(len(hf_new), len(ours_new))
+            try:
+                assert common >= ACCEPT_TOKENS, (
+                    f"prompt={prompt!r} generated only {common} common tokens"
+                    f" (< {ACCEPT_TOKENS});\n"
+                    f"hf  = {hf_new[:60]}\nours= {ours_new[:60]}"
+                )
+                assert hf_new[:ACCEPT_TOKENS] == ours_new[:ACCEPT_TOKENS], (
+                    f"prompt={prompt!r} first {ACCEPT_TOKENS} tokens diverge;\n"
+                    f"hf  = {hf_new[:ACCEPT_TOKENS]}\nours= {ours_new[:ACCEPT_TOKENS]}"
+                )
+            except AssertionError as e:
+                failures.append(str(e))
+        assert not failures, "\n\n".join(failures)
+    finally:
+        _free(hf_model)
