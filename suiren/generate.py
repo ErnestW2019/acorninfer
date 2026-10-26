@@ -30,8 +30,11 @@ def generate_token_ids(
     stopping, so the result may end with a trailing EOS id.
     """
     if prompt_ids is None:
-        assert tokenizer is not None and prompt is not None
+        if tokenizer is None or prompt is None:
+            raise ValueError("generate_token_ids needs prompt_ids, or both tokenizer and prompt")
         prompt_ids = tokenizer.encode(prompt)
+        if not prompt_ids:
+            raise ValueError("prompt encoded to zero tokens; pass a non-empty prompt")
     device = next(model.parameters()).device
 
     out = list(prompt_ids)
