@@ -18,6 +18,18 @@ def test_generate_tiny_model_runs():
     assert all(0 <= i < 256 for i in ids)
 
 
+def test_generate_stops_on_eos_and_appends_it():
+    torch.manual_seed(0)
+    cfg = Qwen3Config.tiny()
+    model = Qwen3ForCausalLM(cfg).to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.lm_head.weight.zero_()  # 全零 logits → argmax 恒为 0
+    ids = generate_token_ids(
+        model, prompt_ids=[5, 6, 7], max_new_tokens=8, eos_ids=frozenset({0})
+    )
+    assert ids == [5, 6, 7, 0]  # EOS 被追加后立即停止
+
+
 @pytest.mark.slow
 def test_generate_real_model_factual():
     from suiren.weights import load_safetensors

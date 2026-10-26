@@ -22,8 +22,13 @@ def generate_token_ids(
     tokenizer: Tokenizer | None = None,
     prompt: str | None = None,
     max_new_tokens: int = 64,
+    eos_ids: frozenset[int] = EOS_IDS,
 ) -> list[int]:
-    """Generate greedily; returns prompt ids + generated ids (prompt included)."""
+    """Generate greedily; returns prompt ids + generated ids (prompt included).
+
+    Mirrors HF semantics: a generated EOS id is APPENDED to the output before
+    stopping, so the result may end with a trailing EOS id.
+    """
     if prompt_ids is None:
         assert tokenizer is not None and prompt is not None
         prompt_ids = tokenizer.encode(prompt)
@@ -34,7 +39,7 @@ def generate_token_ids(
         input_ids = torch.tensor([out], device=device, dtype=torch.long)
         logits = model(input_ids)
         next_id = int(logits[0, -1].argmax())
-        if next_id in EOS_IDS:
-            break
         out.append(next_id)
+        if next_id in eos_ids:
+            break
     return out
