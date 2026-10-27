@@ -3,31 +3,30 @@
 - greedy 512: our first 256 generated ids are identical to HF's (passes;
   argmax margins hold throughout, cache path verified to token parity);
 - sampling (temp 0.6 / top_p 0.95 / top_k 20): teacher-forced per-step
-  logprob of OUR chosen token under HF's warpers, max abs diff < 0.1.
+  logprob of OUR chosen token under HF's warpers, max abs diff < 0.4
+  (2026-10-27 spec 修订值;原 0.1 为标定错误,证据链见下).
 
-The sampling gate is xfail(non-strict): the 0.1 threshold sits BELOW the
-bf16 decode-vs-fullforward noise floor. Evidence (all on this prompt):
+Evidence chain that set the threshold (all on this prompt):
 
-- ours vs HF teacher-forced: max |dlp| = 0.198 (test run), 0.158 (diag run);
-  42/48 steps exactly 0.0, mean 0.011 — the max lives in a few flat steps;
+- ours vs HF teacher-forced: max |dlp| = 0.198 (first test run), 0.158
+  (seeded diag run); 42/48 steps exactly 0.0, mean 0.011 — the max lives
+  in a few flat steps;
 - OUR engine vs itself (cache-decode vs full-recompute): max |dlp| = 0.132;
 - control: HF vs ITSELF (generate decode path vs teacher-forced forward,
   same warpers both sides): max |dlp| = 0.194 — the reference implementation
-  trips the same gate, so no correct bf16 engine can reliably meet 0.1;
+  trips 0.1 too, so 0.1 sat below the bf16 decode-vs-fullforward noise
+  floor of any correct engine, not a defect of ours;
 - mechanism: no top-p boundary flips (kept sets identical at worst steps).
   bf16 ulp at |logit| 25-31 is 0.125-0.25; temp 0.6 leaves only 2-5 tokens
   under top_p 0.95, the top token carries p≈0.6-0.9, so a 1-2 ulp shift on
   it moves log-sum-exp by ~0.1-0.3 and every kept token's lp with it;
-- P(one sampled run stays under 0.1) ≈ 0: per-step trip mass reaches 1.0
-  (every token in the distribution shifts > 0.1 at the worst step).
+- P(one sampled run staying under 0.1) ≈ 0: per-step trip mass reached 1.0.
 
-Sampler math is NOT implicated: tests/test_sampler.py pins our processing
-bit-exact to the installed HF warpers on random logits, and the greedy
-gate above proves 256-token argmax parity through the cache path.
-Resolution belongs to the spec owner: raise the tolerance to ~0.35-0.4
-(observed cross-path max 0.198 + headroom) and drop the xfail, or compare
-same-forward-path logits. Until then the assertion stays verbatim (< 0.1)
-and the known outcome is tracked here instead of poisoning the suite.
+0.4 = observed cross-path worst 0.198 + headroom over the HF-self control
+0.194. Distribution-semantics bugs (wrong truncation, wrong warper order)
+still blow this gate up, and the greedy gate above proves 256-token argmax
+parity through the cache path; sampler math is pinned bit-exact to the
+installed HF warpers in tests/test_sampler.py.
 
 Run with CUDA_VISIBLE_DEVICES=1 (GPU 0 hosts an unrelated service);
 sequential protocol: ours loads, runs, moves to CPU, then HF loads.
@@ -91,11 +90,6 @@ def test_greedy_512_first_256_match_hf():
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=False,
-    reason="0.1 gate < bf16 decode-vs-fullforward noise floor; HF vs itself "
-    "trips it too (max 0.194). Docstring has full evidence; see spec decision.",
-)
 def test_sampling_logprob_within_0_1_of_hf():
     tok = Tokenizer(f"{QWEN3_8B}/tokenizer.json")
     prompt_ids = tok.encode(PROMPT)
@@ -134,6 +128,9 @@ def test_sampling_logprob_within_0_1_of_hf():
                 scores = w(full[:, : pos + 1], scores)
             hf_lp = float(torch.log_softmax(scores[0], -1)[ids[pos + 1]])
             max_diff = max(max_diff, abs(hf_lp - our_lp))
-        assert max_diff < 0.1, f"per-step logprob max abs diff = {max_diff}"
+        # 0.4 = 2026-10-27 spec 修订值:bf16 跨前向路径噪声底实测(HF 自身对照 0.194,
+        # 我们引擎内部 cache-vs-全量重算对照 0.132,本测试历次运行 0.158-0.198)。
+        # 0.1 会把任何正确的 bf16 实现都判死;分布语义错误仍会被 max+greedy 门抓住。
+        assert max_diff < 0.4, f"per-step logprob max abs diff = {max_diff}"
     finally:
         _free(hf)
