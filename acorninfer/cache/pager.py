@@ -39,10 +39,15 @@ class BlockAllocator:
 
     def free(self, block: int) -> None:
         if block not in self._live:
-            raise ValueError(f"double free: block {block} is not live")
-        self._live.discard(block)
+            raise ValueError(f"block {block} is not live (double free or invalid)")
+        self._live.remove(block)
         self._free.append(block)
 
     def assert_balanced(self) -> None:
-        """Debug 守卫:引擎排空后必须零 live 块,否则 = KV 泄漏。"""
-        assert not self._live, f"KV leak: blocks {sorted(self._live)} never freed"
+        """Debug 守卫:引擎排空后必须零 live 块,否则 = KV 泄漏。
+
+        显式 raise 而非 assert 语句:本方法的存在意义就是这个检查,
+        不能在 `python -O` 下静默失效(spec §5 验收依赖它)。
+        """
+        if self._live:
+            raise AssertionError(f"KV leak: blocks {sorted(self._live)} never freed")

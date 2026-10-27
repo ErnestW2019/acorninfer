@@ -77,3 +77,14 @@ class EngineConfig:
     page_size: int = 16
     max_running: int = 8        # decode batch 上限
     watermark_blocks: int = 8   # 水位:free 低于此值不再准入,降低抢占概率
+
+    def __post_init__(self) -> None:
+        # CLI(Task 10 bench/server)直接透传参数,坏值在构造期爆掉而非运行期排队卡死
+        if self.num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {self.num_blocks}")
+        if self.page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {self.page_size}")
+        if self.max_running < 1:
+            raise ValueError(f"max_running must be >= 1, got {self.max_running}")
+        if self.watermark_blocks < 0:
+            raise ValueError(f"watermark_blocks must be >= 0, got {self.watermark_blocks}")
