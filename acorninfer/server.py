@@ -17,6 +17,8 @@
 - ChatML 硬编码(运行时不 import transformers/jinja);temperature=0 走
   executor 的贪心分支(OpenAI 语义);SamplingParams 在 pydantic 边界校验
   (temperature>=0、top_p>0、top_k>=0、max_tokens>=1),坏参数到不了引擎。
+- 兼容性声明:`max_completion_tokens` 与 `stop` 接受但忽略(声明式子集,
+  前者落到默认 max_tokens=16);id 仅进程内唯一。
 """
 
 from __future__ import annotations
@@ -80,8 +82,10 @@ def render_chat(messages: list[ChatMessage]) -> str:
 class _Detok:
     """流式增量解码:每次 decode(至今全部 id),取相对上次的增量后缀。
 
-    参考规模可接受;真实 BPE 的多字节字符中间态可能停一拍(delta 为空,
-    下一个 token 追平)—— 只迟不丢、不重复。
+    真实 ByteLevel 解码对跨 token 切碎的多字节字符会先产出 U+FFFD 中间态;
+    中间态一律扣发(不发、不推进基线),拼完整后再发 —— 否则客户端收到
+    \\ufffd 且真实字符会被对齐逻辑吞掉。代价:流末尾恰为孤立坏字节时该字符
+    不发(合法 UTF-8 流不触发)。参考规模可接受;只迟不丢、不重复。
     """
 
     def __init__(self, tokenizer):
@@ -92,6 +96,8 @@ class _Detok:
     def push(self, token_id: int) -> str:
         self._ids.append(int(token_id))
         text = self._tok.decode(self._ids)
+        if text.endswith("\ufffd"):
+            return ""  # 中间态:扣发
         delta = text[len(self._text) :] if text.startswith(self._text) else ""
         self._text = text
         return delta
@@ -119,6 +125,7 @@ def create_app(engine: Engine) -> FastAPI:
         "abandoned": set(),  # 已弃管未收尾的 seq_id(断连路径,pump 负责收尾 drop)
         "pump": None,  # asyncio.Task | None
         "failure": None,  # 引擎级故障(中毒标记)
+        "reapers": set(),  # 独立收尾任务的强引用(防被 GC)
     }
 
     @asynccontextmanager
@@ -128,6 +135,22 @@ def create_app(engine: Engine) -> FastAPI:
             state["pump"].cancel()
 
     app = FastAPI(title="AcornInfer", lifespan=_lifespan)
+
+    def _on_pump_done(task: asyncio.Task) -> None:
+        """pump 非正常死亡(路由循环 bug 等)必须可见:标 failure 并唤醒等待者。
+
+        中毒路径在 _pump 内已自行设 failure+通知,此处只兜"没接住的异常"。
+        """
+        if task.cancelled():  # lifespan 关停的正常取消
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if state["failure"] is None:
+            state["failure"] = exc
+        for q in state["queues"].values():
+            q.put_nowait(exc)
+        state["queues"].clear()
 
     async def _pump() -> None:
         """唯一 step 驱动方:锁内 查 pending → to_thread(step) → 路由/GC;空闲即退。"""
@@ -164,17 +187,19 @@ def create_app(engine: Engine) -> FastAPI:
         state["queues"][seq_id] = asyncio.Queue()
         if state["pump"] is None or state["pump"].done():
             state["pump"] = asyncio.create_task(_pump(), name="engine-pump")
+            state["pump"].add_done_callback(_on_pump_done)
         return seq_id
 
-    def _submit_or_400(req: CompletionRequest, text: str) -> tuple[int, int]:
-        """持锁下编码+注册;编码为空或引擎拒绝(容量等)→ 400。返回 (seq_id, prompt_len)。"""
+    def _register_or_400(req: CompletionRequest, prompt_ids: list[int]) -> int:
+        """调用方必须已持锁:failure 检查 → submit → 建队列 → 懒启动 pump(防丢唤醒)。
+
+        引擎拒绝(容量等)→ 400。编码在锁外完成(与引擎状态无关,长 prompt
+        不拖累 pump)。
+        """
         if state["failure"] is not None:
             raise HTTPException(status_code=500, detail=f"engine failure: {state['failure']}")
-        prompt_ids = engine.tokenizer.encode(text)
-        if not prompt_ids:
-            raise HTTPException(status_code=400, detail="prompt encoded to zero tokens")
         try:
-            return _register(req, prompt_ids), len(prompt_ids)
+            return _register(req, prompt_ids)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -194,18 +219,45 @@ def create_app(engine: Engine) -> FastAPI:
             if item.finished:
                 return
 
-    async def _release(seq_id: int) -> None:
-        """消费完/断连的收尾:保证每个 finished 序列 exactly-once drop(与 pump GC 互斥)。"""
+    def _release_locked(seq_id: int) -> None:
+        """持锁收尾体:弹队列、标弃管、已 finish 则 drop(与 pump GC 互斥)。"""
+        state["queues"].pop(seq_id, None)
+        if state["failure"] is not None:
+            state["abandoned"].discard(seq_id)  # 引擎已中毒,不碰其状态
+            return
+        state["abandoned"].add(seq_id)  # 先标记:防 pump 先 finish 它而漏 GC
+        seq = engine.seqs.get(seq_id)
+        if seq is not None and seq.is_finished:
+            engine.drop(seq_id)
+            state["abandoned"].discard(seq_id)
+
+    def _spawn_reaper(seq_id: int) -> None:
+        task = asyncio.create_task(_reap(seq_id))
+        state["reapers"].add(task)
+        task.add_done_callback(state["reapers"].discard)
+
+    async def _reap(seq_id: int) -> None:
+        """独立收尾任务:不受请求协程的取消影响,拿到锁即完成清理。"""
         async with state["lock"]:
-            state["queues"].pop(seq_id, None)
-            if state["failure"] is not None:
-                state["abandoned"].discard(seq_id)  # 引擎已中毒,不碰其状态
-                return
-            state["abandoned"].add(seq_id)  # 先标记:防 pump 先 finish 它而漏 GC
-            seq = engine.seqs.get(seq_id)
-            if seq is not None and seq.is_finished:
-                engine.drop(seq_id)
-                state["abandoned"].discard(seq_id)
+            _release_locked(seq_id)
+
+    async def _release(seq_id: int) -> None:
+        """消费完/断连的收尾:每个 finished 序列 exactly-once drop。
+
+        断连取消的杀伤点:uvicorn(ASGI spec 2.3)经 anyio collapsing 取消
+        流式任务,取消会在每个悬挂点反复重投递;而 pump 持锁跨整个前向 ——
+        清理若在此悬挂,会被反复取消而死不成,seq+queue 永久泄漏。对策:
+        锁被占时直接转交独立 reap 任务;锁空闲时内联执行(消费完流 → seqs
+        已空,测试的确定性依赖它)。若在悬挂点被取消,同样转交 reap。
+        """
+        if state["lock"].locked():
+            _spawn_reaper(seq_id)
+            return
+        try:
+            async with state["lock"]:
+                _release_locked(seq_id)
+        except asyncio.CancelledError:
+            _spawn_reaper(seq_id)
 
     async def _collect(seq_id: int) -> tuple[list[int], str | None]:
         """非流式:收齐全部输出;释放放调用方 finally(异常路径也要释放)。"""
@@ -285,13 +337,25 @@ def create_app(engine: Engine) -> FastAPI:
             await _release(seq_id)
 
     @app.get("/health")
-    def health() -> dict:
+    def health():
+        if state["failure"] is not None:
+            # 中毒后必须可见,让监控/编排在位重启,而不是永远返回绿色
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "error": str(state["failure"])},
+            )
         return {"ok": True}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
+        prompt_ids = engine.tokenizer.encode(render_chat(req.messages))
+        if not prompt_ids:
+            raise HTTPException(status_code=400, detail="prompt encoded to zero tokens")
+        prompt_len = len(prompt_ids)
         async with state["lock"]:
-            seq_id, prompt_len = _submit_or_400(req, render_chat(req.messages))
+            seq_id = _register_or_400(req, prompt_ids)
         created = int(time.time())
         if req.stream:
             return StreamingResponse(
@@ -319,8 +383,12 @@ def create_app(engine: Engine) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(req: PromptCompletionRequest):
+        prompt_ids = engine.tokenizer.encode(req.prompt)
+        if not prompt_ids:
+            raise HTTPException(status_code=400, detail="prompt encoded to zero tokens")
+        prompt_len = len(prompt_ids)
         async with state["lock"]:
-            seq_id, prompt_len = _submit_or_400(req, req.prompt)
+            seq_id = _register_or_400(req, prompt_ids)
         created = int(time.time())
         if req.stream:
             return StreamingResponse(
@@ -360,7 +428,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(prog="acorninfer-server")
     parser.add_argument("--model-dir", default="/home/ernest/model-weight/Qwen3-8B")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-blocks", type=int, default=1024)

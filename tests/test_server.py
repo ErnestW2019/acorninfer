@@ -13,8 +13,9 @@ import torch
 from httpx import ASGITransport, AsyncClient
 
 from acorninfer.engine.engine import Engine
+from acorninfer.engine.executor import Executor
 from acorninfer.generate import generate_cached
-from acorninfer.server import ChatMessage, create_app, render_chat
+from acorninfer.server import ChatMessage, _Detok, create_app, render_chat
 
 pytestmark = pytest.mark.anyio  # anyio 自带 pytest 插件,零新依赖(asyncio 后端)
 
@@ -198,3 +199,76 @@ async def test_four_concurrent_streams_match_greedy_reference(client, engine, ti
     assert list(texts) == refs
     engine.assert_balanced()
     assert not engine.seqs
+
+
+async def test_cancelled_request_cleans_up(client, engine):
+    """断连取消:handler 的取消在途时,收尾(reap/内联)仍必须完成。
+
+    钉 C1:pump 持锁跨前向,取消重投递曾使 _release 死不干净 → seq+queue
+    永久泄漏。取消后序列被弃管,pump 代为收尾,最终引擎必须归零。
+    """
+    payload = {"prompt": "canc", "max_tokens": 64, "temperature": 0.0}
+    t = asyncio.create_task(client.post("/v1/completions", json=payload))
+    while not engine.seqs:  # 等 register 完成(锁内提交)
+        await asyncio.sleep(0)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    # 收尾是异步完成的(可能走 reap 任务 + 序列跑完剩余 token):轮询到归零
+    for _ in range(500):
+        if not engine.has_pending() and not engine.seqs:
+            break
+        await asyncio.sleep(0.01)
+    assert not engine.seqs, f"断连后 seqs 残留: {list(engine.seqs)}"
+    engine.assert_balanced()
+
+
+def test_detok_holds_back_replacement_char():
+    """ByteLevel 中间态 U+FFFD 必须扣发:跨 token 切碎的多字节字符不丢不发错。"""
+
+    class FragmentTok:
+        """模拟 from_utf8_lossy:id 1/2 = 「你」的两半,3 = 'a'。"""
+
+        TABLE = {
+            (): "",
+            (1,): "\ufffd",  # 前半:lossy 中间态
+            (1, 2): "你",
+            (1, 2, 3): "你a",
+            (3,): "a",
+        }
+
+        def decode(self, ids):
+            return self.TABLE.get(tuple(ids), "你a")
+
+    d = _Detok(FragmentTok())
+    assert d.push(1) == ""  # 中间态扣发
+    assert d.push(2) == "你"  # 拼完整后一次发出,不丢
+    assert d.push(3) == "a"
+
+
+async def test_engine_poison_500_then_health_503_fast_fail(tiny_model, monkeypatch):
+    """引擎中毒:存活请求 500、/health 转 503(监控可见)、后续请求快速失败。"""
+
+    def boom(self, seq, view):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(Executor, "prefill", boom)
+    eng = Engine(
+        tiny_model,
+        tokenizer=FakeTok(),
+        num_blocks=64,
+        page_size=4,
+        max_running=4,
+        watermark_blocks=0,
+    )
+    # 中毒是终态,标准 fixture 的"归零"teardown 不适用 → 本地建 client
+    async with AsyncClient(
+        transport=ASGITransport(create_app(eng)), base_url="http://test"
+    ) as c:
+        r = await c.post("/v1/completions", json={"prompt": "x", "max_tokens": 2})
+        assert r.status_code == 500
+        assert "kaboom" in r.json()["detail"]
+        h = await c.get("/health")
+        assert h.status_code == 503
+        r2 = await c.post("/v1/completions", json={"prompt": "y", "max_tokens": 2})
+        assert r2.status_code == 500  # 快速失败,不再触碰中毒引擎
