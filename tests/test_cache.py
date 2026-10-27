@@ -30,6 +30,14 @@ def test_update_concatenates_per_layer():
     assert torch.equal(v_full[:, :, 3:], v2)
 
 
+def test_chunked_prefill_multi_token_append():
+    cache = KVCache(num_layers=1)
+    cache.update(0, torch.randn(*shape(3)), torch.randn(*shape(3)))
+    k_full, v_full = cache.update(0, torch.randn(*shape(2)), torch.randn(*shape(2)))
+    assert k_full.shape == shape(5)
+    assert cache.seq_len == 5
+
+
 def test_layers_are_independent():
     # 两层各自 update、互不干扰;seq_len 以 layer 0 为准,
     # 各层长度一致是调用方(模型)的职责,cache 不做断言。

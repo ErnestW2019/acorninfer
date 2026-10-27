@@ -25,6 +25,11 @@ class KVCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append this layer's new K/V; returns the full cached K/V.
 
+        Aliasing contract: the FIRST append stores k_new/v_new by reference (no
+        clone) — callers must not mutate or reuse their input buffers afterwards.
+        Returned tensors alias internal storage and go stale after the next
+        append to the same layer.
+
         k_new/v_new: [1, kv_heads, new_len, head_dim]
         returns:     [1, kv_heads, past_len + new_len, head_dim]
         """

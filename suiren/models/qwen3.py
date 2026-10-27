@@ -87,7 +87,8 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, hidden, cos, sin):
+    def forward(self, hidden, cos, sin, cache=None, layer_idx=0):
+        # cos/sin 由 Qwen3ForCausalLM.rope 预计算,全层共享
         b, s, _ = hidden.shape
         q = self.q_proj(hidden).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -98,10 +99,26 @@ class Qwen3Attention(nn.Module):
 
         q, k = _apply_rope(q, k, cos, sin)
 
+        if cache is not None:
+            k, v = cache.update(layer_idx, k, v)  # k/v 变为全量 [1, kv, past+s, d]
+        past_len = k.shape[2] - s
+
         k = _repeat_kv(k, self.num_heads // self.num_kv_heads)
         v = _repeat_kv(v, self.num_heads // self.num_kv_heads)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if past_len == 0:
+            # prefill:cache 空时左上对齐 == 右下对齐,flash 友好
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=(s > 1))
+        elif s == 1:
+            # decode:单 query,新 K/V 已在 cache 里,全可见 == 正确掩码
+            out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # 非空 cache + 多 token:显式右下对齐掩码
+            q_pos = torch.arange(past_len, past_len + s, device=q.device)
+            kv_pos = torch.arange(past_len + s, device=q.device)
+            mask = q_pos[:, None] >= kv_pos[None, :]  # True = 允许 attend
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
 
@@ -125,8 +142,8 @@ class Qwen3Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
-    def forward(self, hidden, cos, sin):
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin)
+    def forward(self, hidden, cos, sin, cache=None, layer_idx=0):
+        hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin, cache, layer_idx)
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
@@ -141,15 +158,20 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.rope_theta)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """input_ids: [batch, seq] -> logits: [batch, seq, vocab] (float32)."""
+    def forward(self, input_ids: torch.Tensor, cache=None) -> torch.Tensor:
+        """input_ids: [batch, seq] -> logits: [batch, seq, vocab] (float32).
+
+        cache=None: 全量前向(M0 oracle 路径)。传入 KVCache 时为增量路径:
+        位置由 cache.seq_len 推导,prefill(cache 空)与 decode(cache 非空)共用。
+        """
         s = input_ids.shape[1]
-        positions = torch.arange(s, device=input_ids.device)
+        past_len = 0 if cache is None else cache.seq_len
+        positions = torch.arange(past_len, past_len + s, device=input_ids.device)
         dtype = self.embed_tokens.weight.dtype
         cos, sin = self.rope(positions, dtype, input_ids.device)
         hidden = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            hidden = layer(hidden, cos, sin)
+        for i, layer in enumerate(self.layers):
+            hidden = layer(hidden, cos, sin, cache, i)
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()
 
