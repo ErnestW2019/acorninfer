@@ -4,7 +4,7 @@
 
 > 工作名:当前仓库名 `suiren` 为工作名,正式名待定,改名成本低。
 
-状态:设计文档见 `docs/superpowers/specs/`,当前进行 M0。
+状态:设计文档见 `docs/superpowers/specs/`;M0、M1 已完成(tag `m0-acceptance` / `m1-acceptance`),当前准备 M2。
 
 ## M0 用法
 

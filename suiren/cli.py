@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import time
 
-import torch
-
 from suiren.generate import generate_cached
 from suiren.models.qwen3 import from_pretrained
 from suiren.sampler import Sampler, SamplingParams
