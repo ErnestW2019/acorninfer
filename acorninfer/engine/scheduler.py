@@ -50,11 +50,14 @@ class Scheduler:
         抢占循环来不及反应),因此准入预算必须预留这部分(reserve);
         watermark 只是额外策略余量,不再承担正确性。
         """
-        # 抢占:保证每个 running 序列本轮 decode 至多再要 1 块
+        # 抢占:保证每个 running 序列本轮 decode 至多再要 1 块。
+        # 判定用 >= 而非 >:T==S 时本轮 decode 恰好填满页(不分配),但下一轮
+        # 必分配;提前计入 deficit 是保守预留(宁早抢占,勿步内 BlockExhausted)。
+        # T>S(如刚 prefill 完、T=S+1)则是本轮真实要块,漏记必崩。
         preempted_ids: set[int] = set()
         while True:
             deficit = sum(
-                1 for s in self.running if s.num_tokens == s.num_pages * self.page_size
+                1 for s in self.running if s.num_tokens >= s.num_pages * self.page_size
             )
             if self.allocator.num_free >= deficit:
                 break
