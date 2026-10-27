@@ -30,6 +30,20 @@ def test_cached_returns_prompt_and_logprobs_empty_when_greedy():
     assert lps == []
 
 
+def test_sampler_path_call_shape_and_alignment():
+    """Task 7 前 pin 住 sampler 的调用形状与 step_logprobs 对齐契约。"""
+
+    class StubSampler:
+        def sample(self, logits):
+            assert logits.shape == (256,) and logits.dtype == torch.float32
+            return int(logits.argmax()), -0.5
+
+    model = tiny_model()
+    ids, lps = generate_cached(model, prompt_ids=[5, 6, 7], max_new_tokens=4, sampler=StubSampler())
+    assert len(lps) == len(ids) - 3  # 1:1 对齐:每个生成 token 一条 logprob
+    assert lps == [-0.5] * len(lps)
+
+
 @pytest.mark.slow
 def test_cached_greedy_matches_oracle_real_model():
     """真实权重上 cached == oracle:cache 正确性的最强证明。"""

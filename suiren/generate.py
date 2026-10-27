@@ -1,7 +1,8 @@
-"""Greedy generation without a KV cache (M0).
+"""Generation loops for suiren.
 
-Each step re-runs the full sequence: O(n^2) total, correct and simple.
-The KV-cache path replaces this in M1; this loop is the golden oracle.
+`generate_token_ids` is the M0 full-recompute oracle (O(n^2)); it stays as the
+golden reference. `generate_cached` is the M1 KV-cache path (O(n)): prefill
+once, then decode step by step.
 """
 
 from __future__ import annotations
@@ -66,13 +67,19 @@ def generate_cached(
 
     Returns (ids, step_logprobs): prompt included; step_logprobs holds the
     sampler's logprob for each chosen token (empty list when greedy).
+    With a sampler, step_logprobs[t] is the logprob of generated token t under
+    the sampler's processed distribution (always a float).
     EOS semantics mirror HF: a generated EOS id is appended, then we stop.
+    The cache is consumed by this call: created internally when not supplied;
+    if supplied it must be empty (M2 prefix caching relaxes this).
     """
     if not prompt_ids:
         raise ValueError("prompt_ids must be non-empty")
     device = next(model.parameters()).device
     if cache is None:
         cache = KVCache(num_layers=len(model.layers))
+    else:
+        assert cache.seq_len == 0, "cache must be empty; generate_cached consumes it"
 
     out = list(prompt_ids)
     logprobs: list[float] = []
@@ -85,6 +92,7 @@ def generate_cached(
             next_id, lp = int(last.argmax()), None
         else:
             next_id, lp = sampler.sample(last)
+            assert lp is not None  # sampler 契约:(id, logprob) 恒为 float,防止 step_logprobs 静默错位
         out.append(next_id)
         if lp is not None:
             logprobs.append(lp)
