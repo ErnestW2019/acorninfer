@@ -1,9 +1,11 @@
 """M2 acceptance(spec §4/§5):并发引擎输出正确 + KV 无泄漏。
 
 - 并发 greedy 与逐请求参考(generate_cached,M1 路径)逐 id 一致:一次性提交
-  全部 prompt,小池子(512 块 / max_running 4 / watermark 2)强制批处理并
-  有可能触发抢占 —— 抢占 recompute 必须保真,输出不得因此改变;比较按
-  seq_id 对号,与完成顺序无关;
+  全部 prompt,批处理是常态(4 条同批 prefill,后续步 batch-4 decode,spy
+  钉住 B≥2);比较按 seq_id 对号,与完成顺序无关。本配置下抢占不会发生
+  (池数学:4 条峰值共 ≤11 块 vs 512 块)—— recompute 路径的真实触发与
+  输出保真由 fast 套件 test_engine.py::test_preemption_under_block_pressure
+  在 tiny 模型上验证(同一代码路径);
 - 混合负载 fuzz:20 条随机长度请求分 4 波 mid-flight 插入,全部完成后
   stop_reason 合法、allocator 零 live 块、drop 全部后 engine.seqs 为空。
 
@@ -51,8 +53,8 @@ pytestmark = pytest.mark.slow
 def engine():
     tok = Tokenizer(f"{QWEN3_8B}/tokenizer.json")
     eng = Engine.from_config(
-        # 小池子:max_running 4 强制批处理;512 块对 (128+16)×4 绰绰有余,
-        # watermark 2 是策略余量 —— 批处理是常态,这正是被验收的对象
+        # 512 块 vs 峰值需求 ≤11 块(4×(22+16) token ≈ 3 页/条):批处理是常态、
+        # 抢占结构性不可能 —— 后者由 test_engine 的 3 块压力测试覆盖
         EngineConfig(model_dir=QWEN3_8B, num_blocks=512, max_running=4, watermark_blocks=2),
         tok,
     )
@@ -73,12 +75,26 @@ def test_golden_m2_concurrent_matches_sequential(engine):
     ]
 
     # 并发:全部一次提交,temp=0 走 executor 贪心分支(与参考同为 argmax)
+    # spy:钉住批量 decode 真的以 B>1 发生 —— 若未来调度回归把引擎悄悄
+    # 串行化成 B=1,forward_decode 独有的 bug 会从本门溜过(M3 的回归锚点)
+    batch_sizes: list[int] = []
+    orig_decode = engine.executor.decode_batch
+
+    def spying_decode(seqs, views):
+        batch_sizes.append(len(seqs))
+        return orig_decode(seqs, views)
+
+    engine.executor.decode_batch = spying_decode
     sids = [
         engine.submit(ids, SamplingParams(temperature=0.0), max_tokens=MAX_NEW_TOKENS)
         for ids in prompt_ids
     ]
     while engine.has_pending():
         engine.step()
+    engine.executor.decode_batch = orig_decode
+    assert batch_sizes and max(batch_sizes) >= 2, (
+        f"批量 decode 未发生(batch_sizes={batch_sizes}),验收对象落空"
+    )
 
     # 逐 id 相等,按 seq_id 对号 —— 与完成顺序无关
     for sid, ids, ref in zip(sids, prompt_ids, refs):
@@ -123,8 +139,8 @@ def test_golden_m2_fuzz_no_leak(engine):
         for _ in range(20)
     ]
 
-    # 4 波 × 5 条:波间只跑少量 step,下一波 mid-flight 插入(排队 + 批处理 +
-    # 抢占机会都真实发生),最后排空
+    # 4 波 × 5 条:波间只跑少量 step,下一波 mid-flight 插入(排队 + 批处理
+    # 真实发生;池数学下抢占不会触发,见 module docstring),最后排空
     submitted = 0
     for _ in range(4):
         for _ in range(5):

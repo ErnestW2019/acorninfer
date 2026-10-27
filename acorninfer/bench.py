@@ -27,6 +27,7 @@ import torch
 
 from acorninfer.config import QWEN3_EOS_IDS
 from acorninfer.engine.engine import Engine
+from acorninfer.engine.sequence import Sequence
 from acorninfer.models.qwen3 import from_pretrained
 from acorninfer.sampler import SamplingParams
 from acorninfer.tokenizer import Tokenizer
@@ -46,7 +47,7 @@ def _prompts(count: int, in_tokens: int, vocab: int, seed: int) -> list[list[int
 
 def _run_level(
     engine: Engine, prompts: list[list[int]], out_tokens: int
-) -> dict[int, list]:
+) -> dict[int, "Sequence"]:
     """一次性提交全部请求,驱动到完成,返回 {seq_id: Sequence}。"""
     sids = [
         engine.submit(ids, SamplingParams(temperature=0.0), max_tokens=out_tokens)
