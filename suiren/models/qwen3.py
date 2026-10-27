@@ -44,14 +44,15 @@ class RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, seq_len: int, dtype: torch.dtype, device: torch.device):
-        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+    def forward(self, positions: torch.Tensor, dtype: torch.dtype, device: torch.device):
+        # positions: [q_len] float/int tensor of absolute positions.
+        pos = positions.to(device=device, dtype=torch.float32)
         # `.to(dtype=...)` on the module casts this buffer to bf16; force fp32 back.
         freqs = torch.outer(pos, self.inv_freq.float().to(device))
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos().to(dtype)
         sin = emb.sin().to(dtype)
-        return cos, sin  # [seq_len, head_dim]
+        return cos, sin  # [q_len, head_dim]
 
 
 def _apply_rope(
@@ -85,9 +86,8 @@ class Qwen3Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
-        self.rope = RotaryEmbedding(cfg.head_dim, cfg.rope_theta)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden, cos, sin):
         b, s, _ = hidden.shape
         q = self.q_proj(hidden).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -96,7 +96,6 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos, sin = self.rope(s, hidden.dtype, hidden.device)
         q, k = _apply_rope(q, k, cos, sin)
 
         k = _repeat_kv(k, self.num_heads // self.num_kv_heads)
@@ -126,8 +125,8 @@ class Qwen3Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden))
+    def forward(self, hidden, cos, sin):
+        hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin)
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
@@ -140,12 +139,17 @@ class Qwen3ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(Qwen3Block(cfg) for _ in range(cfg.num_hidden_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.rope = RotaryEmbedding(cfg.head_dim, cfg.rope_theta)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """input_ids: [batch, seq] -> logits: [batch, seq, vocab] (float32)."""
+        s = input_ids.shape[1]
+        positions = torch.arange(s, device=input_ids.device)
+        dtype = self.embed_tokens.weight.dtype
+        cos, sin = self.rope(positions, dtype, input_ids.device)
         hidden = self.embed_tokens(input_ids)
         for layer in self.layers:
-            hidden = layer(hidden)
+            hidden = layer(hidden, cos, sin)
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()
 

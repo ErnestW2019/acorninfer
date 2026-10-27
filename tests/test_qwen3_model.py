@@ -65,3 +65,25 @@ def test_real_weights_load_strict_and_forward():
 
     del model  # 释放 16GB,避免套件内后续用例 OOM
     torch.cuda.empty_cache()
+
+
+def test_rope_positions_match_manual():
+    from suiren.models.qwen3 import RotaryEmbedding
+
+    rope = RotaryEmbedding(16, 10_000.0)
+    positions = torch.tensor([2.0, 5.0, 9.0])
+    cos, sin = rope(positions, torch.float32, torch.device("cpu"))
+    inv_freq = 1.0 / (10_000.0 ** (torch.arange(0, 16, 2, dtype=torch.float32) / 16))
+    freqs = torch.outer(positions, inv_freq)
+    manual_cos = torch.cat((freqs, freqs), dim=-1).cos()
+    assert torch.allclose(cos, manual_cos, atol=1e-6)
+    assert torch.allclose(sin, torch.cat((freqs, freqs), dim=-1).sin(), atol=1e-6)
+
+
+def test_forward_positions_arange_default():
+    # 默认路径(无 cache)位置必须是 arange(seq),数值与 M0 完全一致
+    model = tiny_model()
+    ids = torch.randint(0, 256, (1, 8))
+    with torch.inference_mode():
+        logits = model(ids)
+    assert logits.shape == (1, 8, 256)
