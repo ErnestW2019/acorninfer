@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from suiren.config import Qwen3Config
+from suiren.weights import load_safetensors
 
 
 class RMSNorm(nn.Module):
@@ -152,3 +153,20 @@ class Qwen3ForCausalLM(nn.Module):
 def map_hf_state_dict(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """HF checkpoint names -> our module names (strip the `model.` prefix)."""
     return {name.removeprefix("model."): t for name, t in hf_tensors.items()}
+
+
+def from_pretrained(
+    model_dir: str,
+    device: str = "cuda:0",
+    dtype: torch.dtype = torch.bfloat16,
+) -> Qwen3ForCausalLM:
+    """Load a Qwen3 checkpoint dir.
+
+    CPU build -> strict assign load -> single .to(device) move keeps peak VRAM
+    at one weight copy (init-on-GPU + assign would peak at ~2x on a 24GB card).
+    """
+    cfg = Qwen3Config.from_json(f"{model_dir}/config.json")
+    model = Qwen3ForCausalLM(cfg)
+    mapped = map_hf_state_dict(load_safetensors(model_dir, device="cpu"))
+    model.load_state_dict(mapped, strict=True, assign=True)
+    return model.to(device=device, dtype=dtype).eval()
