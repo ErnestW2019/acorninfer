@@ -4,7 +4,7 @@
 
 > 更名记录:前工作名 `suiren`(燧人)已定名 **AcornInfer**。
 
-状态:设计文档见 `docs/superpowers/specs/`;M0、M1 已完成(tag `m0-acceptance` / `m1-acceptance`),当前准备 M2。
+状态:设计文档见 `docs/superpowers/specs/`;M0、M1、M2 已完成(tag `m0-acceptance` / `m1-acceptance`,M2 tag 由验收流程补)。M2 实测:并发 8 聚合 110.68 tok/s(单流 36.99,见 `docs/benchmarks.md`)。
 
 ## M0 用法
 
@@ -24,4 +24,17 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer generate --prompt "The cap
 
 # 采样(temp/top-p/top-k,镜像 HF warper 顺序)
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer generate --prompt "Once upon a time" --max-new-tokens 64 --temperature 0.6 --top-p 0.95 --top-k 20
+```
+
+## M2 用法(并发引擎 + OpenAI API)
+
+```bash
+# OpenAI 兼容服务(GPU 1)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8001
+curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "你好"}], "max_tokens": 64, "temperature": 0.6
+}'
+
+# 压测:吞吐 / TTFT / TPOT(直连 Engine,不经 HTTP)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 4
 ```
