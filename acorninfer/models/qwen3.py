@@ -122,6 +122,35 @@ class Qwen3Attention(nn.Module):
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
 
+    def forward_decode(self, hidden, cos, sin, views, layer_idx):
+        """批量 decode: hidden [B, 1, hidden], cos/sin [B, 1, 1, D]。
+
+        GEMM 批量化(continuous batching 的收益所在);attention 逐序列
+        (KV 长度不同,q_len=1 无需掩码 —— M1 分支 2 的推广)。
+        """
+        B, s, _ = hidden.shape
+        q = self.q_proj(hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # RoPE:每个序列自己的位置;cos/sin 已是 [B,1,1,D],不走 _apply_rope(形状约定不同)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        rep = self.num_heads // self.num_kv_heads
+        outs = []
+        for b, view in enumerate(views):
+            k_full, v_full = view.update(layer_idx, k[b : b + 1], v[b : b + 1])
+            k_full = _repeat_kv(k_full, rep)
+            v_full = _repeat_kv(v_full, rep)
+            outs.append(F.scaled_dot_product_attention(q[b : b + 1], k_full, v_full))
+        out = torch.cat(outs, dim=0)                 # [B, H, 1, D]
+        out = out.transpose(1, 2).reshape(B, s, -1)
+        return self.o_proj(out)
+
 
 class Qwen3MLP(nn.Module):
     def __init__(self, cfg: Qwen3Config):
@@ -144,6 +173,13 @@ class Qwen3Block(nn.Module):
 
     def forward(self, hidden, cos, sin, cache=None, layer_idx=0):
         hidden = hidden + self.self_attn(self.input_layernorm(hidden), cos, sin, cache, layer_idx)
+        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        return hidden
+
+    def forward_decode(self, hidden, cos, sin, views, layer_idx):
+        hidden = hidden + self.self_attn.forward_decode(
+            self.input_layernorm(hidden), cos, sin, views, layer_idx
+        )
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
@@ -186,6 +222,24 @@ class Qwen3ForCausalLM(nn.Module):
         if num_logits_to_keep is not None:
             hidden = hidden[:, -num_logits_to_keep:, :]
         return self.lm_head(hidden).float()
+
+    def forward_decode(self, input_ids: torch.Tensor, views) -> torch.Tensor:
+        """批量 decode:input_ids [B, 1] + 每序列的 PagedCacheView -> [B, vocab]。
+
+        每序列位置 = 各自 cache.seq_len(互不相同);新 token 的 K/V 在
+        attention 内写入各自分页块。
+        """
+        B = input_ids.shape[0]
+        positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
+        dtype = self.embed_tokens.weight.dtype
+        cos, sin = self.rope(positions, dtype, input_ids.device)  # [B, head_dim]
+        cos = cos[:, None, None, :]  # [B, 1, 1, D]
+        sin = sin[:, None, None, :]
+        hidden = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.forward_decode(hidden, cos, sin, views, i)
+        hidden = self.norm(hidden)
+        return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
 
 
 def map_hf_state_dict(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
