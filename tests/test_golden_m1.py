@@ -90,7 +90,7 @@ def test_greedy_512_first_256_match_hf():
 
 
 @pytest.mark.slow
-def test_sampling_logprob_within_0_1_of_hf():
+def test_sampling_logprob_within_tolerance_of_hf():
     tok = Tokenizer(f"{QWEN3_8B}/tokenizer.json")
     prompt_ids = tok.encode(PROMPT)
 
