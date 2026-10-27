@@ -11,7 +11,9 @@ def test_top_k_one_is_deterministic_argmax():
     s = Sampler(SamplingParams(temperature=1.0, top_k=1))
     token, lp = s.sample(LOGITS.clone())
     assert token == 0
-    assert pytest.approx(lp, abs=1e-5) == float(F.log_softmax(LOGITS, -1)[0])
+    assert lp == pytest.approx(0.0, abs=1e-6)  # 截断后分布退化,选中 token 携带全部质量
+    # 截断前分布下的 log_softmax 保留为参考对照(不被 sample 返回)
+    assert pytest.approx(float(F.log_softmax(LOGITS, -1)[0]), abs=1e-5) == -0.4951819
 
 
 def test_temperature_scales_logits():

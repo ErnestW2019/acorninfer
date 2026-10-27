@@ -49,14 +49,12 @@ class Sampler:
     def sample(self, logits: torch.Tensor) -> tuple[int, float]:
         """Process -> softmax -> multinomial; returns (token, its logprob).
 
-        The token is drawn from the processed (truncated) distribution, so
-        top_k=1 stays deterministic. The reported logprob is the token's
-        probability under the temperature-scaled distribution *before*
-        top-k/top-p truncation (test_top_k_one pins this: it must equal
-        log_softmax of the unscaled-by-truncation logits, not the degenerate
-        0.0 that a single-survivor renormalization would give).
+        The logprob is under the PROCESSED (truncated) distribution — the same
+        quantity HF's compute_transition_scores reports — so engine-vs-HF
+        per-step logprob comparisons are exact rather than offset by the
+        truncated tail mass.
         """
         processed = self.process(logits)
-        token = int(torch.multinomial(F.softmax(processed, dim=-1), num_samples=1))
-        logprobs = F.log_softmax(logits.float() / self.params.temperature, dim=-1)
+        logprobs = F.log_softmax(processed, dim=-1)
+        token = int(torch.multinomial(logprobs.exp(), num_samples=1))
         return token, float(logprobs[token])
