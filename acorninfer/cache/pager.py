@@ -88,18 +88,20 @@ class PagedKVCache:
 class PagedCacheView:
     """每序列视图:块表 + update()/seq_len,与 M1 KVCache 接口镜像。
 
-    table 与 Sequence.block_table 共享同一 list 对象(engine 负责传递),
-    因此调度器/引擎释放块时清空 seq.block_table 即同时清空视图。
+    长度按层独立记录(forward 每层各调一次 update);seq_len 读 layer 0,
+    与 M1 KVCache"层间锁步、layer 0 为准"的约定一致。
+    table 与 Sequence.block_table 共享同一 list 对象(engine 负责传递;
+    传入副本会在引擎释放/复用块时造成静默的跨序列 KV 污染)。
     """
 
     def __init__(self, cache: PagedKVCache, table: list[int] | None = None):
         self.cache = cache
         self.table: list[int] = table if table is not None else []
-        self._len = 0
+        self._lens: dict[int, int] = {}  # per-layer written length
 
     @property
     def seq_len(self) -> int:
-        return self._len
+        return self._lens.get(0, 0)
 
     def update(
         self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor
@@ -111,10 +113,11 @@ class PagedCacheView:
         c = self.cache
         s = k_new.shape[2]
         page = c.page_size
-        needed = (self._len + s + page - 1) // page
+        base = self._lens.get(layer_idx, 0)
+        needed = (base + s + page - 1) // page
         while len(self.table) < needed:
             self.table.append(c.allocator.allocate())
-        pos = torch.arange(self._len, self._len + s)
+        pos = torch.arange(base, base + s)
         # dtype=torch.long 必须显式:s=0 时空 list 会默认造出 float 张量,当索引会炸
         rows = torch.tensor(
             [self.table[p // page] for p in pos.tolist()], device=c.device, dtype=torch.long
@@ -124,12 +127,12 @@ class PagedCacheView:
         # [kv, s, D] → permute(1,0,2) 后逐 token 对齐(rows[i],slots[i]) <- token i
         c.k_pages[layer_idx][rows, slots] = k_new[0].permute(1, 0, 2).to(c.dtype)
         c.v_pages[layer_idx][rows, slots] = v_new[0].permute(1, 0, 2).to(c.dtype)
-        self._len += s
+        self._lens[layer_idx] = base + s
         return self._gather(layer_idx, c.k_pages), self._gather(layer_idx, c.v_pages)
 
     def _gather(self, layer_idx: int, pages: list[torch.Tensor]) -> torch.Tensor:
         c = self.cache
         # dtype=torch.long 与 update 的 rows 对称:空表时 torch.tensor([]) 会默认 float
         t = pages[layer_idx][torch.tensor(self.table, device=c.device, dtype=torch.long)]
-        t = t.reshape(-1, c.num_kv_heads, c.head_dim)[: self._len]       # [len, kv, D]
+        t = t.reshape(-1, c.num_kv_heads, c.head_dim)[: self._lens.get(layer_idx, 0)]
         return t.permute(1, 0, 2)[None]                                  # [1, kv, len, D]

@@ -1,6 +1,14 @@
 import pytest
+import torch
 
-from acorninfer.cache.pager import BlockAllocator, BlockExhausted
+from acorninfer.cache.pager import BlockAllocator, BlockExhausted, PagedCacheView, PagedKVCache
+
+PAGE = 4  # 小页方便测试跨页
+
+
+def make_cache(num_blocks=4, kv_heads=2, head_dim=8, layers=2):
+    alloc = BlockAllocator(num_blocks)
+    return PagedKVCache(layers, kv_heads, head_dim, PAGE, alloc, "cpu", torch.float32)
 
 
 def test_allocate_returns_unique_blocks_then_exhausts():
@@ -38,18 +46,6 @@ def test_assert_balanced_detects_leak():
     a.assert_balanced()  # 不抛
 
 
-import torch
-
-from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
-
-PAGE = 4  # 小页方便测试跨页
-
-
-def make_cache(num_blocks=4, kv_heads=2, head_dim=8, layers=2):
-    alloc = BlockAllocator(num_blocks)
-    return PagedKVCache(layers, kv_heads, head_dim, PAGE, alloc, "cpu", torch.float32)
-
-
 def test_view_update_grows_and_gathers_like_concat():
     cache = make_cache()
     view = PagedCacheView(cache)
@@ -70,15 +66,18 @@ def test_view_update_grows_and_gathers_like_concat():
 
 
 def test_pages_independent_across_layers_and_views():
+    """层间与视图间互不串扰;seq_len 读 layer 0(M1 KVCache 锁步约定)。"""
     cache = make_cache()
     va, vb = PagedCacheView(cache), PagedCacheView(cache)
     ka = torch.randn(1, 2, 2, 8)
     va.update(0, ka, torch.randn(1, 2, 2, 8))
     kb = torch.randn(1, 2, 5, 8)
-    vb.update(1, kb, torch.randn(1, 2, 5, 8))  # 另一层,互不干扰
-    assert va.seq_len == 2 and vb.seq_len == 5
-    k_back, _ = va.update(0, torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8))
-    assert torch.equal(k_back[:, :, :2], ka)  # 另一 view 的写入不影响本 view
+    vb.update(1, kb, torch.randn(1, 2, 5, 8))  # vb 只写了 layer 1
+    assert va.seq_len == 2 and vb.seq_len == 0  # seq_len 以 layer 0 为准
+    k1, _ = vb.update(1, torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8))
+    assert torch.equal(k1[:, :, :5], kb)  # vb 的 layer-1 数据完好,新 token 接在其后
+    k0, _ = va.update(0, torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8))
+    assert torch.equal(k0[:, :, :2], ka)  # 另一 view 的写入不影响本 view
 
 
 def test_gather_matches_naive_concat_exactly():
@@ -105,3 +104,20 @@ def test_view_allocation_exhausts_pool():
     for b in view.table:
         alloc.free(b)
     alloc.assert_balanced()
+
+
+def test_update_retry_after_exhaustion_is_coherent():
+    """耗尽 → 释放 → 重试:零部分写入、无重复写(Task 8 抢占-重准入路径依赖)。"""
+    alloc = BlockAllocator(2)
+    cache = PagedKVCache(2, 2, 8, PAGE, alloc, "cpu", torch.float32)
+    view = PagedCacheView(cache)
+    with pytest.raises(BlockExhausted):
+        view.update(0, torch.randn(1, 2, 9, 8), torch.randn(1, 2, 9, 8))
+    assert view.seq_len == 0  # 中断的 update 未提交任何长度
+    for b in view.table:
+        alloc.free(b)
+    view.table.clear()
+    k = torch.randn(1, 2, 6, 8)
+    k_full, _ = view.update(0, k, torch.randn(1, 2, 6, 8))
+    assert view.seq_len == 6
+    assert torch.equal(k_full, k)  # 重试写入正确,无残留脏数据
