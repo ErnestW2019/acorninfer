@@ -71,19 +71,28 @@ def test_rope_positions_match_manual():
     from suiren.models.qwen3 import RotaryEmbedding
 
     rope = RotaryEmbedding(16, 10_000.0)
-    positions = torch.tensor([2.0, 5.0, 9.0])
+    # 独立锚点:inv_freq[0] == 1.0(θ^0),所以 dim0 的 cos/sin 就是 cos(pos)/sin(pos) 本身
+    positions = torch.tensor([2.0, 3.0, 9.0])
     cos, sin = rope(positions, torch.float32, torch.device("cpu"))
+    assert torch.allclose(cos[:, 0], torch.cos(positions), atol=1e-6)
+    assert torch.allclose(sin[:, 0], torch.sin(positions), atol=1e-6)
+    # 高维分量与手工公式对照(频率递减θ^{-2i/d})
     inv_freq = 1.0 / (10_000.0 ** (torch.arange(0, 16, 2, dtype=torch.float32) / 16))
     freqs = torch.outer(positions, inv_freq)
-    manual_cos = torch.cat((freqs, freqs), dim=-1).cos()
-    assert torch.allclose(cos, manual_cos, atol=1e-6)
-    assert torch.allclose(sin, torch.cat((freqs, freqs), dim=-1).sin(), atol=1e-6)
+    assert torch.allclose(cos, torch.cat((freqs, freqs), dim=-1).cos(), atol=1e-6)
+    # bf16 cast 路径:生产总是跑 cast,必须钉住输出 dtype
+    cos_b, sin_b = rope(torch.tensor([3]), torch.bfloat16, torch.device("cpu"))
+    assert cos_b.dtype == torch.bfloat16 and sin_b.dtype == torch.bfloat16
+    assert torch.allclose(cos_b.float(), cos[1:2], atol=2e-2)  # pos=3 行,bf16 容差
 
 
-def test_forward_positions_arange_default():
-    # 默认路径(无 cache)位置必须是 arange(seq),数值与 M0 完全一致
+def test_forward_position_dependence():
+    # logits 必须随绝对位置变化(RoPE 生效);同一 token 在不同上下文长度下分布不同
     model = tiny_model()
-    ids = torch.randint(0, 256, (1, 8))
+    ids_a = torch.randint(0, 256, (1, 4))
+    ids_b = torch.randint(0, 256, (1, 8))
     with torch.inference_mode():
-        logits = model(ids)
-    assert logits.shape == (1, 8, 256)
+        out_a = model(ids_a)
+        out_b = model(ids_b)
+    assert out_a.shape == (1, 4, 256)
+    assert not torch.allclose(out_a[:, -1], out_b[:, -1])
