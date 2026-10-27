@@ -105,3 +105,27 @@ def test_num_logits_to_keep_matches_full(tiny_model):
     assert kept1.shape == (1, 1, 256)
     torch.testing.assert_close(kept, full[:, -3:])
     torch.testing.assert_close(kept1, full[:, -1:])
+
+
+def test_num_logits_to_keep_k_overshoots_returns_all(tiny_model):
+    """k > seq_len 镜像切片语义:静默返回全量位置(与 HF 一致)。"""
+    ids = torch.randint(0, 256, (1, 8))
+    with torch.inference_mode():
+        full = tiny_model(ids)
+        kept = tiny_model(ids, num_logits_to_keep=99)
+    assert kept.shape == (1, 8, 256)
+    torch.testing.assert_close(kept, full)
+
+
+def test_num_logits_to_keep_cached_prefill(tiny_model):
+    """生产调用形状(prefill: cache + keep=1):末位等价,且不得影响 KV 写入。"""
+    from acorninfer.cache import KVCache
+
+    ids = torch.randint(0, 256, (1, 5))
+    with torch.inference_mode():
+        full = tiny_model(ids)
+        cache = KVCache(tiny_model.cfg.num_hidden_layers)
+        kept = tiny_model(ids, cache, num_logits_to_keep=1)
+    assert kept.shape == (1, 1, 256)
+    torch.testing.assert_close(kept, full[:, -1:])
+    assert cache.seq_len == 5  # 切片只动 lm_head 输入,KV 必须全量入缓存
