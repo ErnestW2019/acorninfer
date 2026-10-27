@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 
+from suiren.cache import KVCache
 from suiren.models.qwen3 import Qwen3ForCausalLM
 from suiren.tokenizer import Tokenizer
 
@@ -46,3 +47,51 @@ def generate_token_ids(
         if next_id in eos_ids:
             break
     return out
+
+
+@torch.inference_mode()
+def generate_cached(
+    model: Qwen3ForCausalLM,
+    prompt_ids: list[int],
+    *,
+    max_new_tokens: int = 64,
+    eos_ids: frozenset[int] = EOS_IDS,
+    sampler=None,
+    cache: KVCache | None = None,
+) -> tuple[list[int], list[float]]:
+    """Prefill/decode generation with a KV cache: O(n) total instead of O(n^2).
+
+    prefill  = one forward over the whole prompt (cache empty -> causal);
+    decode   = one forward per new token (q_len == 1, attends to all cache).
+
+    Returns (ids, step_logprobs): prompt included; step_logprobs holds the
+    sampler's logprob for each chosen token (empty list when greedy).
+    EOS semantics mirror HF: a generated EOS id is appended, then we stop.
+    """
+    if not prompt_ids:
+        raise ValueError("prompt_ids must be non-empty")
+    device = next(model.parameters()).device
+    if cache is None:
+        cache = KVCache(num_layers=len(model.layers))
+
+    out = list(prompt_ids)
+    logprobs: list[float] = []
+
+    # prefill:整段 prompt 一次前向,取最后位置的分布
+    last = model(torch.tensor([out], device=device, dtype=torch.long), cache)[0, -1]
+
+    for _ in range(max_new_tokens):
+        if sampler is None:
+            next_id, lp = int(last.argmax()), None
+        else:
+            next_id, lp = sampler.sample(last)
+        out.append(next_id)
+        if lp is not None:
+            logprobs.append(lp)
+        if next_id in eos_ids:
+            break
+        # decode:单 token 增量前向
+        last = model(torch.tensor([[next_id]], device=device, dtype=torch.long), cache)[
+            0, -1
+        ]
+    return out, logprobs
