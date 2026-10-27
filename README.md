@@ -15,3 +15,13 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m suiren generate --prompt "The capital
 .venv/bin/pytest -v -m "not slow"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/pytest -v -m slow
 ```
+
+## M1 用法(KV cache + 采样)
+
+```bash
+# greedy(KV cache,~O(n))
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m suiren generate --prompt "The capital of France is" --max-new-tokens 32
+
+# 采样(temp/top-p/top-k,镜像 HF warper 顺序)
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m suiren generate --prompt "Once upon a time" --max-new-tokens 64 --temperature 0.6 --top-p 0.95 --top-k 20
+```
