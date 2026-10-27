@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from suiren.config import Qwen3Config
-from suiren.generate import generate_token_ids
-from suiren.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
-from suiren.tokenizer import Tokenizer
+from acorninfer.config import Qwen3Config
+from acorninfer.generate import generate_token_ids
+from acorninfer.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
+from acorninfer.tokenizer import Tokenizer
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 
@@ -32,7 +32,7 @@ def test_generate_stops_on_eos_and_appends_it():
 
 @pytest.mark.slow
 def test_generate_real_model_factual():
-    from suiren.weights import load_safetensors
+    from acorninfer.weights import load_safetensors
 
     cfg = Qwen3Config.from_json(f"{QWEN3_8B}/config.json")
     # CPU 上构建 → assign 加载 CPU 权重 → 再整体上卡,

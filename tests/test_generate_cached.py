@@ -1,11 +1,11 @@
 import pytest
 import torch
 
-from suiren.cache import KVCache
-from suiren.config import Qwen3Config
-from suiren.generate import generate_cached, generate_token_ids
-from suiren.models.qwen3 import Qwen3ForCausalLM, from_pretrained
-from suiren.tokenizer import Tokenizer
+from acorninfer.cache import KVCache
+from acorninfer.config import Qwen3Config
+from acorninfer.generate import generate_cached, generate_token_ids
+from acorninfer.models.qwen3 import Qwen3ForCausalLM, from_pretrained
+from acorninfer.tokenizer import Tokenizer
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 

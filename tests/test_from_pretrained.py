@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from suiren.models.qwen3 import from_pretrained
+from acorninfer.models.qwen3 import from_pretrained
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 

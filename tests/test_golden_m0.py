@@ -18,11 +18,11 @@ import pytest
 import torch
 import transformers
 
-from suiren.config import Qwen3Config
-from suiren.generate import generate_token_ids
-from suiren.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
-from suiren.tokenizer import Tokenizer
-from suiren.weights import load_safetensors
+from acorninfer.config import Qwen3Config
+from acorninfer.generate import generate_token_ids
+from acorninfer.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
+from acorninfer.tokenizer import Tokenizer
+from acorninfer.weights import load_safetensors
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 PROMPTS = [
@@ -41,7 +41,7 @@ def _free(model) -> None:
     torch.cuda.empty_cache()
 
 
-def load_suiren() -> Qwen3ForCausalLM:
+def load_acorninfer() -> Qwen3ForCausalLM:
     cfg = Qwen3Config.from_json(f"{QWEN3_8B}/config.json")
     model = Qwen3ForCausalLM(cfg)  # CPU 构建,避免双份显存峰值
     mapped = map_hf_state_dict(load_safetensors(QWEN3_8B, device="cpu"))
@@ -60,21 +60,21 @@ def load_hf() -> transformers.PreTrainedModel:
 
 @pytest.mark.slow
 def test_golden_alignment():
-    suiren_tok = Tokenizer(f"{QWEN3_8B}/tokenizer.json")
+    acorninfer_tok = Tokenizer(f"{QWEN3_8B}/tokenizer.json")
     hf_tok = transformers.AutoTokenizer.from_pretrained(QWEN3_8B)
 
     # 第一阶段:我们的引擎生成(全量重算 oracle)
     ours_by_prompt = {}
-    suiren_model = load_suiren()
+    acorninfer_model = load_acorninfer()
     for prompt in PROMPTS:
         ids = generate_token_ids(
-            suiren_model,
-            tokenizer=suiren_tok,
+            acorninfer_model,
+            tokenizer=acorninfer_tok,
             prompt=prompt,
             max_new_tokens=GEN_TOKENS,
         )
-        ours_by_prompt[prompt] = ids[len(suiren_tok.encode(prompt)):]
-    _free(suiren_model)
+        ours_by_prompt[prompt] = ids[len(acorninfer_tok.encode(prompt)):]
+    _free(acorninfer_model)
 
     # 第二阶段:HF 复现(显式关闭采样与 KV cache,与 oracle 路径对齐)
     hf_model = load_hf()

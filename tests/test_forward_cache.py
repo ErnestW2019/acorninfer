@@ -1,8 +1,8 @@
 import torch
 
-from suiren.cache import KVCache
-from suiren.config import Qwen3Config
-from suiren.models.qwen3 import Qwen3ForCausalLM
+from acorninfer.cache import KVCache
+from acorninfer.config import Qwen3Config
+from acorninfer.models.qwen3 import Qwen3ForCausalLM
 
 
 def tiny_model() -> Qwen3ForCausalLM:

@@ -1,12 +1,12 @@
-# Suiren(燧人)设计文档
+# AcornInfer 设计文档
 
 日期:2026-10-26
 状态:已评审,待实施
 
 ## 1. 项目概述
 
-Suiren 是一个从零手搓的 LLM 推理引擎。燧人氏钻木取火,是人类第一次从零手搓出
-"torch"——本项目基于 PyTorch,从 tokenization 到 sampling 每一层亲手实现。
+AcornInfer 是一个从零手搓的 LLM 推理引擎。橡子虽小,终成参天橡树——
+本项目基于 PyTorch,从 tokenization 到 sampling 每一层亲手实现。
 
 ### 目标(按优先级排序,分阶段兑现)
 
@@ -98,9 +98,9 @@ bench/      压测工具:吞吐 / TTFT / TPOT,与 vLLM 同卡对比
 ## 7. 代码结构
 
 ```
-suiren/
+acorninfer/
   pyproject.toml
-  suiren/
+  acorninfer/
     config.py           # EngineConfig 等配置
     tokenizers/         # HF tokenizers 封装
     models/
@@ -130,12 +130,14 @@ suiren/
 
 ## 8. 协作方式
 
-- 仓库:`~/github/suiren`,git 管理;
+- 仓库:`~/github/acorninfer`,git 管理;
 - 每个里程碑:写代码与测试 → 跑验收 → 复盘该模块的设计取舍
   (为什么 paged、为什么这样调度),学习目标在此兑现;
 - 性能对照命令与数字随里程碑记录在 `docs/benchmarks.md`。
 
 ## 9. 命名
 
-Suiren(燧人):燧人氏钻木取火,人类第一次从零手搓出火;本项目基于
-PyTorch 从零手搓——取火即取 torch。
+AcornInfer:名字取自橡子(acorn),"Great oaks from little acorns grow"——
+参天橡树生于小小橡实,对应本项目从零手搓、逐层生长的路线。前工作名
+`suiren`(燧人:燧人氏钻木取火,人类第一次从零手搓出火)的"从零手搓"
+精神由新名字的寓意接续。

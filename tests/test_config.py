@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from suiren.config import Qwen3Config
+from acorninfer.config import Qwen3Config
 
 QWEN3_8B = Path("/home/ernest/model-weight/Qwen3-8B")
 

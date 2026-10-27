@@ -1,20 +1,20 @@
-"""`python -m suiren` command-line entry."""
+"""`python -m acorninfer` command-line entry."""
 
 from __future__ import annotations
 
 import argparse
 import time
 
-from suiren.generate import generate_cached
-from suiren.models.qwen3 import from_pretrained
-from suiren.sampler import Sampler, SamplingParams
-from suiren.tokenizer import Tokenizer
+from acorninfer.generate import generate_cached
+from acorninfer.models.qwen3 import from_pretrained
+from acorninfer.sampler import Sampler, SamplingParams
+from acorninfer.tokenizer import Tokenizer
 
 DEFAULT_MODEL = "/home/ernest/model-weight/Qwen3-8B"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="suiren")
+    parser = argparse.ArgumentParser(prog="acorninfer")
     sub = parser.add_subparsers(dest="cmd", required=True)
     gen = sub.add_parser("generate", help="greedy or sampled generation")
     gen.add_argument("--prompt", required=True)

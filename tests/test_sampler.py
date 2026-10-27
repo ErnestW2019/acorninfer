@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from suiren.sampler import Sampler, SamplingParams
+from acorninfer.sampler import Sampler, SamplingParams
 
 LOGITS = torch.tensor([2.0, 1.0, 0.5, -1.0])
 

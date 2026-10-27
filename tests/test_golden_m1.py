@@ -45,10 +45,10 @@ import pytest
 import torch
 import transformers
 
-from suiren.generate import generate_cached
-from suiren.models.qwen3 import from_pretrained
-from suiren.sampler import Sampler, SamplingParams
-from suiren.tokenizer import Tokenizer
+from acorninfer.generate import generate_cached
+from acorninfer.models.qwen3 import from_pretrained
+from acorninfer.sampler import Sampler, SamplingParams
+from acorninfer.tokenizer import Tokenizer
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 PROMPT = "The first three prime numbers are"

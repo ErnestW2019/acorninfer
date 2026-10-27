@@ -1,6 +1,6 @@
 import torch
 
-from suiren.cache import KVCache
+from acorninfer.cache import KVCache
 
 
 def shape(s):

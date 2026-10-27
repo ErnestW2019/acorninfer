@@ -1,4 +1,4 @@
-"""Generation loops for suiren.
+"""Generation loops for acorninfer.
 
 `generate_token_ids` is the M0 full-recompute oracle (O(n^2)); it stays as the
 golden reference. `generate_cached` is the M1 KV-cache path (O(n)): prefill
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import torch
 
-from suiren.cache import KVCache
-from suiren.models.qwen3 import Qwen3ForCausalLM
-from suiren.tokenizer import Tokenizer
+from acorninfer.cache import KVCache
+from acorninfer.models.qwen3 import Qwen3ForCausalLM
+from acorninfer.tokenizer import Tokenizer
 
 EOS_IDS = frozenset({151643, 151645})  # <|endoftext|>, <|im_end|>
 

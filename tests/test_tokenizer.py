@@ -1,4 +1,4 @@
-from suiren.tokenizer import Tokenizer
+from acorninfer.tokenizer import Tokenizer
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 

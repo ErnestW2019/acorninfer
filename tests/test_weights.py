@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from suiren.weights import load_safetensors
+from acorninfer.weights import load_safetensors
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 

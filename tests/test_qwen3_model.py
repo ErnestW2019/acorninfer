@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from suiren.config import Qwen3Config
-from suiren.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
+from acorninfer.config import Qwen3Config
+from acorninfer.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 
@@ -44,7 +44,7 @@ def test_state_dict_matches_hf_key_mapping():
 
 @pytest.mark.slow
 def test_real_weights_load_strict_and_forward():
-    from suiren.weights import load_safetensors
+    from acorninfer.weights import load_safetensors
 
     cfg = Qwen3Config.from_json(f"{QWEN3_8B}/config.json")
     # 模型留在 CPU 上初始化;assign=True 会用加载的张量直接替换参数,
@@ -68,7 +68,7 @@ def test_real_weights_load_strict_and_forward():
 
 
 def test_rope_positions_match_manual():
-    from suiren.models.qwen3 import RotaryEmbedding
+    from acorninfer.models.qwen3 import RotaryEmbedding
 
     rope = RotaryEmbedding(16, 10_000.0)
     # 独立锚点:inv_freq[0] == 1.0(θ^0),所以 dim0 的 cos/sin 就是 cos(pos)/sin(pos) 本身

@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from suiren.config import Qwen3Config
-from suiren.weights import load_safetensors
+from acorninfer.config import Qwen3Config
+from acorninfer.weights import load_safetensors
 
 
 class RMSNorm(nn.Module):
