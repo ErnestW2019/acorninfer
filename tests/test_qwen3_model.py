@@ -7,14 +7,8 @@ from acorninfer.models.qwen3 import Qwen3ForCausalLM, map_hf_state_dict
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 
 
-def tiny_model(device: str = "cpu") -> Qwen3ForCausalLM:
-    torch.manual_seed(0)
-    cfg = Qwen3Config.tiny()
-    return Qwen3ForCausalLM(cfg).to(device=device, dtype=torch.bfloat16)
-
-
-def test_forward_shapes_tiny():
-    model = tiny_model()
+def test_forward_shapes_tiny(tiny_model):
+    model = tiny_model
     ids = torch.randint(0, 256, (1, 8))
     logits = model(ids)
     assert logits.shape == (1, 8, 256)
@@ -22,8 +16,8 @@ def test_forward_shapes_tiny():
     assert torch.isfinite(logits).all()
 
 
-def test_forward_batch_consistency_tiny():
-    model = tiny_model()
+def test_forward_batch_consistency_tiny(tiny_model):
+    model = tiny_model
     torch.manual_seed(1)
     ids = torch.randint(0, 256, (2, 8))
     batched = model(ids)
@@ -33,8 +27,8 @@ def test_forward_batch_consistency_tiny():
     assert torch.equal(batched[1], single1[0])
 
 
-def test_state_dict_matches_hf_key_mapping():
-    model = tiny_model()
+def test_state_dict_matches_hf_key_mapping(tiny_model):
+    model = tiny_model
     # 模拟 HF 命名:去掉 "model." 前缀后必须严格对上
     hf_style = {f"model.{k}": v for k, v in model.state_dict().items()}
     hf_style["lm_head.weight"] = hf_style.pop("model.lm_head.weight")
@@ -87,10 +81,10 @@ def test_rope_positions_match_manual():
     assert torch.allclose(cos_b.float(), cos[1:2], atol=2e-2)  # pos=3 行,bf16 容差
 
 
-def test_forward_position_dependence():
+def test_forward_position_dependence(tiny_model):
     # 因果 + 位置是逐调用 arange:同一前缀在两种上下文长度下,pos=3 的输出必须逐位一致。
     # 这才是"位置正确"的黑盒钉子(绝对位置经相对旋转不可观测,不同输入的对比是空洞断言)。
-    model = tiny_model()
+    model = tiny_model
     torch.manual_seed(1)
     ids_b = torch.randint(0, 256, (1, 8))
     ids_a = ids_b[:, :4].clone()

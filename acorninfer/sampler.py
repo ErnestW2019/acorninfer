@@ -23,7 +23,7 @@ class SamplingParams:
 
 
 class Sampler:
-    def __init__(self, params: SamplingParams):
+    def __init__(self, params: SamplingParams, generator: torch.Generator | None = None):
         if params.temperature <= 0:
             raise ValueError("temperature must be > 0")
         if not (0.0 < params.top_p <= 1.0):
@@ -31,10 +31,14 @@ class Sampler:
         if params.top_k < 0:
             raise ValueError("top_k must be >= 0 (0 disables)")
         self.params = params
+        self.generator = generator
 
     def process(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply temperature -> top-k -> top-p; returns processed [vocab] logits."""
-        logits = logits.float() / self.params.temperature
+        logits = logits.float()
+        if not torch.isfinite(logits).all():
+            raise ValueError("logits contain NaN/inf; model forward is broken")
+        logits = logits / self.params.temperature
         if self.params.top_k > 0:
             top_k = min(self.params.top_k, logits.size(-1))  # Safety check (HF 同款)
             kth = torch.topk(logits, top_k).values[-1]
@@ -58,5 +62,5 @@ class Sampler:
         """
         processed = self.process(logits)
         logprobs = F.log_softmax(processed, dim=-1)
-        token = int(torch.multinomial(logprobs.exp(), num_samples=1))
+        token = int(torch.multinomial(logprobs.exp(), num_samples=1, generator=self.generator))
         return token, float(logprobs[token])

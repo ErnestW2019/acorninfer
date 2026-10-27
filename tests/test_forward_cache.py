@@ -1,17 +1,10 @@
 import torch
 
 from acorninfer.cache import KVCache
-from acorninfer.config import Qwen3Config
-from acorninfer.models.qwen3 import Qwen3ForCausalLM
 
 
-def tiny_model() -> Qwen3ForCausalLM:
-    torch.manual_seed(0)
-    return Qwen3ForCausalLM(Qwen3Config.tiny()).to(dtype=torch.bfloat16)
-
-
-def test_prefill_with_cache_equals_no_cache():
-    model = tiny_model()
+def test_prefill_with_cache_equals_no_cache(tiny_model):
+    model = tiny_model
     ids = torch.randint(0, 256, (1, 8))
     with torch.inference_mode():
         plain = model(ids)
@@ -19,8 +12,8 @@ def test_prefill_with_cache_equals_no_cache():
     torch.testing.assert_close(cached, plain)
 
 
-def test_decode_step_matches_full_forward():
-    model = tiny_model()
+def test_decode_step_matches_full_forward(tiny_model):
+    model = tiny_model
     ids = torch.randint(0, 256, (1, 6))
     with torch.inference_mode():
         full = model(ids)                     # 一次性 6 token
@@ -30,8 +23,8 @@ def test_decode_step_matches_full_forward():
     torch.testing.assert_close(stepped[:, -1], full[:, -1])
 
 
-def test_multi_step_decode_matches_full_forward():
-    model = tiny_model()
+def test_multi_step_decode_matches_full_forward(tiny_model):
+    model = tiny_model
     torch.manual_seed(1)
     ids = torch.randint(0, 256, (1, 6))
     with torch.inference_mode():
@@ -43,9 +36,9 @@ def test_multi_step_decode_matches_full_forward():
     torch.testing.assert_close(last[:, -1], full[:, -1])
 
 
-def test_chunked_prefill_matches_full_forward():
+def test_chunked_prefill_matches_full_forward(tiny_model):
     # 分支 3:非空 cache + 多 token(分块 prefill),显式右下对齐掩码路径
-    model = tiny_model()
+    model = tiny_model
     torch.manual_seed(2)
     ids = torch.randint(0, 256, (1, 5))
     with torch.inference_mode():

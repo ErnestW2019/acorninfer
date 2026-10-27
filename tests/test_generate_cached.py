@@ -2,35 +2,29 @@ import pytest
 import torch
 
 from acorninfer.cache import KVCache
-from acorninfer.config import Qwen3Config
 from acorninfer.generate import generate_cached, generate_token_ids
-from acorninfer.models.qwen3 import Qwen3ForCausalLM, from_pretrained
+from acorninfer.models.qwen3 import from_pretrained
 from acorninfer.tokenizer import Tokenizer
 
 QWEN3_8B = "/home/ernest/model-weight/Qwen3-8B"
 
 
-def tiny_model() -> Qwen3ForCausalLM:
-    torch.manual_seed(0)
-    return Qwen3ForCausalLM(Qwen3Config.tiny()).to(dtype=torch.bfloat16)
-
-
-def test_cached_greedy_matches_oracle_tiny():
-    model = tiny_model()
+def test_cached_greedy_matches_oracle_tiny(tiny_model):
+    model = tiny_model
     with torch.inference_mode():
         oracle = generate_token_ids(model, prompt_ids=[5, 6, 7], max_new_tokens=24)
         cached, _ = generate_cached(model, prompt_ids=[5, 6, 7], max_new_tokens=24)
     assert cached == oracle
 
 
-def test_cached_returns_prompt_and_logprobs_empty_when_greedy():
-    model = tiny_model()
+def test_cached_returns_prompt_and_logprobs_empty_when_greedy(tiny_model):
+    model = tiny_model
     ids, lps = generate_cached(model, prompt_ids=[5, 6, 7], max_new_tokens=4)
     assert ids[:3] == [5, 6, 7]
     assert lps == []
 
 
-def test_sampler_path_call_shape_and_alignment():
+def test_sampler_path_call_shape_and_alignment(tiny_model):
     """Task 7 前 pin 住 sampler 的调用形状与 step_logprobs 对齐契约。"""
 
     class StubSampler:
@@ -38,7 +32,7 @@ def test_sampler_path_call_shape_and_alignment():
             assert logits.shape == (256,) and logits.dtype == torch.float32
             return int(logits.argmax()), -0.5
 
-    model = tiny_model()
+    model = tiny_model
     ids, lps = generate_cached(model, prompt_ids=[5, 6, 7], max_new_tokens=4, sampler=StubSampler())
     assert len(lps) == len(ids) - 3  # 1:1 对齐:每个生成 token 一条 logprob
     assert lps == [-0.5] * len(lps)

@@ -65,3 +65,20 @@ def test_matches_hf_warpers_on_random_logits():
         for w in warpers:
             hf = w(torch.zeros(1, 1, dtype=torch.long), hf)
         assert torch.allclose(ours, hf[0]), f"max diff {(ours - hf[0]).abs().max()}"
+
+
+def test_nan_logits_rejected():
+    s = Sampler(SamplingParams())
+    with pytest.raises(ValueError, match="NaN/inf"):
+        s.process(torch.tensor([1.0, float("nan")]))
+
+
+def test_generator_makes_sampling_reproducible():
+    g1, g2 = torch.Generator().manual_seed(42), torch.Generator().manual_seed(42)
+    s1 = Sampler(SamplingParams(), generator=g1)
+    s2 = Sampler(SamplingParams(), generator=g2)
+    torch.manual_seed(0)
+    logits = torch.randn(1000)
+    seq1 = [s1.sample(logits.clone())[0] for _ in range(8)]
+    seq2 = [s2.sample(logits.clone())[0] for _ in range(8)]
+    assert seq1 == seq2

@@ -10,10 +10,11 @@ from __future__ import annotations
 import torch
 
 from acorninfer.cache import KVCache
+from acorninfer.config import QWEN3_EOS_IDS
 from acorninfer.models.qwen3 import Qwen3ForCausalLM
 from acorninfer.tokenizer import Tokenizer
 
-EOS_IDS = frozenset({151643, 151645})  # <|endoftext|>, <|im_end|>
+EOS_IDS = QWEN3_EOS_IDS  # 兼容别名;新代码请用 acorninfer.config.QWEN3_EOS_IDS
 
 
 @torch.inference_mode()
