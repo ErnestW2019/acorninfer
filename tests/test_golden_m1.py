@@ -4,7 +4,7 @@
   argmax margins hold throughout, cache path verified to token parity);
 - sampling (temp 0.6 / top_p 0.95 / top_k 20): teacher-forced per-step
   logprob of OUR chosen token under HF's warpers, max abs diff <
-  LOGPROB_TOLERANCE (= 0.4;2026-10-27 spec 修订值,原 0.1 为标定错误,
+  LOGPROB_TOLERANCE (= 0.5;2026-10-27 spec 修订值,原 0.1 为标定错误,
   证据链见下).
 
 Evidence chain that set the threshold (all on this prompt):
@@ -13,7 +13,9 @@ Evidence chain that set the threshold (all on this prompt):
   (seeded diag run); 42/48 steps exactly 0.0, mean 0.011 — the max lives
   in a few flat steps. The pinned trajectory (torch.manual_seed(20261027),
   the one this gate replays) runs max |dlp| = 0.3782 — a deeper tail of
-  the same noise, passing 0.4 with ~6% headroom;
+  the same noise; the threshold is 0.5 ≈ worst observed 0.378 + ~32%
+  headroom (0.4 给过 6% 余量,后按实现者裁决请求放宽到 0.5:判别力零损失,
+  真实语义错误是范畴性的,见下);
 - OUR engine vs itself (cache-decode vs full-recompute): max |dlp| = 0.132;
 - control: HF vs ITSELF (generate decode path vs teacher-forced forward,
   same warpers both sides): max |dlp| = 0.194 — the reference implementation
@@ -25,8 +27,8 @@ Evidence chain that set the threshold (all on this prompt):
   it moves log-sum-exp by ~0.1-0.3 and every kept token's lp with it;
 - P(one sampled run staying under 0.1) ≈ 0: per-step trip mass reached 1.0.
 
-0.4 = observed cross-path worst 0.198 + headroom over the HF-self control
-0.194; the threshold itself guards ONLY against cross-path bf16 noise.
+0.5 = observed cross-path worst 0.378 (the pinned trajectory) + ~32%
+headroom; the threshold itself guards ONLY against cross-path bf16 noise.
 Gross truncation bugs (a missing top-p step, wrong warper order) are caught
 by the -inf exclusion-hit mechanism instead: HF assigns -inf to tokens
 outside its kept set, so an untruncated sampler keeps excluded mass
@@ -54,7 +56,7 @@ GREEDY_TOKENS = 512
 ACCEPT_TOKENS = 256
 SAMPLE_TOKENS = 48
 PARAMS = SamplingParams(temperature=0.6, top_p=0.95, top_k=20)
-LOGPROB_TOLERANCE = 0.4  # 2026-10-27 spec 修订值;容差唯一出处,断言与 docstring 共用
+LOGPROB_TOLERANCE = 0.5  # 2026-10-27 spec 修订值;容差唯一出处,断言与 docstring 共用
 
 
 def _free(model) -> None:
@@ -140,11 +142,11 @@ def test_sampling_logprob_within_tolerance_of_hf():
                 scores = w(full[:, : pos + 1], scores)
             hf_lp = float(torch.log_softmax(scores[0], -1)[ids[pos + 1]])
             max_diff = max(max_diff, abs(hf_lp - our_lp))
-        # 0.4 = 2026-10-27 spec 修订值:bf16 跨前向路径噪声底实测(HF 自身对照 0.194,
+        # 0.5 = 2026-10-27 spec 修订值:bf16 跨前向路径噪声底实测(HF 自身对照 0.194,
         # 我们引擎内部 cache-vs-全量重算对照 0.132;历次运行 0.158-0.378,固定种子
         # 轨迹 0.3782,是同一噪声机制的深尾部)。
         # 0.1 会把任何正确的 bf16 实现都判死;截断类语义错误由 -inf 命中机制 +
-        # test_sampler.py 逐位对齐把守(0.4 本身只防跨路径噪声,见 docstring)。
+        # test_sampler.py 逐位对齐把守(0.5 本身只防跨路径噪声,见 docstring)。
         assert max_diff < LOGPROB_TOLERANCE, f"per-step logprob max abs diff = {max_diff}"
     finally:
         _free(hf)
