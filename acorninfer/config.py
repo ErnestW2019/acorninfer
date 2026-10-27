@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 # Qwen3 生成终止符:<|endoftext|>(基座)、<|im_end|>(chat)。
 # 引擎默认值;请求级 eos 覆盖在 Engine.submit 传入。
 QWEN3_EOS_IDS: frozenset[int] = frozenset({151643, 151645})
@@ -62,3 +64,16 @@ class Qwen3Config:
             bos_token_id=0,
             eos_token_id=[1],
         )
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    """Engine-level configuration (M2)."""
+
+    model_dir: str
+    device: str = "cuda:0"
+    dtype: torch.dtype = torch.bfloat16
+    num_blocks: int = 1024      # 物理块数;Qwen3-8B 每块 16 token ≈ 2.3MB(全 36 层)
+    page_size: int = 16
+    max_running: int = 8        # decode batch 上限
+    watermark_blocks: int = 8   # 水位:free 低于此值不再准入,降低抢占概率
