@@ -104,3 +104,41 @@ def test_preemption_under_block_pressure(tiny_model):
     assert [s.all_ids for s in eng.seqs.values()] == [ref1, ref2] or \
            [s.all_ids for s in eng.seqs.values()] == [ref2, ref1]
     eng.assert_balanced()
+
+
+def test_submit_rejects_prompt_over_schedulable_capacity(tiny_model):
+    """拒绝阈值是可调度容量(total - watermark),不是 total。
+
+    回归:落在 (total-watermark, total] 缝隙的 prompt 被接受却永远无法准入
+    (准入预算按 free - watermark 结算)→ 队首饿死,步循环卡死。
+    """
+    eng = Engine(tiny_model, tokenizer=None, num_blocks=8, page_size=4,
+                 max_running=4, watermark_blocks=2)
+    # 8 块 - 水位 2 = 6 块可调度:≤24 token 可入,25+ 必拒绝
+    s = eng.submit(_ids(24, 0), SamplingParams(temperature=0.0), max_tokens=1)
+    eng.step()  # max_tokens=1:prefill 即完成并退休
+    eng.drop(s)  # drop 后 seqs 不留痕(server 的消费后释放契约)
+    assert s not in eng.seqs
+    with pytest.raises(ValueError, match="capacity"):
+        eng.submit(_ids(25, 1), SamplingParams(temperature=0.0), max_tokens=1)
+    # 水位 ≥ 块数的配置直接在构造期拒绝(否则任何 prompt 都无法准入)
+    with pytest.raises(ValueError, match="watermark"):
+        Engine(tiny_model, tokenizer=None, num_blocks=8, page_size=4,
+               max_running=4, watermark_blocks=8)
+
+
+def test_temperature_sampling_end_to_end(engine):
+    """temp>0 走 Sampler 路径:只做结构性断言(全局 RNG,值不可复现)。"""
+    torch.manual_seed(3)
+    s = engine.submit(
+        _ids(5, 2), SamplingParams(temperature=0.8, top_p=0.95), max_tokens=3
+    )
+    for _ in range(4):
+        if not engine.has_pending():
+            break
+        engine.step()
+    seq = engine.seqs[s]
+    assert seq.is_finished and seq.stop_reason == "length"
+    assert len(seq.generated_ids) == 3
+    assert all(0 <= t < 256 for t in seq.generated_ids)
+    engine.assert_balanced()

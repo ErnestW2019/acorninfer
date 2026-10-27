@@ -52,6 +52,10 @@ class Engine:
             dtype,
         )
         self.scheduler = Scheduler(self.allocator, page_size, max_running, watermark_blocks)
+        if watermark_blocks >= num_blocks:
+            raise ValueError(
+                f"watermark_blocks ({watermark_blocks}) must be < num_blocks ({num_blocks})"
+            )
         self.executor = Executor(model)
         self.page_size = page_size
         self.seqs: dict[int, Sequence] = {}
@@ -82,8 +86,16 @@ class Engine:
             raise ValueError("prompt_ids must be non-empty")
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
-        if -(-len(prompt_ids) // self.page_size) > self.allocator.total:
-            raise ValueError("prompt longer than total KV capacity; reject early")
+        # 拒绝阈值必须是"可调度容量"(total - watermark)而非 total:准入预算
+        # 按 free - watermark 结算,落在两者之间的 prompt 会被接受却永远排在
+        # 队首饿死(has_pending 永不清零,server/bench 步循环卡死)
+        capacity = self.allocator.total - self.scheduler.watermark
+        if -(-len(prompt_ids) // self.page_size) > capacity:
+            raise ValueError(
+                f"prompt needs more KV blocks than the schedulable capacity "
+                f"({capacity} = {self.allocator.total} blocks - watermark); "
+                f"it could never be admitted"
+            )
         seq = Sequence(
             seq_id=self._next_id,
             prompt_ids=list(prompt_ids),
@@ -100,29 +112,39 @@ class Engine:
     def step(self) -> list[TokenOutput]:
         prefills, decodes = self.scheduler.schedule()
         outputs: list[TokenOutput] = []
-        for seq in prefills:
-            # 块表共享同一 list 对象:调度器 _release 清空它即同时清空视图
-            view = PagedCacheView(self.cache, seq.block_table)
-            self._views[seq.seq_id] = view
-            token = self.executor.prefill(seq, view)
-            seq.num_pages = len(view.table)
-            self._record(seq, token, outputs)
-        if decodes:
-            views = [self._views[s.seq_id] for s in decodes]
-            tokens = self.executor.decode_batch(decodes, views)
-            for seq, token in zip(decodes, tokens):
-                seq.num_pages = len(self._views[seq.seq_id].table)
+        try:
+            for seq in prefills:
+                # 块表共享同一 list 对象:调度器 _release 清空它即同时清空视图
+                view = PagedCacheView(self.cache, seq.block_table)
+                self._views[seq.seq_id] = view
+                token = self.executor.prefill(seq, view)
+                seq.num_pages = len(view.table)
                 self._record(seq, token, outputs)
-        # 退休:释放已完成序列的块(调度器不退休,见 Scheduler docstring)
-        for seq in [s for s in self.scheduler.running if s.is_finished]:
-            self.scheduler.running.remove(seq)
-            seq.status = RequestStatus.FINISHED
-            self._views.pop(seq.seq_id)  # 视图丢弃;块经共享块表释放
-            for b in seq.block_table:
-                self.allocator.free(b)
-            seq.block_table.clear()
-            seq.num_pages = 0
+            if decodes:
+                views = [self._views[s.seq_id] for s in decodes]
+                tokens = self.executor.decode_batch(decodes, views)
+                for seq, token in zip(decodes, tokens):
+                    seq.num_pages = len(self._views[seq.seq_id].table)
+                    self._record(seq, token, outputs)
+        finally:
+            # 退休放在 finally:即使前向抛异常,已 FINISHED 的序列也必须在本步
+            # 出场 —— 否则僵尸序列下轮会被再次 decode(毒循环)
+            for seq in [s for s in self.scheduler.running if s.is_finished]:
+                self.scheduler.running.remove(seq)
+                seq.status = RequestStatus.FINISHED
+                self._views.pop(seq.seq_id)  # 视图丢弃;块经共享块表释放
+                for b in seq.block_table:
+                    self.allocator.free(b)
+                seq.block_table.clear()
+                seq.num_pages = 0
         return outputs
+
+    def drop(self, seq_id: int) -> None:
+        """消费完结果后释放序列记录(bench/server 负责调用,防 seqs 无界增长)。"""
+        seq = self.seqs.get(seq_id)
+        if seq is not None and not seq.is_finished:
+            raise ValueError(f"seq {seq_id} is still pending; cannot drop")
+        self.seqs.pop(seq_id, None)
 
     def _record(self, seq: Sequence, token_id: int, outputs: list[TokenOutput]) -> None:
         seq.generated_ids.append(token_id)

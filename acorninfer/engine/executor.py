@@ -29,6 +29,12 @@ class Executor:
 
     @staticmethod
     def _sample(seq: Sequence, logits: torch.Tensor) -> int:
-        if seq.sampling.temperature == 0:  # OpenAI 语义:temp=0 即 greedy
+        """temp=0 → greedy(OpenAI 语义,Sampler 拒绝 temp=0,须先分流)。
+
+        temp>0 走全局 RNG(generator=None):同进程多种子序列交织后,
+        单请求不可复现 —— 契约与 Sampler(generator) 的按请求可复现性不同,
+        bench 的确定性测试一律用 temp=0。
+        """
+        if seq.sampling.temperature == 0:
             return int(logits.argmax())
         return Sampler(seq.sampling).sample(logits)[0]
