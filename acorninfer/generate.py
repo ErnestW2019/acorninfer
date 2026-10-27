@@ -85,8 +85,12 @@ def generate_cached(
     out = list(prompt_ids)
     logprobs: list[float] = []
 
-    # prefill:整段 prompt 一次前向,取最后位置的分布
-    last = model(torch.tensor([out], device=device, dtype=torch.long), cache)[0, -1]
+    # prefill:整段 prompt 一次前向,取最后位置的分布(lm_head 只算末位)
+    last = model(
+        torch.tensor([out], device=device, dtype=torch.long),
+        cache,
+        num_logits_to_keep=1,
+    )[0, -1]
 
     for _ in range(max_new_tokens):
         if sampler is None:

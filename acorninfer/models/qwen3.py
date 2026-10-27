@@ -158,11 +158,18 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.rope_theta)
 
-    def forward(self, input_ids: torch.Tensor, cache=None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache=None,
+        num_logits_to_keep: int | None = None,
+    ) -> torch.Tensor:
         """input_ids: [batch, seq] -> logits: [batch, seq, vocab] (float32).
 
         cache=None: 全量前向(M0 oracle 路径)。传入 KVCache 时为增量路径:
         位置由 cache.seq_len 推导,prefill(cache 空)与 decode(cache 非空)共用。
+        num_logits_to_keep: 只对最后 k 个位置算 lm_head(prefill 生成只需末位;
+        None = 全位置,M0 路径不变)。
         """
         s = input_ids.shape[1]
         past_len = 0 if cache is None else cache.seq_len
@@ -173,6 +180,8 @@ class Qwen3ForCausalLM(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden = layer(hidden, cos, sin, cache, i)
         hidden = self.norm(hidden)
+        if num_logits_to_keep is not None:
+            hidden = hidden[:, -num_logits_to_keep:, :]
         return self.lm_head(hidden).float()
 
 

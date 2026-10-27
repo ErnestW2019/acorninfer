@@ -93,3 +93,15 @@ def test_forward_position_dependence(tiny_model):
     assert out_a.shape == (1, 4, 256)
     assert out_b.shape == (1, 8, 256)
     assert torch.equal(out_a[:, -1], out_b[:, 3])
+
+
+def test_num_logits_to_keep_matches_full(tiny_model):
+    ids = torch.randint(0, 256, (1, 8))
+    with torch.inference_mode():
+        full = tiny_model(ids)
+        kept = tiny_model(ids, num_logits_to_keep=3)
+        kept1 = tiny_model(ids, num_logits_to_keep=1)
+    assert kept.shape == (1, 3, 256)
+    assert kept1.shape == (1, 1, 256)
+    torch.testing.assert_close(kept, full[:, -3:])
+    torch.testing.assert_close(kept1, full[:, -1:])
