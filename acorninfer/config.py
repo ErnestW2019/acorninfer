@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Qwen3 生成终止符:<|endoftext|>(基座)、<|im_end|>(chat)。
 # 引擎默认值;请求级 eos 覆盖在 Engine.submit 传入。
-QWEN3_EOS_IDS: frozenset = frozenset({151643, 151645})
+QWEN3_EOS_IDS: frozenset[int] = frozenset({151643, 151645})
 
 
 @dataclass(frozen=True)

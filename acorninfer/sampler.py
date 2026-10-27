@@ -24,6 +24,8 @@ class SamplingParams:
 
 class Sampler:
     def __init__(self, params: SamplingParams, generator: torch.Generator | None = None):
+        """generator 契约:必须与 logits 同设备(torch.multinomial 会校验);
+        不得跨序列共享(并发解码会交错消耗随机流,破坏逐请求可复现)。"""
         if params.temperature <= 0:
             raise ValueError("temperature must be > 0")
         if not (0.0 < params.top_p <= 1.0):
