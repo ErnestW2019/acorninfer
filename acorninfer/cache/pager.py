@@ -6,6 +6,8 @@ Spec §5:   KV 泄漏 debug 守卫 —— assert_balanced 在引擎排空后必�
 
 from __future__ import annotations
 
+import torch
+
 
 class BlockExhausted(Exception):
     """物理块耗尽;调度器以此触发排队/抢占。"""
@@ -51,3 +53,83 @@ class BlockAllocator:
         """
         if self._live:
             raise AssertionError(f"KV leak: blocks {sorted(self._live)} never freed")
+
+
+class PagedKVCache:
+    """物理页存储:每层 k_pages/v_pages [num_blocks, page_size, kv_heads, head_dim]。
+
+    序列通过块表(list[block_id])引用自己的页;token 顺序 = 块表序 × 页内偏移。
+    M3 的 Triton paged attention 将直接按页读取;本实现的 gather-to-contiguous
+    就是它的数值 reference。
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        allocator: BlockAllocator,
+        device,
+        dtype: torch.dtype,
+    ):
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.page_size = page_size
+        self.allocator = allocator
+        self.device = device
+        self.dtype = dtype
+        shape = (allocator.total, page_size, num_kv_heads, head_dim)
+        self.k_pages = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(num_layers)]
+        self.v_pages = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(num_layers)]
+
+
+class PagedCacheView:
+    """每序列视图:块表 + update()/seq_len,与 M1 KVCache 接口镜像。
+
+    table 与 Sequence.block_table 共享同一 list 对象(engine 负责传递),
+    因此调度器/引擎释放块时清空 seq.block_table 即同时清空视图。
+    """
+
+    def __init__(self, cache: PagedKVCache, table: list[int] | None = None):
+        self.cache = cache
+        self.table: list[int] = table if table is not None else []
+        self._len = 0
+
+    @property
+    def seq_len(self) -> int:
+        return self._len
+
+    def update(
+        self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """写入新 token 的 k/v 并返回全量 [1, kv_heads, seq_len, head_dim]。
+
+        k_new/v_new: [1, kv_heads, s, head_dim];块不足时按需 allocate。
+        """
+        c = self.cache
+        s = k_new.shape[2]
+        page = c.page_size
+        needed = (self._len + s + page - 1) // page
+        while len(self.table) < needed:
+            self.table.append(c.allocator.allocate())
+        pos = torch.arange(self._len, self._len + s)
+        # dtype=torch.long 必须显式:s=0 时空 list 会默认造出 float 张量,当索引会炸
+        rows = torch.tensor(
+            [self.table[p // page] for p in pos.tolist()], device=c.device, dtype=torch.long
+        )
+        slots = (pos % page).to(c.device)
+        # scatter 目标 [rows,slots] 是 [s, kv, D](token 轴在前);k_new[0] 是
+        # [kv, s, D] → permute(1,0,2) 后逐 token 对齐(rows[i],slots[i]) <- token i
+        c.k_pages[layer_idx][rows, slots] = k_new[0].permute(1, 0, 2).to(c.dtype)
+        c.v_pages[layer_idx][rows, slots] = v_new[0].permute(1, 0, 2).to(c.dtype)
+        self._len += s
+        return self._gather(layer_idx, c.k_pages), self._gather(layer_idx, c.v_pages)
+
+    def _gather(self, layer_idx: int, pages: list[torch.Tensor]) -> torch.Tensor:
+        c = self.cache
+        # dtype=torch.long 与 update 的 rows 对称:空表时 torch.tensor([]) 会默认 float
+        t = pages[layer_idx][torch.tensor(self.table, device=c.device, dtype=torch.long)]
+        t = t.reshape(-1, c.num_kv_heads, c.head_dim)[: self._len]       # [len, kv, D]
+        return t.permute(1, 0, 2)[None]                                  # [1, kv, len, D]
