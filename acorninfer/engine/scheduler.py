@@ -13,6 +13,13 @@ from acorninfer.engine.sequence import RequestStatus, Sequence
 
 
 class Scheduler:
+    """FCFS 调度器。
+
+    退休契约(Task 8 Engine 负责):序列结束后由引擎从 running 移除、
+    状态置 FINISHED、经 view 的共享块表释放块 —— 调度器自身不退休序列,
+    忘记退休的序列会一直占 deficit 与 max_running 名额。
+    """
+
     def __init__(
         self,
         allocator: BlockAllocator,
@@ -37,7 +44,12 @@ class Scheduler:
         seq.num_pages = 0
 
     def schedule(self) -> tuple[list[Sequence], list[Sequence]]:
-        """返回 (本轮 prefill, 本轮 decode);副作用:抢占与准入。"""
+        """返回 (本轮 prefill, 本轮 decode);副作用:抢占与准入。
+
+        正确性不变式:本轮页满 decode 的占块发生在步内(下次 schedule() 的
+        抢占循环来不及反应),因此准入预算必须预留这部分(reserve);
+        watermark 只是额外策略余量,不再承担正确性。
+        """
         # 抢占:保证每个 running 序列本轮 decode 至多再要 1 块
         preempted_ids: set[int] = set()
         while True:
@@ -51,6 +63,7 @@ class Scheduler:
             self._release(victim)
             self.waiting.appendleft(victim)
             preempted_ids.add(victim.seq_id)
+        reserve = deficit  # 本轮页满 decode 将占用的块数;准入不得动用
 
         # 准入:FCFS,受水位与 max_running 约束;刚被抢占者本轮不准入(防抖:
         # 否则同一步"抢占→重准入"空转,下轮重试)
@@ -61,7 +74,7 @@ class Scheduler:
             if cand.seq_id in preempted_ids:
                 break
             need = -(-cand.num_tokens // self.page_size) - cand.num_pages
-            if self.allocator.num_free - pending_pages - self.watermark < need:
+            if self.allocator.num_free - pending_pages - reserve - self.watermark < need:
                 break
             self.waiting.popleft()
             pending_pages += need

@@ -64,6 +64,29 @@ def test_admission_stops_at_watermark():
     assert [s.seq_id for s in prefills3] == [2]
 
 
+def test_admission_reserves_decode_blocks():
+    """页满 running 的本轮 decode 块必须被预留:准入不得吃掉它。
+
+    repro:页满 s0(本轮 decode 要 +1 块)+ need=2 的 s1 → 无预留时会准入
+    s1(2≥2),步内 s0 decode 无块可占 → BlockExhausted 崩溃。
+    """
+    alloc = BlockAllocator(3)
+    sch = Scheduler(alloc, PAGE)
+    s0 = mkseq(0, 3, gen=1)  # prefill 后 num_tokens=4 == 1 页满
+    sch.add(s0)
+    sch.schedule()  # s0 准入
+    s0.status = RequestStatus.RUNNING
+    s0.num_pages = 1
+    s0.block_table = [alloc.allocate()]  # free=2
+    s1 = mkseq(1, 8)  # need=2
+    sch.add(s1)
+    prefills, decodes = sch.schedule()
+    # reserve=1(s0 页满):预算 2-0-1=1 < 2 → s1 留队,块留给 s0 本轮 decode
+    assert prefills == []
+    assert [s.seq_id for s in decodes] == [0]
+    assert sch.waiting[0].seq_id == 1
+
+
 def test_preempt_oldest_running_recompute():
     alloc = BlockAllocator(3)
     sch = Scheduler(alloc, PAGE)
