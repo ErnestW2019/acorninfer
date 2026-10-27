@@ -2,7 +2,8 @@
 
 页面数学(易错,先算清楚):
 - PAGE=4;mkseq(i, 5) → num_tokens=5 → 需 ceil(5/4)=2 块;
-- 抢占场景 mkseq(i, 3, gen=1) → num_tokens=4 == 1 页满 → 下一 token 必须新块。
+- 抢占场景 mkseq(i, 3, gen=1):prefill 写 A=4 恰满 1 页,record 后
+  num_tokens=5 > 1×4 → 本轮 decode 必须新块(判据是 >,见 scheduler.py)。
 """
 
 from acorninfer.cache.pager import BlockAllocator
@@ -69,19 +70,23 @@ def test_admission_reserves_decode_blocks():
 
     repro:页满 s0(本轮 decode 要 +1 块)+ need=2 的 s1 → 无预留时会准入
     s1(2≥2),步内 s0 decode 无块可占 → BlockExhausted 崩溃。
+
+    状态语义:prefill 写入 A=4(prompt 3 + gen 1)恰好满 1 页,record 后
+    num_tokens=5 > 1×4 → 本轮 decode 真要块。
     """
     alloc = BlockAllocator(3)
     sch = Scheduler(alloc, PAGE)
-    s0 = mkseq(0, 3, gen=1)  # prefill 后 num_tokens=4 == 1 页满
+    s0 = mkseq(0, 3, gen=1)
     sch.add(s0)
     sch.schedule()  # s0 准入
     s0.status = RequestStatus.RUNNING
     s0.num_pages = 1
-    s0.block_table = [alloc.allocate()]  # free=2
+    s0.block_table = [alloc.allocate()]  # free=2;KV 已写 A=4,满页
+    s0.generated_ids.append(9999)  # prefill 选出新 token → num_tokens=5
     s1 = mkseq(1, 8)  # need=2
     sch.add(s1)
     prefills, decodes = sch.schedule()
-    # reserve=1(s0 页满):预算 2-0-1=1 < 2 → s1 留队,块留给 s0 本轮 decode
+    # reserve=1(s0 本轮 decode 要块):预算 2-0-1=1 < 2 → s1 留队
     assert prefills == []
     assert [s.seq_id for s in decodes] == [0]
     assert sch.waiting[0].seq_id == 1
@@ -90,7 +95,7 @@ def test_admission_reserves_decode_blocks():
 def test_preempt_oldest_running_recompute():
     alloc = BlockAllocator(3)
     sch = Scheduler(alloc, PAGE)
-    s0, s1 = mkseq(0, 3, gen=1), mkseq(1, 3, gen=1)  # num_tokens=4 == 1 页满
+    s0, s1 = mkseq(0, 3, gen=1), mkseq(1, 3, gen=1)  # prefill 写 A=4,恰满 1 页
     for s in (s0, s1):
         sch.add(s)
     sch.schedule()  # 双双准入(此时尚未真实占块)
@@ -98,8 +103,9 @@ def test_preempt_oldest_running_recompute():
         s.status = RequestStatus.RUNNING
         s.num_pages = 1
         s.block_table = [alloc.allocate()]
+        s.generated_ids.append(9999)  # record 后 num_tokens=5 > 1×4:本轮 decode 要新块
     assert alloc.num_free == 1
-    # 两条都页满:deficit=2 > free=1 → 抢占最老 s0(释放 1 块 → free=2 ≥ 1)
+    # 两条都溢出页容量:deficit=2 > free=1 → 抢占最老 s0(释放 1 块 → free=2 ≥ 1)
     prefills, decodes = sch.schedule()
     assert s0.status is RequestStatus.WAITING
     assert s0.seq_id == sch.waiting[0].seq_id  # 回到队首(FCFS 重试优先)
