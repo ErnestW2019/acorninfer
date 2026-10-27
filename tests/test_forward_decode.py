@@ -46,7 +46,7 @@ def test_decode_single_matches_forward_path(env):
 def test_decode_batch_matches_individual_token_sequences(env):
     model, cache, alloc = env
     torch.manual_seed(1)
-    lens = [3, 5, 7]
+    lens = [3, 5, 5]  # 两条等长(同位置的常见 bench 形态)+ 一条异长
     prompts = [torch.randint(0, 256, (1, n)) for n in lens]
     views_indiv = [PagedCacheView(cache) for _ in range(3)]
     views_batch = [PagedCacheView(cache) for _ in range(3)]

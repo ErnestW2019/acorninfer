@@ -142,6 +142,8 @@ class Qwen3Attention(nn.Module):
 
         rep = self.num_heads // self.num_kv_heads
         outs = []
+        # 每层每序列全量 gather(O(seq_len) 拷贝)是刻意的参考设计;M3 的分页
+        # attention kernel 直接按页读取,消除这份拷贝
         for b, view in enumerate(views):
             k_full, v_full = view.update(layer_idx, k[b : b + 1], v[b : b + 1])
             k_full = _repeat_kv(k_full, rep)
@@ -226,10 +228,13 @@ class Qwen3ForCausalLM(nn.Module):
     def forward_decode(self, input_ids: torch.Tensor, views) -> torch.Tensor:
         """批量 decode:input_ids [B, 1] + 每序列的 PagedCacheView -> [B, vocab]。
 
+        契约:views[i] 与 input_ids[i] 一一对应;s 必须为 1(decode 步)。
         每序列位置 = 各自 cache.seq_len(互不相同);新 token 的 K/V 在
         attention 内写入各自分页块。
         """
-        B = input_ids.shape[0]
+        if input_ids.shape[1] != 1:
+            # s>1 会静默腐败:cos/sin 广播成同位置、update 多写 token
+            raise ValueError("forward_decode expects [B, 1] input_ids (decode step)")
         positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
         dtype = self.embed_tokens.weight.dtype
         cos, sin = self.rope(positions, dtype, input_ids.device)  # [B, head_dim]
