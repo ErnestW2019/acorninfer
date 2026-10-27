@@ -80,6 +80,7 @@ def test_rope_positions_match_manual():
     inv_freq = 1.0 / (10_000.0 ** (torch.arange(0, 16, 2, dtype=torch.float32) / 16))
     freqs = torch.outer(positions, inv_freq)
     assert torch.allclose(cos, torch.cat((freqs, freqs), dim=-1).cos(), atol=1e-6)
+    assert torch.allclose(sin, torch.cat((freqs, freqs), dim=-1).sin(), atol=1e-6)
     # bf16 cast 路径:生产总是跑 cast,必须钉住输出 dtype
     cos_b, sin_b = rope(torch.tensor([3]), torch.bfloat16, torch.device("cpu"))
     assert cos_b.dtype == torch.bfloat16 and sin_b.dtype == torch.bfloat16
@@ -87,12 +88,14 @@ def test_rope_positions_match_manual():
 
 
 def test_forward_position_dependence():
-    # logits 必须随绝对位置变化(RoPE 生效);同一 token 在不同上下文长度下分布不同
+    # 因果 + 位置是逐调用 arange:同一前缀在两种上下文长度下,pos=3 的输出必须逐位一致。
+    # 这才是"位置正确"的黑盒钉子(绝对位置经相对旋转不可观测,不同输入的对比是空洞断言)。
     model = tiny_model()
-    ids_a = torch.randint(0, 256, (1, 4))
+    torch.manual_seed(1)
     ids_b = torch.randint(0, 256, (1, 8))
+    ids_a = ids_b[:, :4].clone()
     with torch.inference_mode():
-        out_a = model(ids_a)
-        out_b = model(ids_b)
+        out_a, out_b = model(ids_a), model(ids_b)
     assert out_a.shape == (1, 4, 256)
-    assert not torch.allclose(out_a[:, -1], out_b[:, -1])
+    assert out_b.shape == (1, 8, 256)
+    assert torch.equal(out_a[:, -1], out_b[:, 3])
