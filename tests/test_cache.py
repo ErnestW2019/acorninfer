@@ -26,6 +26,7 @@ def test_update_concatenates_per_layer():
     assert k_full.shape == shape(4)
     assert torch.equal(k_full[:, :, :3], k1)
     assert torch.equal(k_full[:, :, 3:], k2)
+    assert torch.equal(v_full[:, :, :3], v1)
     assert torch.equal(v_full[:, :, 3:], v2)
 
 
