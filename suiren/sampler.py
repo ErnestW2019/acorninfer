@@ -2,7 +2,9 @@
 
 Mirrors HF's warper pipeline order: temperature -> top-k -> top-p.
 Numerical fidelity to HF is a hard requirement (M1 acceptance: per-step
-logprob diff < 0.1); the unit suite pins our processing to HF's warpers.
+logprob diff < 0.4 vs HF's own warpers — the value is the bf16 cross-path
+noise floor, see tests/test_golden_m1.py); the unit suite pins our
+processing to HF's warpers bit-exactly.
 """
 
 from __future__ import annotations
