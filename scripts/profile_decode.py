@@ -7,8 +7,9 @@ top-15 kernel 表。
 8 序列(in=128,seed=20261027,与 bench 同 seed)prefill 完成后先空跑
 3 步出稳定,再计时 + profile N 个 decode 步(默认 20),temp=0。
 注意:该 seed 下与 M2/M3 的 C=8 档记录一致,有 1 条请求在第 2 个生成 token
-命中 EOS、于预热期退役,计时窗口内 batch 恒为 7;脚本尾部 sanity 行打印
-alive 数,若窗口内仍有提前退役(batch 不均匀)则断言失败。
+命中 EOS、于预热期退役,计时窗口内 batch 恒为 7;脚本对计时窗口前后的
+alive 序列集合做同一性比对(不用 assert:python -O 会剥掉 assert),窗口内
+若仍有提前退役则 raise RuntimeError 立即失败。
 
 torch 2.13 profiler API 探测结论(脚本按此写,勿再硬猜):
 - FunctionEventAvg 上是 self_device_time_total(旧名 self_cuda_time_total
@@ -44,6 +45,12 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
+    if not args.device.startswith("cuda"):
+        ap.error(
+            f"--device must be a CUDA device (script is CUDA-only by "
+            f"construction: torch.profiler CUDA activity + .cuda tensors), "
+            f"got {args.device!r}"
+        )
 
     model = from_pretrained(DEFAULT_MODEL, args.device, torch.bfloat16)
     model.attention_backend = "triton"
@@ -63,6 +70,11 @@ def main() -> None:
         # 全员进入 decode;先空跑 3 步出稳定性(该 seed 的 EOS 命中者也在此退役)
         for _ in range(3):
             engine.step()
+        # 测量有效性基线:计时窗口(含下方 profiler 预热步)开始前的 alive 集合。
+        # 引擎 lockstep decode 下所有在跑序列每步恰好 +1 token、中途退役者在步末
+        # finally 块出场,alive 序列的 generated_ids 长度永远彼此相同 —— 长度
+        # 比对恒真(空判据);集合同一性才是窗口内提前退役会触发的真判据
+        alive_before = {i for i in sids if not engine.seqs[i].is_finished}
 
         # profiler 预热窗:CUPTI 首次启用/缓冲分配的一次性开销落在独立窗口,
         # 不进计时也不进账目(key_averages 只取下面的测量窗)
@@ -90,14 +102,23 @@ def main() -> None:
         print(f"launches/step={launches / n:.1f} memcpy/step={memcpy / n:.2f}")
         print(evs.table(sort_by="self_device_time_total", row_limit=15))
 
-        # 测量有效性:计时窗口内 batch 必须恒定(提前退役会使各步 batch 不同)
+        # 测量有效性:计时窗口内不得有提前退役(否则各步 batch 不同,账目失真)
         alive = [i for i in sids if not engine.seqs[i].is_finished]
-        gens = sorted({len(engine.seqs[i].generated_ids) for i in alive})
-        assert len(gens) == 1, f"计时窗口内仍有序列提前退役,batch 不均匀: {gens}"
-        print(f"sanity: alive={len(alive)}/8 generated_per_seq={gens[0]} "
+        if len(alive) != len(alive_before):
+            raise RuntimeError(
+                f"计时窗口内有序列提前退役: alive {len(alive_before)} -> {len(alive)}"
+            )
+        print(f"sanity: alive={len(alive)}/8 "
+              f"generated_per_seq={len(engine.seqs[alive[0]].generated_ids)} "
               f"(batch 恒定贯穿计时窗口)")
     finally:
-        model.to("cpu")
+        # 失败安全:清理步骤的异常不得遮蔽 try 块的原始异常;del engine 先释放
+        # PagedKVCache 的 KV pool 引用,empty_cache 才能连权重带池子一起回收
+        try:
+            del engine
+            model.to("cpu")
+        except Exception:
+            pass
         torch.cuda.empty_cache()
 
 
