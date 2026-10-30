@@ -98,3 +98,40 @@ before 复跑与 Task 8 归档(40.35/116.30/161.60)一致性:C=1/C=4 ±1% 内,C=
 ### 验收判定(2026-10-30,用户裁定收官)
 
 M3 收官:C=1 ✓(线的 124.5%)、C=4 ✓(线的 112.9%)、C=8 以线的 99.2%(246.37 vs 248.44)带缺口收官;spec §3 预案参考「相对 M2 gather 版 ≥2×」达成(2.23×)。C=8 剩余缺口首要归因指向无 CUDA graph 的逐 kernel 发射间隙(推断,未单独计时),列为 M4 首项;量化归因需 profiler,随 M4 一并处理。
+
+## M4 实测:decode 步 profiler 账目(2026-10-30,`scripts/profile_decode.py`,真机输出)
+
+M4(CUDA graph 消发射间隙)的开工基线:8 序列(in=128,seed=20261027,与 bench 同 seed)prefill 完成后空跑 3 步出稳定,再以 torch.profiler(CPU+CUDA activity,独立预热窗吸收 CUPTI 初始化)连测 20 个 decode 步(temp=0,triton+fused 后端,num_blocks=1024,page=16,物理 GPU 1,RTX 4090)。命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/profile_decode.py --steps 20`。
+
+**decode 步的时间去向自此为实测**(上节 M3 收官中「无 CUDA graph 的逐 kernel 发射间隙」一项由推断升级为下表数字):
+
+| 指标 | 实测值 |
+|---|---|
+| 每步墙钟 wall/step | 27.37 ms |
+| GPU 端累计(kernel+memcpy)/step | 19.99 ms |
+| 发射间隙 gap/step(wall − GPU 端) | 7.38 ms |
+| kernel 启动次数/step | 1430.0 |
+| H2D/D2H memcpy 次数/step | 13.00 |
+
+脚本原始输出行(逐字):`steps=20 wall/step=27.37ms gpu_kernel+memcpy/step=19.99ms gap/step=7.38ms`;`launches/step=1430.0 memcpy/step=13.00`。gap 占每步墙钟的 27.0%(7.38/27.37)——即 CUDA graph 对 decode 步墙钟的理论收益上限(实测占比)。
+
+top kernel(按设备时间,20 步累计 Self CUDA / 折合每步 / 占 GPU 忙时占比,数字取自 profiler 表):
+
+| kernel | Self CUDA(20 步) | 每步 | 次数/步 | 占比 |
+|---|---|---|---|---|
+| cutlass_80_wmma_tensorop_bf16(GEMM) | 354.041 ms | 17.70 ms | 253 | 88.55% |
+| _paged_attn_split_kernel | 11.796 ms | 0.59 ms | 36 | 2.95% |
+| unrolled_elementwise_kernel | 5.649 ms | 0.28 ms | 183 | 1.41% |
+| index_elementwise_kernel | 4.468 ms | 0.22 ms | 72 | 1.12% |
+| elementwise_kernel<128, 2> | 3.987 ms | 0.20 ms | 146 | 1.00% |
+| reduce_kernel | 2.987 ms | 0.15 ms | 73 | 0.75% |
+| _fused_add_rmsnorm_kernel | 2.473 ms | 0.12 ms | 72 | 0.62% |
+| _rope_inplace_kernel | 1.790 ms | 0.09 ms | 72 | 0.45% |
+
+其余为长尾小 elementwise/reduce kernel,单项占比均 <1%;GPU 忙时合计 399.810 ms(20 步)。GEMM 一项独占 GPU 忙时的 88.55%(每步 253 次 = 36 层 × 7 次小矩阵乘 + lm_head),decode 是典型 GEMV 形状、带宽受限——graph 化消除的是 27.0% 的发射间隙,GEMM 本体的利用率是 M4 之后的下一瓶颈(此句为对实测数字的解读,非新增实测)。
+
+口径注记(均为脚本行为/实测事实):
+
+1. **GPU 忙时只按 device_type=CUDA 事件累加**(torch 2.13:`key_averages()` 事件的属性名为 `self_device_time_total`,旧名 `self_cuda_time_total` 在 FunctionEventAvg 上已不存在,实测 AttributeError;`table(sort_by=...)` 统一用新名),与 profiler 表格 footer「Self CUDA time total: 399.810ms」同口径;表格中 CPU 算子行(如 aten::mm 行 Self CUDA 355.728ms)是子 kernel 时间归因,与 kernel 行双计,不入账。
+2. **batch=7 非 8**:同 seed 下与 M2/M3 C=8 档既有记录一致,1 条请求在第 2 个生成 token 命中 EOS,于预热期退役;计时窗口内 batch 恒为 7(脚本 sanity 行逐字:`sanity: alive=7/8 generated_per_seq=25 (batch 恒定贯穿计时窗口)`;窗口内若再有提前退役,脚本断言直接失败)。
+3. **27.37 ms/步含 profiler 逐 kernel 采样开销**(对照:M3 无 profiler 同配置 C=8 TPOT 24.93 ms,见上节引用);本节数字用于 kernel/gap 结构归因,绝对吞吐以 M3 节为准。
