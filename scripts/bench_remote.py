@@ -5,7 +5,7 @@
 acorninfer.bench._report 一致;差异(入档 docs):HTTP 往返计入两端延迟
 (vLLM 侧含其调度开销),这是产品真实路径,70% 线按此口径。
 
-运行(vLLM 已在 GPU 0 :8100 起好,见 Task 1):
+运行(vLLM 起服命令与基线实测数字见 docs/benchmarks.md「M3 基线」小节):
     CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --concurrency 1 4 8
 """
 
@@ -29,10 +29,12 @@ def _run_one(client, base, ids, out_tokens, out):
     out["first"] = None
     out["last"] = out["t0"]
     out["n"] = 0
+    out["done"] = False
     with client.stream(
         "POST", f"{base}/v1/completions",
-        json={"prompt": ids, "max_tokens": out_tokens, "temperature": 0.0,
-              "stream": True, "stream_options": {"include_usage": True}},
+        json={"model": DEFAULT_MODEL, "prompt": ids, "max_tokens": out_tokens,
+              "temperature": 0.0, "stream": True,
+              "stream_options": {"include_usage": True}},
     ) as r:
         r.raise_for_status()
         for line in r.iter_lines():
@@ -40,17 +42,22 @@ def _run_one(client, base, ids, out_tokens, out):
                 continue
             payload = line[len("data: "):]
             if payload.strip() == "[DONE]":
+                out["done"] = True
                 break
             obj = json.loads(payload)
             now = time.perf_counter()
             if out["first"] is None:
                 out["first"] = now          # 首个 data 事件 ≈ TTFT
-            out["last"] = now
+            if obj.get("choices"):
+                out["last"] = now           # 仅内容 chunk 推进 last(usage 尾包不算)
             if obj.get("usage"):
                 out["n"] = obj["usage"]["completion_tokens"]
 
 
 def _report(level: int, outs: list, out_tokens: int) -> None:
+    bad = [i for i, o in enumerate(outs) if not o.get("done") or o["n"] <= 0]
+    if bad:
+        raise RuntimeError(f"C={level}: {len(bad)} request(s) ended without [DONE]/usage")
     ttfts = [o["first"] - o["t0"] for o in outs]
     tpots = [(o["last"] - o["first"]) / (o["n"] - 1) for o in outs if o["n"] > 1]
     total = sum(o["n"] for o in outs)
