@@ -3,11 +3,11 @@
 门(双环境独立 —— 同 seed 造同权重的两套 model/cache/allocator,页表互不污染):
 1. 4 序列(桶 4 满批)× 6 步:每步 argmax token 逐位;logits assert_close(TOL_BF16;
    缩批步两路 B 不同(3 vs 桶 4 的 GEMM 形状差)允许低比特漂移,token 不许翻);
-2. 第 4 步退休 2 序列 + 同 seed 新序列入批:缩批 4→3(桶仍 4)后 row 3 转为
+2. step 3(0 起)退休 2 序列 + 同 seed 新序列入批:缩批 4→3(桶仍 4)后 row 3 转为
    padding,但残留 row-3 序列的真 (page,slot);新序列经 allocator LIFO 恰好
    拿回该页 —— replay 的 padding scatter 若不每步重置回 scratch,会写花新
    序列刚拿到的页(静默 KV 腐败;本门钉死该回归);
-3. 第 5 步再退 1 序列 → 桶 4→2 切换,余下序列仍逐位;
+3. step 4 再退 1 序列 → 桶 4→2 切换,余下序列仍逐位;
 4. 每 runner 步后 views 的 _lens 与 eager 步后逐层相等(_commit_lens 契约);
 5. 收尾:显式 free 全部测试页后,runner 侧 alloc 恰 1 块 live(scratch 常驻),
    eager 侧 assert_balanced 零 live。
@@ -22,6 +22,7 @@ from acorninfer.engine.graph_runner import DecodeGraphRunner
 from acorninfer.models.qwen3 import Qwen3ForCausalLM
 from triton_utils import TOL_BF16
 
+# LENS 各跨不同页数;LENS[3]=7 使残留 scatter 位 (slot 2) 落在新序列已 prefill 的区间内,回归门才咬得到
 LENS = [5, 9, 13, 7]
 
 
@@ -103,8 +104,11 @@ def test_runner_matches_eager_and_bucket_switch():
             assert v._lens == v2._lens  # _commit_lens 契约:全层逐层等长
         tokens = graph_tokens
 
-    for a, v in [(alloc, v) for v in views] + [(alloc2, v) for v in views2]:
+    for v in views:
         for b in v.table:
-            a.free(b)
+            alloc.free(b)
+    for v in views2:
+        for b in v.table:
+            alloc2.free(b)
     assert alloc.num_live == 1  # 仅 runner 常驻 scratch;其余零 live
     alloc2.assert_balanced()

@@ -61,6 +61,7 @@ class DecodeGraphRunner:
         self.states = {b: self._build_state(b) for b in BUCKETS}
         for st in self.states.values():
             self._capture(st)
+        self.last_logits = None
 
     # ---- 构造期:状态与捕获 ----
 
@@ -99,6 +100,7 @@ class DecodeGraphRunner:
         """与 Executor.decode_batch 同参;seqs 仅取 generated_ids[-1]。"""
         B = len(views)
         assert 1 <= B <= BUCKETS[-1]
+        assert len(seqs) == B, "seqs/views 必须一一对应"
         st = self.states[min(b for b in BUCKETS if b >= B)]
         targets = [v.ensure_append_capacity(0) for v in views]
         pre = [int(v.seq_len) for v in views]
@@ -113,13 +115,15 @@ class DecodeGraphRunner:
         # padding 行三场每步重置(pages/slots/tables 首列):缩批后旧 padding 行
         # 残留退休序列的真 (page,slot) —— 引擎 free 该页、allocator LIFO 把它
         # 发给下一个 prefill 后,不重置的 replay scatter 会写花活序列 KV(静默
-        # 腐败;tables 首列 zero_ 后须重写,kernel 按 padding lens=1 只读首列)。
+        # 腐败;tables 首列 zero_ 后须重写,kernel 按 padding lens=1 只读首列);
+        # lens[B:] 恒为 init 的 1(每步写入只切 [:B]),无需重置。
         st.pages[B:].fill_(self.scratch)
         st.slots[B:].zero_()
         st.tables[B:, 0] = self.scratch
         st.ids[:B].copy_(torch.tensor([[s.generated_ids[-1]] for s in seqs], dtype=torch.long))
         self._commit_lens(views, new_len)
         st.graph.replay()
+        # 图输出缓冲原址覆写:仅本步有效;parity 测试的对拍观察点
         self.last_logits = st.logits
         return [int(row.argmax()) for row in st.logits[:B]]
 
