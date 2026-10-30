@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from acorninfer.config import Qwen3Config
+import pytest
+
+from acorninfer.config import EngineConfig, Qwen3Config
 
 QWEN3_8B = Path("/home/ernest/model-weight/Qwen3-8B")
 
@@ -25,3 +27,11 @@ def test_tiny_config_for_unit_tests():
     assert cfg.num_hidden_layers == 2
     assert cfg.vocab_size == 256
     assert cfg.hidden_size == 64
+
+
+def test_engine_config_defaults_and_backend_validation():
+    cfg = EngineConfig(model_dir="x")
+    assert cfg.attention_backend == "sdpa"
+    assert cfg.fused_ops is False
+    with pytest.raises(ValueError, match="attention_backend"):
+        EngineConfig(model_dir="x", attention_backend="sdpaX")

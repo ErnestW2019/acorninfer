@@ -37,7 +37,24 @@ def _fused_add_rmsnorm_kernel(
 
 
 def fused_add_rmsnorm(x, residual, weight, eps):
-    """x: [..., H];residual: None 或同形状;返回 (normed, residual_new),均新分配。"""
+    """融合 add + RMSNorm(行内单 kernel)。语义契约(与 torch 路径逐操作同构,
+    oracle 见本文件 fused_add_rmsnorm_ref):
+
+        fused_add_rmsnorm(x, residual, weight, eps) -> (normed, residual_new)
+        residual is None    : residual_new = x(同值新张量),     normed = rmsnorm(x)
+        residual is not None: residual_new = round(residual + x), normed = rmsnorm(residual_new)
+
+    加法在 fp32 opmath 后按输入 dtype 取整(torch bf16 逐元素加法行为);
+    归一对取整后的残差在 fp32 进行、末尾 cast 回输入 dtype(镜像
+    models.qwen3.RMSNorm)。
+
+    - x: [..., H],任意前置维度(内部展平 [rows, H]);non-contiguous 允许
+      (reshape 按需拷贝);residual: None 或与 x 同形状同 dtype。
+    - weight: [H];eps:方差稳定项。
+    - 返回 (normed, residual_new):均新分配、与 x 同形状,绝不原地写 x 或
+      residual。
+    - dtype:bf16 / fp16 / fp32 均可。
+    """
     *lead, H = x.shape
     rows = x.numel() // H
     x2 = x.reshape(rows, H)

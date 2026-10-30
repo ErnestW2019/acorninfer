@@ -11,9 +11,12 @@ import pytest
 import torch
 from triton_utils import TOL_BF16, TOL_F32, max_abs_diff
 
+from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
+from acorninfer.config import Qwen3Config
+from acorninfer.models.qwen3 import Qwen3ForCausalLM
 from acorninfer.ops.rmsnorm import fused_add_rmsnorm, fused_add_rmsnorm_ref
 
-CASES = [(1, 4096), (4, 4096), (3, 1024), (2, 64)]  # (rows, cols);64 = tiny 模型 hidden
+CASES = [(1, 4096), (4, 4096), (3, 1024), (2, 64), (5, 100)]  # (rows, cols);64 = tiny 模型 hidden;100 = 非 2 幂,掩码路径
 
 
 def _gen(dtype):
@@ -28,11 +31,13 @@ def _gen(dtype):
 @pytest.mark.gpu
 def test_matches_ref_fp32_tight():
     for x, r, w in _gen(torch.float32):
+        x_before = x.clone()
         for residual in (None, r):
             n_ref, r_ref = fused_add_rmsnorm_ref(x, residual, w, 1e-6)
             n_k, r_k = fused_add_rmsnorm(x, residual, w, 1e-6)
             torch.testing.assert_close(n_k, n_ref, **TOL_F32)
             torch.testing.assert_close(r_k, r_ref, **TOL_F32)
+        assert torch.equal(x, x_before)  # kernel 不落笔调用方的 x
 
 
 @pytest.mark.gpu
@@ -48,19 +53,11 @@ def test_matches_ref_bf16_calibrated():
     print(f"\n[rmsnorm bf16 calibrated max|diff| = {worst:.6f}]")  # 标定输出,回填 TOL
 
 
-@pytest.mark.gpu
-def test_tiny_model_fused_ops_roundtrip():
-    """tiny 模型端到端:fused_ops 开关不改变 logits 超出 bf16 标定容差。
+def _tiny_decode_env():
+    """tiny 模型 + CUDA 分页 cache(page_size=4:8-token prefill 跨 2 页)。
 
-    decode 路径(计划首选):prefill 一条 8-token 序列建页(page_size=4 覆盖
-    多页),再 decode 2 步;fused_ops False/True 各跑一遍。模型权重相同,开关
-    切换不改变权重;两个 run 各用全新 PagedCacheView(互不串页),步末手动还块。
+    集成用例共享;调用方自建 PagedCacheView(互不串页),步末手动还块。
     """
-    import torch
-    from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
-    from acorninfer.config import Qwen3Config
-    from acorninfer.models.qwen3 import Qwen3ForCausalLM
-
     torch.manual_seed(0)
     model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
     alloc = BlockAllocator(32)
@@ -68,11 +65,22 @@ def test_tiny_model_fused_ops_roundtrip():
         model.cfg.num_hidden_layers,
         model.cfg.num_key_value_heads,
         model.cfg.head_dim,
-        4,  # page_size=4:8-token prefill 跨 2 页
+        4,
         alloc,
         "cuda",
         torch.bfloat16,
     )
+    return model, cache, alloc
+
+
+@pytest.mark.gpu
+def test_tiny_model_fused_ops_roundtrip():
+    """tiny 模型端到端:fused_ops 开关不改变 logits 超出 bf16 标定容差。
+
+    decode 路径(计划首选):prefill 一条 8-token 序列建页,再 decode 2 步;
+    fused_ops False/True 各跑一遍。模型权重相同,开关切换不改变权重。
+    """
+    model, cache, alloc = _tiny_decode_env()
     torch.manual_seed(1)
     prompt = torch.randint(0, 256, (1, 8), device="cuda")
     steps = torch.randint(0, 256, (2, 1), device="cuda")
@@ -92,3 +100,40 @@ def test_tiny_model_fused_ops_roundtrip():
 
     torch.testing.assert_close(runs[1], runs[0], **TOL_BF16)
     alloc.assert_balanced()
+
+
+@pytest.mark.gpu
+def test_fused_ops_switch_is_wired(monkeypatch):
+    """守卫:开关没接线(如 model.forward_decode 忘了透传 fused_ops)时本测试必炸。
+
+    fused 与 torch 路径 logits 容差内一致,只有调用计数能钉住接线。Block 在
+    方法体内 `from acorninfer.ops.rmsnorm import fused_add_rmsnorm`,每次调用
+    重新解析模块属性,monkeypatch 模块属性即可命中(经验证)。
+    """
+    import acorninfer.ops.rmsnorm as rmsnorm_mod
+
+    model, cache, alloc = _tiny_decode_env()
+    torch.manual_seed(1)
+    prompt = torch.randint(0, 256, (1, 8), device="cuda")
+    step = torch.randint(0, 256, (1, 1), device="cuda")
+    view = PagedCacheView(cache)
+    real = rmsnorm_mod.fused_add_rmsnorm
+    calls = {"n": 0}
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rmsnorm_mod, "fused_add_rmsnorm", spy)
+    with torch.inference_mode():
+        model(prompt, view)  # prefill 走 torch forward,不碰 fused
+        assert calls["n"] == 0
+        model.fused_ops = True
+        model.forward_decode(step, [view])
+        assert calls["n"] == 2 * len(model.layers)
+        model.fused_ops = False
+        calls["n"] = 0
+        model.forward_decode(step, [view])
+        assert calls["n"] == 0  # 反向:开关关掉后不得再进 fused
+    for blk in view.table:
+        alloc.free(blk)
