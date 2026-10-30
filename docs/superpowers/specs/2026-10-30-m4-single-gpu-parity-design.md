@@ -32,7 +32,9 @@
 - **图内内容**:embed → 36 ×(K1 fused_add_rmsnorm → qkv GEMM → K2 rope → K3 paged attn + scatter 写页 → o_proj → K1 → MLP)→ norm → lm_head → argmax(greedy 采样在图内)。
 - **每桶一张 graph + 私有内存池**:capture 冻结该桶全部中间激活分配,重放零分配。
 
-**步协议(CPU 逻辑全部留图外)**:executor 现有流程——prepare 容量确保、tables/lens 构建、`_lens` 簿记、EOS 状态机——一行不动;仅将 `model.forward_decode` 调用点替换为「原位写静态缓冲 → `graph.replay()` → 读静态输出缓冲」。pager 页张量本就是设备上原位更新,天然图内安全。
+**步协议(CPU 逻辑全部留图外)**:executor 现有流程——prepare 容量确保、tables/lens 构建、`_lens` 簿记、EOS 状态机——语义一行不动;graph 路径下由 runner 在图外执行 prepare,再「原位写静态缓冲 → `graph.replay()` → 读静态输出缓冲」。pager 页张量本就是设备上原位更新,天然图内安全。
+
+**一处 spec 修正(原"不改模型")**:捕获体内若含 `forward_decode` 的 prepare(CPU `torch.tensor` 构建 + H2D),重放会从捕获期冻结的源地址拷贝陈旧数据 —— 因此 `forward_decode` 增加一个 additive 形参 `prepared=None`(positions/tables/lens/scatter 五元组,图外构建传入;`None` = 现行为逐位不变,prepare 逻辑零改动)。torch 路径与 eager triton 路径 byte-identical 的保护不变。
 
 **Padding 行**:scatter 索引指向每层预留的一页 scratch(捕获前分配,永不读);EOS 后序列继续空转、输出由 executor 屏蔽(与现状 decode 循环语义一致)。桶 {1,2,4,8} 下 C=8 满桶零浪费;非满桶批(如 5/6/7)pad 到 8,仅浪费算力不影响正确性。
 
@@ -71,6 +73,6 @@
 
 ## 6. 保护文件与纪律(沿用 M3)
 
-- golden m0/m1/m2/m3、`cache/kv.py`、`engine/scheduler.py`、`engine/sequence.py`:禁改;`cache/pager.py`:本里程碑禁改(M3.5 已给足接口);`models/qwen3.py`:torch 路径与 eager triton 路径 byte-identical(graph 接线走 executor 层,不改模型);`ops/*`:仅 T5 条件性微调,按 §3 纪律。
+- golden m0/m1/m2/m3、`cache/kv.py`、`engine/scheduler.py`、`engine/sequence.py`:禁改;`cache/pager.py`:本里程碑禁改(M3.5 已给足接口;runner 代行 `_lens` 提交属 runner 职责,注释声明);`models/qwen3.py`:仅 §2 所述 `prepared` additive 形参,torch 路径与 eager triton 路径 byte-identical;`ops/*`:仅 T5 条件性微调,按 §3 纪律。
 - GPU 分工:GPU 1 开发测试(`CUDA_VISIBLE_DEVICES=1`);GPU 0 仅验收日配对 A/B 时跑 vLLM 服务。
 - 实测数字才可写入 docs;容差不拍脑袋;runtime 不 import transformers。
