@@ -2,6 +2,8 @@
 
 两级容差协议:
 - fp32 输入 + TOL_F32(紧):只容忍归约序差异;索引/mask/边界错了必炸;
+  TOL_F32 亦可按 kernel 标定(大 K 归约序漂移可合理超过 1e-5),规则同
+  bf16:按实测写死并注释标定命令与日期。
 - bf16 输入 + TOL_BF16(标定):先以 INIT 值跑通,再按实测 max|diff| 收紧写死,
   注释记录标定命令与日期。不允许拍脑袋容差。
 
@@ -19,4 +21,7 @@ TOL_BF16 = dict(rtol=2e-2, atol=2e-2)
 
 
 def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    assert a.shape == b.shape
+    if a.numel() == 0:
+        return 0.0
     return (a.float() - b.float()).abs().max().item()
