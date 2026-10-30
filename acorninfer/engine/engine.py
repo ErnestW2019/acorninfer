@@ -10,6 +10,7 @@ import torch
 from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
 from acorninfer.config import QWEN3_EOS_IDS, EngineConfig
 from acorninfer.engine.executor import Executor
+from acorninfer.engine.graph_runner import DecodeGraphRunner
 from acorninfer.engine.scheduler import Scheduler
 from acorninfer.engine.sequence import RequestStatus, Sequence
 from acorninfer.models.qwen3 import Qwen3ForCausalLM, from_pretrained
@@ -58,7 +59,6 @@ class Engine:
             )
         self.graph_runner = None
         if getattr(model, "decode_graph", False):
-            from acorninfer.engine.graph_runner import DecodeGraphRunner
             self.graph_runner = DecodeGraphRunner(model, self.cache, self.allocator)
         self.executor = Executor(model, self.graph_runner)
         self.page_size = page_size
@@ -183,4 +183,5 @@ class Engine:
             # 排空后恰它一块 live,其余任何 live 块 = KV 泄漏
             if self.allocator.num_live != 1:
                 raise AssertionError(
-                    f"KV leak: {self.allocator.num_live - 1} block(s) never freed")
+                    f"expected exactly 1 live block (graph runner scratch), "
+                    f"got {self.allocator.num_live}")

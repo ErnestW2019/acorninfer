@@ -164,7 +164,7 @@ def test_engine_decode_graph_tokens_bitwise():
         assert (engine.graph_runner is not None) == graph
         gen = torch.Generator(device="cuda").manual_seed(7)
         sids = []
-        for i, L in enumerate([6, 10, 14, 18]):
+        for L in [6, 10, 14, 18]:
             ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
             sids.append(engine.submit(ids[0].tolist(),
                                       SamplingParams(temperature=0.0), max_tokens=6))
@@ -176,6 +176,8 @@ def test_engine_decode_graph_tokens_bitwise():
             engine.drop(sid)
         engine.assert_balanced()
         outs.append([toks[sid] for sid in sids])
+        if graph:
+            assert engine.graph_runner.last_logits is not None  # dispatch 确曾走过 runner(防假绿)
         model.to("cpu")
     assert outs[0] == outs[1]
 
@@ -199,7 +201,7 @@ def test_engine_decode_graph_eos_shrinks_batch():
         engine = Engine(model, None, num_blocks=64, page_size=4, max_running=8)
         gen = torch.Generator(device="cuda").manual_seed(7)
         prompts = []
-        for i, L in enumerate([6, 10, 14, 18]):
+        for L in [6, 10, 14, 18]:
             ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
             prompts.append(ids[0].tolist())
         sids = []

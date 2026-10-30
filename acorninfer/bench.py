@@ -121,6 +121,10 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=20261027)
     args = parser.parse_args()
+    # --cuda-graph 须 triton 后端(EngineConfig 校验的镜像;bench 直接构造
+    # Engine 绕过了它,坏组合应在秒级爆掉而非吃完数分钟的权重加载再炸)
+    if args.cuda_graph and args.attention_backend != "triton":
+        parser.error("--cuda-graph requires --attention-backend triton")
 
     print(f"loading {args.model_dir} -> {args.device} (bf16) ...")
     model = from_pretrained(args.model_dir, args.device, torch.bfloat16)

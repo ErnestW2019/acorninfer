@@ -23,6 +23,7 @@ class Executor:
         return self._sample(seq, logits)
 
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
+        # runner 契约 = triton(构造期钉死)+ greedy(与 _sample 的 argmax 分支同义)+ B ≤ 8
         if (self.graph_runner is not None
                 and len(views) <= BUCKETS[-1]
                 and all(s.sampling.temperature == 0 for s in seqs)):
