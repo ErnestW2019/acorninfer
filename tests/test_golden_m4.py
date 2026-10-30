@@ -22,8 +22,9 @@ decode_graph 前置契约:DecodeGraphRunner 在 Engine.__init__ 里构造并按�
 再置位 runner 不存在,Executor 永远走 eager,图门空转(第一钉查这个)。
 
 单卡顺序协议:统一 CUDA_VISIBLE_DEVICES=1;权重只加载一次(module 级
-fixture),三引擎共享同一模型对象(各建一套分页 cache,3×~1.2GB,加
-16GB 权重 < 24GB),teardown 回 CPU + empty_cache(镜像 golden_m3)。
+fixture),三引擎共享同一模型对象(各建一套分页 cache,3×~1.2GB,
++graph 捕获池(4 桶,静态),加 16GB 权重 < 24GB),teardown 回 CPU +
+empty_cache(镜像 golden_m3)。
 """
 
 import pytest
@@ -151,7 +152,7 @@ def _concurrent_matches_sequential(engine: Engine, label: str) -> None:
         while engine.has_pending():
             engine.step()
     finally:
-        engine.executor.decode_batch = orig_decode
+        del engine.executor.decode_batch  # 撤实例属性遮蔽,恢复类方法
     assert batch_sizes and max(batch_sizes) >= 2, (
         f"批量 decode 未发生(batch_sizes={batch_sizes}),验收对象落空"
     )
@@ -246,16 +247,20 @@ def test_golden_m4_graph_matches_sequential(graph_engine):
     try:
         _concurrent_matches_sequential(engine, "triton+graph")
     finally:
-        engine.graph_runner.decode_batch = orig_rb
-        del engine.model.forward_decode  # 撤实例属性遮蔽,恢复类方法
+        del engine.graph_runner.decode_batch  # 撤实例属性遮蔽,恢复类方法
+        del engine.model.forward_decode
 
     assert rb_calls, "graph decode_batch 未被调用,graph 门验收对象落空"
     assert max(rb_calls) >= 2, f"graph 分流只见过单批(rb_calls={rb_calls})"
     assert not fd_calls, (
         f"门内 eager forward_decode 被调 {len(fd_calls)} 次 —— decode 未走 graph 重放"
+        f"(顺序参考段 generate_cached 若改走 forward_decode 同样触发,先查该路径)"
     )
-    # 第三钉:确曾 replay(last_logits 由 replay 后原址覆写,捕获时为 None)
+    # 第三钉:钉到静态输出缓冲 —— last_logits 是桶 4 的图冻结缓冲,replay 后
+    # 由 decode_batch 收尾原址覆写(rb_calls 已证分发,此处证 bookkeeping 确实
+    # 走到);shape 钉住桶尺寸:本门全步 B=4 → 桶 4,缓冲首维必为 4
     assert engine.graph_runner.last_logits is not None
+    assert engine.graph_runner.last_logits.shape[0] == 4
 
 
 def test_golden_m4_fuzz_no_leak(graph_engine):
@@ -276,18 +281,31 @@ def test_golden_m4_fuzz_no_leak(graph_engine):
     ]
 
     # 4 波 × 5 条:波间只跑少量 step,下一波 mid-flight 插入(排队 + 批处理
-    # 真实发生;批 ≤ max_running=4 ≤ 8,每步 decode 都落 graph 重放;池数学下
-    # 抢占不会触发),最后排空 —— 协议与 m2/m3 fuzz 完全一致
-    submitted = 0
-    for _ in range(4):
-        for _ in range(5):
-            ids, max_tokens = specs[submitted]
-            engine.submit(ids, SamplingParams(temperature=0.0), max_tokens=max_tokens)
-            submitted += 1
-        for _ in range(3):
+    # 真实发生;批 ≤ max_running=4 ≤ 8,每步 decode 都落 graph 重放(下钉);
+    # 池数学下抢占不会触发),最后排空 —— 协议与 m2/m3 fuzz 完全一致
+    rb_calls: list[int] = []
+    orig_rb = engine.graph_runner.decode_batch
+
+    def spying_rb(seqs, views):
+        rb_calls.append(len(seqs))
+        return orig_rb(seqs, views)
+
+    engine.graph_runner.decode_batch = spying_rb
+    try:
+        submitted = 0
+        for _ in range(4):
+            for _ in range(5):
+                ids, max_tokens = specs[submitted]
+                engine.submit(
+                    ids, SamplingParams(temperature=0.0), max_tokens=max_tokens
+                )
+                submitted += 1
+            for _ in range(3):
+                engine.step()
+        while engine.has_pending():
             engine.step()
-    while engine.has_pending():
-        engine.step()
+    finally:
+        del engine.graph_runner.decode_batch  # 撤实例属性遮蔽,恢复类方法
 
     assert not engine.has_pending()
     assert len(engine.seqs) == 20
@@ -295,6 +313,7 @@ def test_golden_m4_fuzz_no_leak(graph_engine):
         assert seq.is_finished
         assert seq.stop_reason in ("stop", "length")
         assert 1 <= len(seq.generated_ids) <= 16
+    assert rb_calls, "fuzz 全程未走 graph 重放,graph no-leak 门验收对象落空"
     engine.assert_balanced()  # graph 契约:allocator 恰 1 块 live(scratch),余即泄漏
     for sid in list(engine.seqs):
         engine.drop(sid)
