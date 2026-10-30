@@ -56,7 +56,11 @@ class Engine:
             raise ValueError(
                 f"watermark_blocks ({watermark_blocks}) must be < num_blocks ({num_blocks})"
             )
-        self.executor = Executor(model)
+        self.graph_runner = None
+        if getattr(model, "decode_graph", False):
+            from acorninfer.engine.graph_runner import DecodeGraphRunner
+            self.graph_runner = DecodeGraphRunner(model, self.cache, self.allocator)
+        self.executor = Executor(model, self.graph_runner)
         self.page_size = page_size
         self.seqs: dict[int, Sequence] = {}
         self._views: dict[int, PagedCacheView] = {}
@@ -65,9 +69,12 @@ class Engine:
     @classmethod
     def from_config(cls, cfg: EngineConfig, tokenizer: Tokenizer) -> "Engine":
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
-        # attention_backend 由 from_config 透传到 model,decode 路径已生效(Task 7)
+        # attention_backend/decode_graph 由 from_config 透传到 model,decode 路径
+        # 已生效(Task 7);decode_graph 必须在 Engine 构造前置位(graph runner
+        # 在 __init__ 捕获各桶)
         model.attention_backend = cfg.attention_backend
         model.fused_ops = cfg.fused_ops
+        model.decode_graph = cfg.decode_graph
         return cls(
             model,
             tokenizer,
@@ -169,4 +176,11 @@ class Engine:
         return bool(self.scheduler.waiting or self.scheduler.running)
 
     def assert_balanced(self) -> None:
-        self.allocator.assert_balanced()
+        if self.graph_runner is None:
+            self.allocator.assert_balanced()
+        else:
+            # graph runner 常驻 1 块 scratch(padding 行 KV 落点,永不读):
+            # 排空后恰它一块 live,其余任何 live 块 = KV 泄漏
+            if self.allocator.num_live != 1:
+                raise AssertionError(
+                    f"KV leak: {self.allocator.num_live - 1} block(s) never freed")

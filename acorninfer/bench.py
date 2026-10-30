@@ -17,7 +17,7 @@ prompt 由 --seed 决定:每档独立重播种,因此各档第 1 条 prompt 相�
 运行(GPU 0 被外部服务占用,统一走 GPU 1):
     CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8
     CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 \
-        --attention-backend triton --fused-ops
+        --attention-backend triton --fused-ops --cuda-graph
 """
 
 from __future__ import annotations
@@ -112,6 +112,7 @@ def main() -> None:
     parser.add_argument("--watermark-blocks", type=int, default=8)
     parser.add_argument("--attention-backend", default="sdpa", choices=["sdpa", "triton"])
     parser.add_argument("--fused-ops", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--in-tokens", type=int, default=128)
     parser.add_argument("--out-tokens", type=int, default=32)
     parser.add_argument(
@@ -124,6 +125,13 @@ def main() -> None:
     print(f"loading {args.model_dir} -> {args.device} (bf16) ...")
     model = from_pretrained(args.model_dir, args.device, torch.bfloat16)
     tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
+    # M3/M4 后端开关(bench.py 直接构造 Engine,不经 EngineConfig —— 属性赋值与
+    # Engine.from_config 同一机制;K1/K2/K3 均在 forward_decode 读属性生效):
+    # decode_graph 必须在 Engine 构造前置位(graph runner 在 Engine.__init__ 捕获
+    # 各桶);backend/fused 为运行时属性,一并提前便于一处管理
+    model.attention_backend = args.attention_backend
+    model.fused_ops = args.fused_ops
+    model.decode_graph = args.cuda_graph
     engine = Engine(
         model,
         tok,
@@ -132,14 +140,11 @@ def main() -> None:
         max_running=args.max_running,
         watermark_blocks=args.watermark_blocks,
     )
-    # M3 后端开关(bench.py 直接构造 Engine,不经 EngineConfig —— 属性赋值与
-    # Engine.from_config 同一机制;K1/K2/K3 均在 forward_decode 读属性生效)
-    model.attention_backend = args.attention_backend
-    model.fused_ops = args.fused_ops
     vocab = model.cfg.vocab_size
     print(f"engine ready: num_blocks={args.num_blocks} page={args.page_size} "
           f"max_running={args.max_running} watermark={args.watermark_blocks} "
-          f"backend={model.attention_backend} fused_ops={model.fused_ops}")
+          f"backend={model.attention_backend} fused_ops={model.fused_ops} "
+          f"cuda_graph={model.decode_graph}")
 
     try:
         # warmup:1 条短请求,触发 prefill/decode/paged-cache 的 CUDA 路径,

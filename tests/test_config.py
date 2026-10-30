@@ -33,5 +33,11 @@ def test_engine_config_defaults_and_backend_validation():
     cfg = EngineConfig(model_dir="x")
     assert cfg.attention_backend == "sdpa"
     assert cfg.fused_ops is False
+    assert cfg.decode_graph is False
     with pytest.raises(ValueError, match="attention_backend"):
         EngineConfig(model_dir="x", attention_backend="sdpaX")
+    # decode_graph 须 triton 后端(M4 CUDA graph 只接 paged triton 路径)
+    with pytest.raises(ValueError, match="decode_graph"):
+        EngineConfig(model_dir="x", attention_backend="sdpa", decode_graph=True)
+    assert EngineConfig(model_dir="x", attention_backend="triton",
+                        decode_graph=True).decode_graph is True

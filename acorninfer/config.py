@@ -79,6 +79,7 @@ class EngineConfig:
     watermark_blocks: int = 8   # 水位:free 低于此值不再准入,降低抢占概率
     attention_backend: str = "sdpa"  # "sdpa" | "triton"(M3 paged attention)
     fused_ops: bool = False          # True → decode 走 K1/K2 融合算子(M3)
+    decode_graph: bool = False       # True → decode 走 CUDA graph(M4;须 triton 后端)
 
     def __post_init__(self) -> None:
         # CLI(Task 10 bench/server)直接透传参数,坏值在构造期爆掉而非运行期排队卡死
@@ -94,3 +95,5 @@ class EngineConfig:
             raise ValueError(
                 f"attention_backend must be 'sdpa'|'triton', got {self.attention_backend!r}"
             )
+        if self.decode_graph and self.attention_backend != "triton":
+            raise ValueError("decode_graph requires attention_backend='triton'")

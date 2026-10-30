@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import torch
 
+from acorninfer.engine.graph_runner import BUCKETS, DecodeGraphRunner
 from acorninfer.engine.sequence import Sequence
 from acorninfer.models.qwen3 import Qwen3ForCausalLM
 from acorninfer.sampler import Sampler
 
 
 class Executor:
-    def __init__(self, model: Qwen3ForCausalLM):
+    def __init__(self, model: Qwen3ForCausalLM, graph_runner: DecodeGraphRunner | None = None):
         self.model = model
+        self.graph_runner = graph_runner
         self.device = next(model.parameters()).device
 
     def prefill(self, seq: Sequence, view) -> int:
@@ -21,6 +23,10 @@ class Executor:
         return self._sample(seq, logits)
 
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
+        if (self.graph_runner is not None
+                and len(views) <= BUCKETS[-1]
+                and all(s.sampling.temperature == 0 for s in seqs)):
+            return self.graph_runner.decode_batch(seqs, views)
         x = torch.tensor(
             [[s.generated_ids[-1]] for s in seqs], device=self.device, dtype=torch.long
         )

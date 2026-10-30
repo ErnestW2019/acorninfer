@@ -1,10 +1,14 @@
-"""Engine 端到端(tiny 模型,CPU):并发等价、连续提交、抢占回收、泄漏守卫。"""
+"""Engine 端到端(tiny 模型,CPU;decode_graph 等价两例走 GPU):
+并发等价、连续提交、抢占回收、泄漏守卫。
+"""
 
 import pytest
 import torch
 
+from acorninfer.config import Qwen3Config
 from acorninfer.engine.engine import Engine
 from acorninfer.generate import generate_cached
+from acorninfer.models.qwen3 import Qwen3ForCausalLM
 from acorninfer.sampler import SamplingParams
 
 
@@ -142,3 +146,81 @@ def test_temperature_sampling_end_to_end(engine):
     assert len(seq.generated_ids) == 3
     assert all(0 <= t < 256 for t in seq.generated_ids)
     engine.assert_balanced()
+
+
+@pytest.mark.gpu
+def test_engine_decode_graph_tokens_bitwise():
+    """graph 引擎 vs eager 引擎:同 submits 同步序,生成 token 逐位一致;
+    runner 启用钉死(构造期捕获,属性翻转不重建 runner 则必然不一致);
+    排空后 KV 平衡(graph 常驻 scratch 例外,见 Engine.assert_balanced)。"""
+    outs = []
+    for graph in (False, True):
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+        model.attention_backend = "triton"
+        model.fused_ops = True
+        model.decode_graph = graph          # 必须在 Engine 构造前置位
+        engine = Engine(model, None, num_blocks=64, page_size=4, max_running=8)
+        assert (engine.graph_runner is not None) == graph
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        sids = []
+        for i, L in enumerate([6, 10, 14, 18]):
+            ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
+            sids.append(engine.submit(ids[0].tolist(),
+                                      SamplingParams(temperature=0.0), max_tokens=6))
+        toks = {sid: [] for sid in sids}
+        while engine.has_pending():
+            for o in engine.step():
+                toks[o.seq_id].append(o.token_id)
+        for sid in sids:
+            engine.drop(sid)
+        engine.assert_balanced()
+        outs.append([toks[sid] for sid in sids])
+        model.to("cpu")
+    assert outs[0] == outs[1]
+
+
+@pytest.mark.gpu
+def test_engine_decode_graph_eos_shrinks_batch():
+    """decode 中途 EOS 退休使批缩小、桶切换(4→2)。
+
+    tiny 词表(256)吐不出 QWEN3_EOS_IDS,max_tokens=1 又在 prefill 就终
+    (缩不了 decode 批)—— 用两阶段陷阱:先跑无陷阱 eager 拿全量 token 流,
+    取各陷阱序列的第 2 个生成 token(= 首个 decode 产出)作 eos_ids 覆写,
+    两引擎同构重跑;批在第 1 个 decode 步后 4→2,余者仍逐位、跑满 max_tokens。
+    """
+
+    def run(graph, traps):
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+        model.attention_backend = "triton"
+        model.fused_ops = True
+        model.decode_graph = graph
+        engine = Engine(model, None, num_blocks=64, page_size=4, max_running=8)
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        prompts = []
+        for i, L in enumerate([6, 10, 14, 18]):
+            ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
+            prompts.append(ids[0].tolist())
+        sids = []
+        for i, p in enumerate(prompts):
+            kw = {"eos_ids": frozenset({traps[i]})} if i in traps else {}
+            sids.append(engine.submit(p, SamplingParams(temperature=0.0),
+                                      max_tokens=8, **kw))
+        toks = {sid: [] for sid in sids}
+        while engine.has_pending():
+            for o in engine.step():
+                toks[o.seq_id].append(o.token_id)
+        for sid in sids:
+            engine.drop(sid)
+        engine.assert_balanced()
+        model.to("cpu")
+        return [toks[sid] for sid in sids]
+
+    full = run(False, {})                              # 阶段 1:无陷阱全量流
+    traps = {0: full[0][1], 1: full[1][1]}             # 生成流第 2 个 token = 首个 decode 产出
+    eager = run(False, traps)
+    graph = run(True, traps)
+    assert eager == graph                              # 缩批后 token 仍逐位
+    assert len(eager[0]) == 2 and len(eager[1]) == 2   # 陷阱序列恰在第 1 个 decode 步终止
+    assert all(len(s) == 8 for s in eager[2:])         # 余者跑满 → 桶 4→2 切换确有发生
