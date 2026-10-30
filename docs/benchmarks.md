@@ -135,3 +135,55 @@ top kernel(按设备时间,20 步累计 Self CUDA / 折合每步 / 占 GPU 忙�
 1. **GPU 忙时只按 device_type=CUDA 事件累加**(torch 2.13:`key_averages()` 事件的属性名为 `self_device_time_total`,旧名 `self_cuda_time_total` 在 FunctionEventAvg 上已不存在,实测 AttributeError;`table(sort_by=...)` 统一用新名),与 profiler 表格 footer「Self CUDA time total: 399.810ms」同口径;表格中 CPU 算子行(如 aten::mm 行 Self CUDA 355.728ms)是子 kernel 时间归因,与 kernel 行双计,不入账。
 2. **batch=7 非 8**:同 seed 下与 M2/M3 C=8 档既有记录一致,1 条请求在第 2 个生成 token 命中 EOS,于预热期退役;计时窗口内 batch 恒为 7(脚本 sanity 行逐字:`sanity: alive=7/8 generated_per_seq=25 (batch 恒定贯穿计时窗口)`;窗口内若再有提前退役,脚本断言直接失败)。
 3. **27.37 ms/步含 profiler 逐 kernel 采样开销**(对照:M3 无 profiler 同配置 C=8 TPOT 24.93 ms,见上节引用);本节数字用于 kernel/gap 结构归因,绝对吞吐以 M3 节为准。
+
+## M4 T6 判定:kernel 调参按触发条件跳过(2026-10-31,`scripts/profile_decode.py --cuda-graph`,真机账目)
+
+T6(kernel 微调)预设双触发条件,须同时成立方开工:① decode GPU 忙时中 kernel 占比 ≥20%;② 引擎距 vLLM 100% 线 ≤10%。当日实测:① 成立(kernel 占比 73%,当日 profiler 账目);② 不成立(今晨 preview C=8 档 254.55 vs vLLM 354.91,距 100% 线 28.3% > 10%)→ **按计划跳过 kernel 调参,不为达标改码**。
+
+graph 路径 profiler 账目(2026-10-31,同上节协议,物理 GPU 1),与 eager(上节 2026-10-30 账目引用,非当日重跑)对照:
+
+| 指标 | eager(10-30) | graph(当日) |
+|---|---|---|
+| 每步墙钟 wall/step | 27.37 ms | 21.64 ms |
+| GPU 端累计(kernel+memcpy)/step | 19.99 ms | 19.84 ms |
+| 发射间隙 gap/step(wall − GPU 端) | 7.38 ms | 1.80 ms |
+
+gap 由 7.38 ms 降至 1.80 ms,graph 回收发射间隙的 75.6%(残差占 graph 墙钟的 8.3%)。结论:decode GPU 侧 ≈ 平价(graph 19.84 ms vs eager 19.99 ms),GPU 时间由 cuBLAS GEMM 主导(占 89%,上节账目)——graph 化只回收发射间隙,不改 GPU 侧工作量;当日残差归因图外 CPU(残余 gap ~1.8 ms/步)与 prefill 串行化(C=8 档本引擎 TTFT p50 0.1467 s vs 当日配对 vLLM 0.0817 s,调度器 prefill 单序列推进所致,推断,见下节)。
+
+## M4 实测:当日配对 A/B 验收(2026-10-31,`scripts/bench_remote.py` + `python -m acorninfer.bench`,真机输出)
+
+今晨中间实测(preview,graph on,物理 GPU 1,分母为 2026-10-30 归档 vLLM 线):C=1 53.97 tok/s(93.4%)、C=4 172.18 tok/s(83.0%)、C=8 254.55 tok/s(71.7%)。验收不用归档分母,以下为同日配对复测——vLLM 起服、三轮压测、关服在同一工作时段内完成(01:24:44 起服,01:25:23 健康探活 200,末轮压测完成 01:27:12 后随即关服),消机时漂移。聚合吞吐(tok/s):
+
+| 并发 | vLLM(当日配对) | 本引擎 graph | 本引擎 eager | graph vs eager | 达标率(graph ÷ 当日 vLLM) |
+|---|---|---|---|---|---|
+| 1 | 58.06 | 53.93 | 50.69 | +6.4% | **92.9%,未过 100%** |
+| 4 | 208.15 | 172.77 | 163.79 | +5.5% | **83.0%,未过 100%** |
+| 8 | 354.92 | 256.09 | 246.59 | +3.9% | **72.2%,未过 100%** |
+
+TTFT p50 / TPOT mean(格式 `TTFT / TPOT`):
+
+| 并发 | vLLM(当日配对) | graph | eager |
+|---|---|---|---|
+| 1 | 0.0270 s / 16.91 ms | 0.0355 s / 18.00 ms | 0.0348 s / 19.24 ms |
+| 4 | 0.0661 s / 17.81 ms | 0.0822 s / 21.25 ms | 0.0812 s / 22.59 ms |
+| 8 | 0.0817 s / 17.89 ms | 0.1467 s / 23.95 ms | 0.1457 s / 24.89 ms |
+
+命令(照 M3 基线格式)。服务(物理 GPU 0,与 M3 基线记录逐字一致):`CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --dtype bfloat16 --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90`(nohup 后台,前台轮询 `/health` 至 200)。压测三连(物理 GPU 1,每条前台执行;seed 默认 20261027,与 M3 同):
+
+- vLLM:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --concurrency 1 4 8`
+- graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 --attention-backend triton --fused-ops --cuda-graph`
+- eager:同上,去掉 `--cuda-graph`
+
+RESULT 行逐字(stdout):
+
+- vLLM:`RESULT-VLLM C=1 ttft_p50=0.0270s ttft_mean=0.0270s tpot_mean=16.91ms tok_s=58.06` / `RESULT-VLLM C=4 ttft_p50=0.0661s ttft_mean=0.0570s tpot_mean=17.81ms tok_s=208.15` / `RESULT-VLLM C=8 ttft_p50=0.0817s ttft_mean=0.0749s tpot_mean=17.89ms tok_s=354.92`
+- graph:`RESULT C=1 ttft_p50=0.0355s ttft_mean=0.0355s tpot_mean=18.00ms tok_s=53.93` / `RESULT C=4 ttft_p50=0.0822s ttft_mean=0.0821s tpot_mean=21.25ms tok_s=172.77` / `RESULT C=8 ttft_p50=0.1467s ttft_mean=0.1467s tpot_mean=23.95ms tok_s=256.09`
+- eager:`RESULT C=1 ttft_p50=0.0348s ttft_mean=0.0348s tpot_mean=19.24ms tok_s=50.69` / `RESULT C=4 ttft_p50=0.0812s ttft_mean=0.0811s tpot_mean=22.59ms tok_s=163.79` / `RESULT C=8 ttft_p50=0.1457s ttft_mean=0.1458s tpot_mean=24.89ms tok_s=246.59`
+
+口径注记(均为实测事实):
+
+1. **机时漂移核对**:当日 vLLM 对 10-30 归档漂移 +0.4%/+0.4%/+0.0%(58.06/57.81、208.15/207.39、354.92/354.91),远小于 M3 节记录的 ±2-3% 机时漂移带,配对口径成立;本引擎 graph 当日数字与今晨 preview 差 ≤0.6%(53.93/53.97、172.77/172.18、256.09/254.55)。
+2. **C=8 档提前 EOS 复现**:本引擎 graph/eager 两列 out/token-stats 均 `min=2 max=32 / 32`(总 226/256 token,一条请求第 2 token 命中 EOS),与 M2/M3/vLLM 侧既有记录逐项一致;TPOT 按 n>1 的 8/8 序计算。
+3. **GPU 分工与清理**:起服前双卡 ~4 MiB / 0%;vLLM 独占物理 GPU 0、引擎压测独占物理 GPU 1;关服后 GPU 0 回落 4 MiB,`nvidia-smi --query-compute-apps` 为空(无残留计算进程)。
+
+**验收判定(逐档 ≥100% 当日 vLLM 与否,如实):三档均未过——C=1 线的 92.9%、C=4 线的 83.0%、C=8 线的 72.2%。** graph 相对 eager 的当日净增益为 +6.4%/+5.5%/+3.9%,与 T6 账目(回收 75.6% 发射间隙、GPU 侧平价)相互印证;C=8 残余缺口主体仍在 GPU 侧 GEMM 利用率与 prefill 串行化(TTFT 0.1467 vs 0.0817 s)——此句为对实测数字的归因推断。
