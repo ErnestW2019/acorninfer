@@ -4,8 +4,12 @@ Phase 1(split)grid = (B, H, S):按 Q 头铺开,每 program 算一个
 (序列, Q 头, KV 分片) 的 online-softmax 部和 (acc, m, l);GQA 下
 kv 头 = hq // REP(REP = H // KV)。并行度公式按 Q 头估是 B×H(已含
 GQA 因子)。num_splits 启发式固定 SM=128(4090),调参归 Task 8。
-Phase 2(combine)grid = (B*H,):按 l 加权合并各 split 的部分和,
-fp32 归一后 cast 回 q dtype 单次取整。
+Phase 2(combine)grid = (B*H,):以公共 max-m 重标定合并(β=exp(m_s−m_new)),
+l 同步累计,末尾 acc/l_j 归一,cast 回 q dtype 单次取整。
+
+输入即 M2 页张量+块表,直读不 gather;q_len≡1(decode 步),无因果掩码。
+分片按整页对齐(计划草稿的 token 均分块在非页对齐块首会错位读,缘由见
+_paged_attn_split_kernel 内注释)。
 
 数值策略:q/k/v load 后全程 fp32 计算(online softmax 标准两常数更新),
 仅 combine 末尾 cast 回输出 dtype —— attention 是 L 长求和,归约序漂移
@@ -13,8 +17,8 @@ fp32 归一后 cast 回 q dtype 单次取整。
 
 尾块 mask 只处理"slot ≥ 有效 token 数"一种:块表无空洞、前缀恒稠密
 (pager.write 顺序 scatter 保证)。空分片(start ≥ end)存 (m=-inf, l=0,
-acc=0),combine 按 l==0 跳(beta=exp(-inf - m_new)=0);decode 步不变式
-L ≥ 1 → split 0 非空 → combine 首迭代 m_new 必有限,全程无 NaN。
+acc=0),combine 无分支:β=exp(m_s−m_new),空分片 m_s=−inf → β=0,零贡献。
+decode 步不变式 L ≥ 1 → split 0 非空 → combine 首迭代 m_new 必有限,全程无 NaN。
 """
 
 from __future__ import annotations
@@ -122,13 +126,16 @@ def paged_decode_attention(q, k_pages, v_pages, tables, seq_lens, num_splits: in
     """q [B,H,D](contiguous,已 norm+rope);k/v_pages [NB,P,KV,D];
     tables [B,MP] int32;seq_lens [B] int32(含本步新 token)。
     返回 [B,H,D] 与 q 同 dtype。GQA 映射 q 头 j ← kv 头 j // (H//KV),
-    与 pager._gather + repeat_interleave 的 torch 路径(oracle)一致。"""
+    与 pager._gather + repeat_interleave 的 torch 路径(oracle)一致。
+    dtype:fp32/bf16 已对拍,fp16 未单独对拍。"""
     B, H, D = q.shape
     NB, P, KV, _ = k_pages.shape
     S = num_splits
     assert D & (D - 1) == 0 and P & (P - 1) == 0, "D and P must be power-of-2"
     assert H % KV == 0, "GQA requires H divisible by KV"
     assert S >= 1
+    assert v_pages.shape == k_pages.shape
+    assert tables.shape[0] == B and seq_lens.shape[0] == B
     assert k_pages.is_contiguous() and v_pages.is_contiguous()
     assert tables.is_contiguous() and seq_lens.is_contiguous()
     q2 = q.reshape(B * H, D).contiguous()
