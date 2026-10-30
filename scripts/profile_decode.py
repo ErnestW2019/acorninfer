@@ -1,6 +1,8 @@
 """decode 步 profiler 账目(M4 T1):docs 的"推断"升级为实测。
 
 跑法:CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/profile_decode.py
+可选 --cuda-graph:走 Engine 的 graph 路径(Task 4 接线)再测同一账目 ——
+两账相减即图外 CPU 残差(prepare/H2D 覆写/_commit_lens/采样同步)的实测归因。
 输出:每步墙钟、GPU 端累计(kernel+memcpy)、发射间隙(gap = 墙钟 − GPU 端,
 即 CUDA graph 的理论收益上限)、每步 kernel 启动次数与 H2D/D2H 次数、
 top-15 kernel 表。
@@ -44,6 +46,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--cuda-graph", action="store_true",
+                    help="decode 走 CUDA graph 路径(Task 4);对照 eager 账目")
     args = ap.parse_args()
     if not args.device.startswith("cuda"):
         ap.error(
@@ -55,6 +59,9 @@ def main() -> None:
     model = from_pretrained(DEFAULT_MODEL, args.device, torch.bfloat16)
     model.attention_backend = "triton"
     model.fused_ops = True
+    # decode_graph 必须在 Engine 构造前置位:graph runner 在 Engine.__init__
+    # 捕获各桶(Task 4 契约),事后置位不重建 runner
+    model.decode_graph = args.cuda_graph
     engine = Engine(model, None, num_blocks=1024, page_size=16, max_running=8)
     try:
         vocab = model.cfg.vocab_size
