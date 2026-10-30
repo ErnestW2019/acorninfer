@@ -105,7 +105,7 @@ class PagedCacheView:
 
     def write(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
         """纯 scatter:写入新 token 的 k/v;不读不 gather(读侧由调用方定:
-        update() = write + gather;M3 triton 后端只 write,attention 直接读页)。
+        update() = write + gather;M3 Triton 后端只 write,attention 直接读页)。
         分配在 scatter 之前全部完成:BlockExhausted 中断零部分写入、_lens 未提交。
 
         k_new/v_new: [1, kv_heads, s, head_dim];块不足时按需 allocate。
