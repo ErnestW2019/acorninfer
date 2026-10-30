@@ -18,7 +18,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import torch
 
 from acorninfer.bench import _prompts
 
@@ -75,6 +74,13 @@ def main() -> None:
     vocab = Qwen3Config.from_json(f"{args.model_dir}/config.json").vocab_size
 
     with httpx.Client(timeout=300.0) as client:
+        # warmup:1 条小请求(镜像 acorninfer.bench 协议:8 prompt token,
+        # min(4, out_tokens) 输出),触发服务端一次性初始化路径,不计入任何档位指标
+        warm = [dict()]
+        _run_one(client, args.base, _prompts(1, 8, vocab, args.seed)[0],
+                 min(4, args.out_tokens), warm[0])
+        print("warmup done (1 request, not measured)")
+
         for level in args.concurrency:
             prompts = _prompts(level, args.in_tokens, vocab, args.seed)
             outs = [dict() for _ in prompts]
