@@ -315,25 +315,24 @@ class Qwen3ForCausalLM(nn.Module):
         (positions, tables, lens, (pages, slots)),由调用方(DecodeGraphRunner)
         在图外完成原 prepare 后传入 —— prepare 的 CPU torch.tensor 构建 + H2D
         若在图内执行,重放会从捕获期冻结的源地址拷贝陈旧数据。其语义与自
-        prepare(prepared=None)逐位一致(单测钉死);None(默认)= 自 prepare,
-        既有 eager 执行序不变。rope 派生不进四件套:positions 已在设备上,
-        fused 路径纯引用 inv_freq buffer、非融合路径为纯 GPU kernel,图内
-        执行可安全捕获,故仍由本函数完成。
+        prepare(prepared=None)逐位一致(单测钉死);prepared 仅对 triton 后端
+        有意义(sdpa 分支忽略 tables/lens/scatter);None(默认)= 自 prepare,
+        既有 eager 执行序不变。
+        dtype 契约:positions/scatter = long,tables/lens = build_tables 产物
+        (int32);与图外静态缓冲逐字段一致,勿自选 dtype(单测只钉值,不钉 dtype)。
+        rope 派生不进四件套:positions 已在设备上,fused 路径纯引用 inv_freq
+        buffer、非融合路径为纯 GPU kernel,图内执行可安全捕获,故仍由本函数完成。
         """
         if input_ids.shape[1] != 1:
             # s>1 会静默腐败:cos/sin 广播成同位置、update 多写 token
             raise ValueError("forward_decode expects [B, 1] input_ids (decode step)")
         if prepared is not None:
-            # M4:graph 捕获路径。prepare 的 CPU torch.tensor 构建 + H2D 若在
-            # 图内执行,重放会从捕获期冻结的源地址拷贝陈旧数据 —— 故由调用方
-            # 图外完成并传入。契约:四件套 (positions, tables, lens, (pages, slots)),
-            # 语义与自 prepare(prepared=None)逐位一致(Task 2 单测钉死)。
+            # M4 graph 捕获路径:四件套契约、dtype、图外理由见 docstring prepared 契约。
             positions, tables, lens, scatter = prepared
         else:
             positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
         # rope 派生与 prepare 无数据依赖,位置不动:prepared=None 时执行序与
-        # 改前逐语句相同;prepared 路径用传入 positions 走同一派生(cos/sin/
-        # inv_freq 不随 prepared 传入,见 docstring)。
+        # 改前逐语句相同;prepared 路径用传入 positions 走同一派生。
         if self.fused_ops:
             # K2:cos/sin 不再预算,kernel 内由 positions×inv_freq 重算
             # (inv_freq 是 fp32 buffer,模块 .to(dtype) 后变 bf16,wrapper 内 .float() 还原)

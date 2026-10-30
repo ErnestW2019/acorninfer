@@ -137,7 +137,8 @@ def test_decode_backends_logits_equivalent(tiny_model, backend, fused):
 
 
 @pytest.mark.gpu
-def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch):
+@pytest.mark.parametrize("fused", [True, False])
+def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch, fused):
     """prepared 四件套路径 ≡ 自 prepare 路径(逐位);且传入 prepared 时
     forward_decode 内部零 ensure 调用 —— 否则 graph 捕获会冻结 CPU 源地址。
 
@@ -148,8 +149,9 @@ def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch):
     from acorninfer.ops.paged_attention import build_tables
 
     model = tiny_model.to("cuda")
+    torch.manual_seed(0)
     model.attention_backend = "triton"
-    model.fused_ops = True
+    model.fused_ops = fused
     alloc = BlockAllocator(32)  # 2 序列:ceil(5/4)+ceil(9/4)+2 追加位 = 7 页,富余
     cache = PagedKVCache(
         model.cfg.num_hidden_layers,
@@ -169,8 +171,7 @@ def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch):
             views.append(view)
             tokens.append(int(ids[0, -1]))
 
-        # 关键时序:pre-write 状态与 scatter 目标必须在参考步**之前**取 ——
-        # decode 一步会提交 _lens(L → L+1),之后同状态无法再复现
+        # pre 状态与 scatter 目标必须在参考步**之前**取(理由见 docstring 关键时序)。
         pre = [int(v.seq_len) for v in views]
         targets = [v.ensure_append_capacity(0) for v in views]
         x = torch.tensor([[t] for t in tokens], device="cuda")
