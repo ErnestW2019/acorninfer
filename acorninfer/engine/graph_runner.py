@@ -7,7 +7,9 @@
   _lens 提交)只在捕获期执行一次,重放不执行 —— _lens 提交由 runner 在
   prepare 阶段代行(_commit_lens),捕获期那次与代行同值,无副作用;
 - padding 行:views 尾部补 dummy view;scatter 索引指向 scratch 块(init
-  期从 allocator 常驻分配,永不读);输出由调用方丢弃;
+  期从 allocator 常驻分配,永不读);输出由调用方丢弃;缩批后旧 padding 行
+  残留的真 (page,slot) 必须每步压回 scratch(decode_batch 重置),否则引擎
+  复用退休页时 replay scatter 会写花活序列 KV;
 - 捕获在 runner 构造期完成(全 dummy views):请求路径零捕获抖动;捕获前
   3 次 side-stream warmup 与正式步计算同值(确定性 + 同 (page,slot) 写同
   k/v 的幂等性)。
@@ -108,7 +110,13 @@ class DecodeGraphRunner:
         t, _ = build_tables(views, self.page_size, self.device, lens_override=new_len)
         st.tables.zero_()
         st.tables[:B, : t.shape[1]].copy_(t)
-        st.tables[B:, 0] = self.scratch  # padding 行的常量场(zero_ 后重写)
+        # padding 行三场每步重置(pages/slots/tables 首列):缩批后旧 padding 行
+        # 残留退休序列的真 (page,slot) —— 引擎 free 该页、allocator LIFO 把它
+        # 发给下一个 prefill 后,不重置的 replay scatter 会写花活序列 KV(静默
+        # 腐败;tables 首列 zero_ 后须重写,kernel 按 padding lens=1 只读首列)。
+        st.pages[B:].fill_(self.scratch)
+        st.slots[B:].zero_()
+        st.tables[B:, 0] = self.scratch
         st.ids[:B].copy_(torch.tensor([[s.generated_ids[-1]] for s in seqs], dtype=torch.long))
         self._commit_lens(views, new_len)
         st.graph.replay()
