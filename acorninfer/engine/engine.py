@@ -65,6 +65,8 @@ class Engine:
     @classmethod
     def from_config(cls, cfg: EngineConfig, tokenizer: Tokenizer) -> "Engine":
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
+        model.attention_backend = cfg.attention_backend
+        model.fused_ops = cfg.fused_ops
         return cls(
             model,
             tokenizer,

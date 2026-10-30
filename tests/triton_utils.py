@@ -17,7 +17,11 @@ TOL_F32 = dict(rtol=1e-5, atol=1e-5)
 
 # bf16 初值(宽松;各 kernel 标定后收紧):bf16 ulp ≈ 2^-8 相对,跨路径双重
 # 取整放宽到 ~2%。标定命令见各测试 docstring。
-TOL_BF16 = dict(rtol=2e-2, atol=2e-2)
+# 标定:2026-10-30 K1 fused_add_rmsnorm 首标,bit-exact(max|diff|=0.0,32 组
+# x/residual/case 全零);命令 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest
+# tests/test_ops_rmsnorm.py -v -s`。按实测收紧到 1e-2(为后续 kernel 的归约序
+# 漂移留 ~2-3 ulp 余量;新 kernel 落地时按协议再标定、再收紧)。
+TOL_BF16 = dict(rtol=1e-2, atol=1e-2)
 
 
 def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:

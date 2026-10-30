@@ -178,12 +178,23 @@ class Qwen3Block(nn.Module):
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
-    def forward_decode(self, hidden, cos, sin, views, layer_idx):
-        hidden = hidden + self.self_attn.forward_decode(
-            self.input_layernorm(hidden), cos, sin, views, layer_idx
+    def forward_decode(self, hidden, cos, sin, views, layer_idx, *, fused_ops=False):
+        if not fused_ops:
+            hidden = hidden + self.self_attn.forward_decode(
+                self.input_layernorm(hidden), cos, sin, views, layer_idx
+            )
+            hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+            return hidden
+        from acorninfer.ops.rmsnorm import fused_add_rmsnorm  # 局部导入,避免 torch 路径依赖 ops
+        normed, residual = fused_add_rmsnorm(
+            hidden, None, self.input_layernorm.weight, self.input_layernorm.eps
         )
-        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
-        return hidden
+        hidden = self.self_attn.forward_decode(normed, cos, sin, views, layer_idx)
+        normed, residual = fused_add_rmsnorm(
+            hidden, residual, self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        return residual + self.mlp(normed)
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -195,6 +206,9 @@ class Qwen3ForCausalLM(nn.Module):
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.rope_theta)
+        # M3 后端开关(EngineConfig/bench/测试直接赋值;默认 = M2 行为)
+        self.attention_backend = "sdpa"
+        self.fused_ops = False
 
     def forward(
         self,
@@ -242,7 +256,7 @@ class Qwen3ForCausalLM(nn.Module):
         sin = sin[:, None, None, :]
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
-            hidden = layer.forward_decode(hidden, cos, sin, views, i)
+            hidden = layer.forward_decode(hidden, cos, sin, views, i, fused_ops=self.fused_ops)
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
 

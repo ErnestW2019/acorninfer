@@ -77,6 +77,8 @@ class EngineConfig:
     page_size: int = 16
     max_running: int = 8        # decode batch 上限
     watermark_blocks: int = 8   # 水位:free 低于此值不再准入,降低抢占概率
+    attention_backend: str = "sdpa"  # "sdpa" | "triton"(M3 paged attention)
+    fused_ops: bool = False          # True → decode 走 K1/K2 融合算子(M3)
 
     def __post_init__(self) -> None:
         # CLI(Task 10 bench/server)直接透传参数,坏值在构造期爆掉而非运行期排队卡死
@@ -88,3 +90,7 @@ class EngineConfig:
             raise ValueError(f"max_running must be >= 1, got {self.max_running}")
         if self.watermark_blocks < 0:
             raise ValueError(f"watermark_blocks must be >= 0, got {self.watermark_blocks}")
+        if self.attention_backend not in ("sdpa", "triton"):
+            raise ValueError(
+                f"attention_backend must be 'sdpa'|'triton', got {self.attention_backend!r}"
+            )
