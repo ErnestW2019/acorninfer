@@ -134,3 +134,69 @@ def test_decode_backends_logits_equivalent(tiny_model, backend, fused):
     if backend == "triton":
         again = run_combo()
         assert torch.equal(steps, again)  # kernel 确定性
+
+
+@pytest.mark.gpu
+def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch):
+    """prepared 四件套路径 ≡ 自 prepare 路径(逐位);且传入 prepared 时
+    forward_decode 内部零 ensure 调用 —— 否则 graph 捕获会冻结 CPU 源地址。
+
+    关键时序:pre-write 状态(pre/长度/scatter 目标)必须在参考步**之前**
+    取 —— decode 一步会提交 _lens(L → L+1),之后同状态无法再复现。
+    """
+    import acorninfer.cache.pager as pager_mod
+    from acorninfer.ops.paged_attention import build_tables
+
+    model = tiny_model.to("cuda")
+    model.attention_backend = "triton"
+    model.fused_ops = True
+    alloc = BlockAllocator(32)  # 2 序列:ceil(5/4)+ceil(9/4)+2 追加位 = 7 页,富余
+    cache = PagedKVCache(
+        model.cfg.num_hidden_layers,
+        model.cfg.num_key_value_heads,
+        model.cfg.head_dim,
+        4,
+        alloc,
+        "cuda",
+        torch.bfloat16,
+    )
+    views, tokens = [], []
+    with torch.inference_mode():
+        for L in (5, 9):
+            ids = torch.randint(0, 256, (1, L), device="cuda")
+            view = PagedCacheView(cache)
+            model(ids, view)  # prefill:写入 L 个 token 的 KV
+            views.append(view)
+            tokens.append(int(ids[0, -1]))
+
+        # 关键时序:pre-write 状态与 scatter 目标必须在参考步**之前**取 ——
+        # decode 一步会提交 _lens(L → L+1),之后同状态无法再复现
+        pre = [int(v.seq_len) for v in views]
+        targets = [v.ensure_append_capacity(0) for v in views]
+        x = torch.tensor([[t] for t in tokens], device="cuda")
+        ref = model.forward_decode(x, views)  # eager 自 prepare
+
+        # runner 同款图外 prepare → prepared(四件套,build_tables 返回 (tables, lens))
+        calls = {"n": 0}
+        real_ensure = pager_mod.PagedCacheView.ensure_append_capacity
+
+        def spy_ensure(self, layer_idx):
+            calls["n"] += 1
+            return real_ensure(self, layer_idx)
+
+        monkeypatch.setattr(pager_mod.PagedCacheView, "ensure_append_capacity", spy_ensure)
+        tables, lens = build_tables(views, 4, "cuda", lens_override=[p + 1 for p in pre])
+        prepared = (
+            torch.tensor(pre, device="cuda"),
+            tables,
+            lens,
+            (torch.tensor([p for p, _ in targets], device="cuda", dtype=torch.long),
+             torch.tensor([s for _, s in targets], device="cuda", dtype=torch.long)),
+        )
+        out = model.forward_decode(x, views, prepared=prepared)
+    assert calls["n"] == 0  # 测试自己的 ensure 在 spy 装配前;prepared 路径内部必须零调用
+    assert torch.equal(out, ref)  # 与 eager 自 prepare 逐位一致
+    for v in views:
+        for blk in v.table:
+            alloc.free(blk)
+    alloc.assert_balanced()

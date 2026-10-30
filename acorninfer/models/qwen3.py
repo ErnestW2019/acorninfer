@@ -300,7 +300,7 @@ class Qwen3ForCausalLM(nn.Module):
             hidden = hidden[:, -num_logits_to_keep:, :]
         return self.lm_head(hidden).float()
 
-    def forward_decode(self, input_ids: torch.Tensor, views) -> torch.Tensor:
+    def forward_decode(self, input_ids: torch.Tensor, views, *, prepared=None) -> torch.Tensor:
         """批量 decode:input_ids [B, 1] + 每序列的 PagedCacheView -> [B, vocab]。
 
         契约:views 非空(B ≥ 1);views[i] 与 input_ids[i] 一一对应;
@@ -311,11 +311,29 @@ class Qwen3ForCausalLM(nn.Module):
         (跨页分新页)+ 块表/长度(含本步新 token = pre-write + 1)+ scatter
         目标一次构建并随层下传,消除原每层每步的 build_tables 重建与逐序列
         write 小发射;RoPE 位置仍为 pre-write seq_len(容量确保不提交长度)。
+        prepared(M4,可选):graph 捕获路径的四件套
+        (positions, tables, lens, (pages, slots)),由调用方(DecodeGraphRunner)
+        在图外完成原 prepare 后传入 —— prepare 的 CPU torch.tensor 构建 + H2D
+        若在图内执行,重放会从捕获期冻结的源地址拷贝陈旧数据。其语义与自
+        prepare(prepared=None)逐位一致(单测钉死);None(默认)= 自 prepare,
+        既有 eager 执行序不变。rope 派生不进四件套:positions 已在设备上,
+        fused 路径纯引用 inv_freq buffer、非融合路径为纯 GPU kernel,图内
+        执行可安全捕获,故仍由本函数完成。
         """
         if input_ids.shape[1] != 1:
             # s>1 会静默腐败:cos/sin 广播成同位置、update 多写 token
             raise ValueError("forward_decode expects [B, 1] input_ids (decode step)")
-        positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
+        if prepared is not None:
+            # M4:graph 捕获路径。prepare 的 CPU torch.tensor 构建 + H2D 若在
+            # 图内执行,重放会从捕获期冻结的源地址拷贝陈旧数据 —— 故由调用方
+            # 图外完成并传入。契约:四件套 (positions, tables, lens, (pages, slots)),
+            # 语义与自 prepare(prepared=None)逐位一致(Task 2 单测钉死)。
+            positions, tables, lens, scatter = prepared
+        else:
+            positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
+        # rope 派生与 prepare 无数据依赖,位置不动:prepared=None 时执行序与
+        # 改前逐语句相同;prepared 路径用传入 positions 走同一派生(cos/sin/
+        # inv_freq 不随 prepared 传入,见 docstring)。
         if self.fused_ops:
             # K2:cos/sin 不再预算,kernel 内由 positions×inv_freq 重算
             # (inv_freq 是 fp32 buffer,模块 .to(dtype) 后变 bf16,wrapper 内 .float() 还原)
@@ -327,26 +345,27 @@ class Qwen3ForCausalLM(nn.Module):
             cos = cos[:, None, None, :]
             sin = sin[:, None, None, :]
             inv_freq = None
-        tables = lens = scatter = None
-        if self.attention_backend == "triton":
-            from acorninfer.ops.paged_attention import build_tables
-            # M3 Task 9:步首一次 prepare(层循环之前),替代原每步 36 层 ×
-            # (build_tables CPU 构造 + H2D 同步,加 B 次逐序列 write 小算子)。
-            page_size = views[0].cache.page_size
-            targets = [v.ensure_append_capacity(0) for v in views]  # 跨页者在此分新页
-            scatter = (
-                torch.tensor([p for p, _ in targets],
-                             device=input_ids.device, dtype=torch.long),
-                torch.tensor([s for _, s in targets],
-                             device=input_ids.device, dtype=torch.long),
-            )
-            # lens 含本步新 token(pre-write + 1):旧路径 build_tables 在
-            # layer-0 write 之后取 seq_len,得值与此逐位相同;块表行宽与
-            # 零填充由 build_tables 自身构造,kernel 输入逐位不变。
-            tables, lens = build_tables(
-                views, page_size, input_ids.device,
-                lens_override=[int(v.seq_len) + 1 for v in views],
-            )
+        if prepared is None:
+            tables = lens = scatter = None
+            if self.attention_backend == "triton":
+                from acorninfer.ops.paged_attention import build_tables
+                # M3 Task 9:步首一次 prepare(层循环之前),替代原每步 36 层 ×
+                # (build_tables CPU 构造 + H2D 同步,加 B 次逐序列 write 小算子)。
+                page_size = views[0].cache.page_size
+                targets = [v.ensure_append_capacity(0) for v in views]  # 跨页者在此分新页
+                scatter = (
+                    torch.tensor([p for p, _ in targets],
+                                 device=input_ids.device, dtype=torch.long),
+                    torch.tensor([s for _, s in targets],
+                                 device=input_ids.device, dtype=torch.long),
+                )
+                # lens 含本步新 token(pre-write + 1):旧路径 build_tables 在
+                # layer-0 write 之后取 seq_len,得值与此逐位相同;块表行宽与
+                # 零填充由 build_tables 自身构造,kernel 输入逐位不变。
+                tables, lens = build_tables(
+                    views, page_size, input_ids.device,
+                    lens_override=[int(v.seq_len) + 1 for v in views],
+                )
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
             hidden = layer.forward_decode(
