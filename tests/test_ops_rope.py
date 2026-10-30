@@ -36,6 +36,7 @@ def test_rope_matches_ref_bf16_bitwise_or_calibrated():
     直接 `.to(act)` 取整会被 triton elementwise 降级改写成单次取整的 bf16
     原生 fma(~3-13% 元素差 1 ulp)。若未来 triton 升级破坏屏障,本测试
     退级到 TOL_BF16 放行并打印实测 max|diff| 供按协议回填标定。
+    标定命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest tests/test_ops_rope.py -v -s`
     """
     worst = 0.0
     for x, pos, inv_freq in _gen(torch.bfloat16):
@@ -43,14 +44,13 @@ def test_rope_matches_ref_bf16_bitwise_or_calibrated():
         q = x.clone()
         k = x.clone()
         fused_rope_inplace(q, k, pos, inv_freq.to("cuda"))
+        worst = max(worst, max_abs_diff(q, ref))
         try:
             torch.testing.assert_close(q, ref, rtol=0, atol=0)  # 目标:逐位
         except AssertionError:
-            worst = max(worst, max_abs_diff(q, ref))
             torch.testing.assert_close(q, ref, **TOL_BF16)      # 退级:标定容差
         assert torch.equal(k, q)  # 同输入同 kernel,q/k 必一致
-    if worst > 0:
-        print(f"\n[rope bf16 退级:bitwise 失效,实测 max|diff| = {worst:.6f}]")
+    print(f"\n[rope bf16 calibrated max|diff| = {worst:.6f}]")  # 标定输出,回填 TOL;逐位绿时为 0.0
 
 
 # ---- 集成:tiny 模型 decode 路径(复用 K1 的 env helper;计划里的 M1 KVCache

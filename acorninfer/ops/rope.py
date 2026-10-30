@@ -31,6 +31,9 @@ def _round_via_act(x, ACT_BF16: tl.constexpr, ACT_F16: tl.constexpr):
     对所有 pass 不透明,取整段数与 torch 逐段对齐。恒返 fp32 —— Triton
     统一 jit 函数各 return 分支的类型。fp32 激活时为 mov.f32 恒等屏障:
     挡住 LLVM 把相邻 fmul+fsub 收缩成 fma.f32(torch 逐元素路径无收缩)。
+    屏障只挡 Triton/LLVM 层,ptxas 仍可能在屏障之下做 FFMA 收缩 —— 故
+    fp32 路径并非逐位(实测 max|diff| ~2.4e-7 ≪ TOL_F32);逐位目标仅
+    对 bf16 成立。
     """
     if ACT_BF16:
         return tl.inline_asm_elementwise(
@@ -92,8 +95,10 @@ def fused_rope_inplace(q, k, positions, inv_freq):
     dtype:bf16/fp32 已对拍;fp16 走同一 cvt.rn 机制(未单独对拍)。
     """
     B, H, s, D = q.shape
-    assert s == 1 and D % 2 == 0 and (D & (D - 1)) == 0, "D must be power-of-2"
+    assert s == 1 and D % 2 == 0 and (D & (D - 1)) == 0, "s==1 and D power-of-2 required"
     assert q.is_contiguous() and k.is_contiguous()
+    assert k.dtype == q.dtype and k.device == q.device
+    assert k.shape[0] == B and k.shape[2] == s and k.shape[3] == D  # H 可异(GQA)
     act_bf16 = q.dtype == torch.bfloat16
     act_f16 = q.dtype == torch.float16
     inv_freq = inv_freq.float()

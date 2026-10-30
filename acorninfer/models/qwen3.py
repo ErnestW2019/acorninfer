@@ -133,6 +133,7 @@ class Qwen3Attention(nn.Module):
         fused_ops=True 时走 K2 fused RoPE:需要 positions[B] + inv_freq[D/2],
         且 cos/sin 必须为 None(否则 torch 路径的 cos/sin 与 kernel 内重算
         会二选一,传双份是调用方 bug)。
+        attention_backend:预留 Task 7 接入点,当前不生效(恒走 SDPA)。
         """
         B, s, _ = hidden.shape
         q = self.q_proj(hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
