@@ -133,8 +133,15 @@ class Qwen3Attention(nn.Module):
         fused_ops=True 时走 K2 fused RoPE:需要 positions[B] + inv_freq[D/2],
         且 cos/sin 必须为 None(否则 torch 路径的 cos/sin 与 kernel 内重算
         会二选一,传双份是调用方 bug)。
-        attention_backend:预留 Task 7 接入点,当前不生效(恒走 SDPA)。
+        attention_backend="triton" 时走 K3 分页 decode attention:各序列
+        write 进页(纯 scatter)后 build_tables,kernel 按块表直读页张量、
+        不 gather;lens 含本步新 token,与 SDPA 分支 update() 的可见性
+        语义一致(都 attend 到含新 token 的全序列)。
         """
+        if attention_backend not in ("sdpa", "triton"):
+            raise ValueError(
+                f"attention_backend must be 'sdpa'|'triton', got {attention_backend!r}"
+            )
         B, s, _ = hidden.shape
         q = self.q_proj(hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -153,16 +160,31 @@ class Qwen3Attention(nn.Module):
             q = q * cos + _rotate_half(q) * sin
             k = k * cos + _rotate_half(k) * sin
 
-        rep = self.num_heads // self.num_kv_heads
-        outs = []
-        # 每层每序列全量 gather(O(seq_len) 拷贝)是刻意的参考设计;M3 的分页
-        # attention kernel 直接按页读取,消除这份拷贝
-        for b, view in enumerate(views):
-            k_full, v_full = view.update(layer_idx, k[b : b + 1], v[b : b + 1])
-            k_full = _repeat_kv(k_full, rep)
-            v_full = _repeat_kv(v_full, rep)
-            outs.append(F.scaled_dot_product_attention(q[b : b + 1], k_full, v_full))
-        out = torch.cat(outs, dim=0)                 # [B, H, 1, D]
+        if attention_backend == "triton":
+            from acorninfer.ops.paged_attention import (
+                build_tables, num_splits_for, paged_decode_attention,
+            )
+            cache = views[0].cache
+            for b, view in enumerate(views):
+                view.write(layer_idx, k[b : b + 1], v[b : b + 1])   # 纯 scatter,不 gather
+            tables, lens = build_tables(views, cache.page_size, q.device)
+            out = paged_decode_attention(
+                q[:, :, 0, :],                       # [B, H, D];RMSNorm 输出,contiguous
+                cache.k_pages[layer_idx], cache.v_pages[layer_idx],
+                tables, lens, num_splits_for(B, self.num_heads),
+            )
+            out = out[:, :, None, :]                 # 与 SDPA 分支同构 [B, H, 1, D]
+        else:
+            rep = self.num_heads // self.num_kv_heads
+            outs = []
+            # 每层每序列全量 gather(O(seq_len) 拷贝)是刻意的参考设计;M3 的分页
+            # attention kernel 直接按页读取,消除这份拷贝
+            for b, view in enumerate(views):
+                k_full, v_full = view.update(layer_idx, k[b : b + 1], v[b : b + 1])
+                k_full = _repeat_kv(k_full, rep)
+                v_full = _repeat_kv(v_full, rep)
+                outs.append(F.scaled_dot_product_attention(q[b : b + 1], k_full, v_full))
+            out = torch.cat(outs, dim=0)             # [B, H, 1, D]
         out = out.transpose(1, 2).reshape(B, s, -1)
         return self.o_proj(out)
 
@@ -192,11 +214,13 @@ class Qwen3Block(nn.Module):
         return hidden
 
     def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
-                       positions=None, inv_freq=None, fused_ops=False):
+                       positions=None, inv_freq=None, fused_ops=False,
+                       attention_backend="sdpa"):
         if not fused_ops:
             hidden = hidden + self.self_attn.forward_decode(
                 self.input_layernorm(hidden), cos, sin, views, layer_idx,
                 positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
+                attention_backend=attention_backend,
             )
             hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
             return hidden
@@ -207,6 +231,7 @@ class Qwen3Block(nn.Module):
         hidden = self.self_attn.forward_decode(
             normed, cos, sin, views, layer_idx,
             positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
+            attention_backend=attention_backend,
         )
         normed, residual = fused_add_rmsnorm(
             hidden, residual, self.post_attention_layernorm.weight,
@@ -285,6 +310,7 @@ class Qwen3ForCausalLM(nn.Module):
                 hidden, cos, sin, views, i,
                 positions=positions, inv_freq=inv_freq,
                 fused_ops=self.fused_ops,
+                attention_backend=self.attention_backend,
             )
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
