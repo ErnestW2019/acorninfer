@@ -121,3 +121,40 @@ def test_update_retry_after_exhaustion_is_coherent():
     k_full, _ = view.update(0, k, torch.randn(1, 2, 6, 8))
     assert view.seq_len == 6
     assert torch.equal(k_full, k)  # 重试写入正确,无残留脏数据
+
+
+def test_write_then_gather_equals_update():
+    """write + gather ≡ update(逐位);块表分配行为一致。"""
+    alloc = BlockAllocator(8)
+    cache = PagedKVCache(num_layers=2, num_kv_heads=2, head_dim=8, page_size=4,
+                         allocator=alloc, device="cpu", dtype=torch.float32)
+    k = torch.randn(1, 2, 3, 8)
+    v = torch.randn(1, 2, 3, 8)
+
+    t1: list[int] = []
+    v1 = PagedCacheView(cache, t1)
+    k_up, v_up = v1.update(0, k, v)
+
+    t2: list[int] = []
+    v2 = PagedCacheView(cache, t2)
+    v2.write(0, k, v)
+    k_g = v2._gather(0, cache.k_pages)
+    v_g = v2._gather(0, cache.v_pages)
+
+    assert torch.equal(k_up, k_g) and torch.equal(v_up, v_g)
+    # 同一共享分配器(LIFO)给两个视图的物理块号必然不同;可比的是分配行为:
+    # 相同写入形状 → 相同的块表长度。
+    assert len(t1) == len(t2) == 1 and v1.seq_len == v2.seq_len == 3
+
+
+def test_write_exhaustion_leaves_no_partial_state():
+    """块不足时 write 原样抛 BlockExhausted、_lens 未提交(与 update 同语义)。"""
+    alloc = BlockAllocator(1)
+    cache = PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=8, page_size=4,
+                         allocator=alloc, device="cpu", dtype=torch.float32)
+    t: list[int] = []
+    view = PagedCacheView(cache, t)
+    view.write(0, torch.randn(1, 2, 3, 8), torch.randn(1, 2, 3, 8))  # 占 1 块
+    with pytest.raises(BlockExhausted):
+        view.write(0, torch.randn(1, 2, 9, 8), torch.randn(1, 2, 9, 8))
+    assert view.seq_len == 3  # 失败写不提交
