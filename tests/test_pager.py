@@ -167,7 +167,7 @@ def test_ensure_append_capacity_allocates_only_on_page_boundary():
     assert view.seq_len == 4  # 容量确保不提交长度
 
 
-def test_ensure_capacity_noop_when_all_sequences_have_page_room():
+def test_ensure_append_capacity_noop_when_all_sequences_have_page_room():
     """全部序列不跨页:对每个 view 均 no-op,分配器零扰动(步首热路径的常态)。"""
     cache = make_cache(num_blocks=8)
     views = []

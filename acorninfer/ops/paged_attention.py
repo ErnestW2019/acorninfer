@@ -158,10 +158,18 @@ def num_splits_for(B: int, num_heads: int, *, sm_count: int = _SM_COUNT,
     return max(1, min(max_splits, -(-sm_count // (B * num_heads))))
 
 
-def build_tables(views, page_size: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+def build_tables(views, page_size: int, device, *,
+                 lens_override=None) -> tuple[torch.Tensor, torch.Tensor]:
     """块表 → ([B, max_pages] int32 填充张量, [B] int32 长度含本步新 token)。
-    填充值任意:kernel 按 seq_lens 截断循环,永不读填充项。"""
-    lens = [int(v.seq_len) for v in views]
+    填充值任意:kernel 按 seq_lens 截断循环,永不读填充项。
+    lens_override(M3 Task 9):decode 合批路径在步首建表时各 view 长度仍是
+    pre-write,传入显式长度序列(pre-write + 1 = 含本步新 token)替代内部
+    读取的 view.seq_len;块表行宽与填充按该长度推导。None(默认)= 既有
+    行为,对现有调用方零改动。"""
+    if lens_override is not None:
+        lens = [int(L) for L in lens_override]
+    else:
+        lens = [int(v.seq_len) for v in views]
     max_pages = max(1, max(-(-L // page_size) for L in lens))
     t = torch.zeros((len(views), max_pages), dtype=torch.int32)
     for i, v in enumerate(views):

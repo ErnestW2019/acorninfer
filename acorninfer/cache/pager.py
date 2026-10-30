@@ -157,10 +157,10 @@ class PagedCacheView:
         c.v_pages[layer_idx][rows, slots] = v_new[0].permute(1, 0, 2).to(c.dtype)
         self._lens[layer_idx] = base + s
 
-    def ensure_append_capacity(self, layer_idx: int = 0) -> tuple[int, int]:
+    def ensure_append_capacity(self, layer_idx: int) -> tuple[int, int]:
         """decode 合批路径的步首容量确保(M3 Task 9):若在 _lens[layer_idx] 处
-        追加 1 token 会跨页(seq_len % page_size == 0),先分配新页号追加进
-        table,否则 no-op(页内余量足够)。
+        追加 1 token 会跨页(_lens[layer_idx] % page_size == 0),先分配新页号
+        追加进 table,否则 no-op(页内余量足够)。
 
         返回追加位 (page_id, slot_id) —— scatter_decode 的写入目标。
         BlockExhausted 语义与 write 一致:分配循环中途抛出时,已拿到的页

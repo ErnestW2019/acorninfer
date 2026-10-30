@@ -171,6 +171,9 @@ class Qwen3Attention(nn.Module):
             )
             cache = views[0].cache  # 契约:全部 views 共享同一 PagedKVCache(引擎单一 cache 实例保证);
             # 混用多 cache 会静默读错页 —— kernel 只按 views[0] 的页张量寻址(SDPA 分支对此容忍,triton 分支不容)
+            assert (tables is None) == (lens is None) == (scatter is None), (
+                "tables/lens/scatter 必须整体传入或整体为 None"
+            )
             if tables is not None:
                 # M3 Task 9 合批路径:步首已完成容量分配与建表,此处单次
                 # scatter + _lens 提交(原每层 B 次小发射收拢为 2 次)
@@ -326,8 +329,9 @@ class Qwen3ForCausalLM(nn.Module):
             inv_freq = None
         tables = lens = scatter = None
         if self.attention_backend == "triton":
-            # M3 Task 9:步首一次 prepare(层循环之前),替代原每层每步的
-            # 28×(逐序列 write 小算子 + build_tables CPU 构造 + H2D 同步)。
+            from acorninfer.ops.paged_attention import build_tables
+            # M3 Task 9:步首一次 prepare(层循环之前),替代原每步 36 层 ×
+            # (build_tables CPU 构造 + H2D 同步,加 B 次逐序列 write 小算子)。
             page_size = views[0].cache.page_size
             targets = [v.ensure_append_capacity(0) for v in views]  # 跨页者在此分新页
             scatter = (
@@ -337,16 +341,12 @@ class Qwen3ForCausalLM(nn.Module):
                              device=input_ids.device, dtype=torch.long),
             )
             # lens 含本步新 token(pre-write + 1):旧路径 build_tables 在
-            # layer-0 write 之后取 seq_len,得值与此逐位相同;块表行宽
-            # (max_pages)与零填充构造同构,kernel 输入逐位不变。
-            lens_list = [int(v.seq_len) + 1 for v in views]
-            max_pages = max(1, max(-(-n // page_size) for n in lens_list))
-            t = torch.zeros((len(views), max_pages), dtype=torch.int32)
-            for i, v in enumerate(views):
-                n = -(-lens_list[i] // page_size)
-                t[i, :n] = torch.tensor(v.table[:n], dtype=torch.int32)
-            tables = t.to(input_ids.device)
-            lens = torch.tensor(lens_list, dtype=torch.int32, device=input_ids.device)
+            # layer-0 write 之后取 seq_len,得值与此逐位相同;块表行宽与
+            # 零填充由 build_tables 自身构造,kernel 输入逐位不变。
+            tables, lens = build_tables(
+                views, page_size, input_ids.device,
+                lens_override=[int(v.seq_len) + 1 for v in views],
+            )
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
             hidden = layer.forward_decode(
