@@ -65,7 +65,7 @@ class Engine:
     @classmethod
     def from_config(cls, cfg: EngineConfig, tokenizer: Tokenizer) -> "Engine":
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
-        # attention_backend="triton" 在 Task 7 接入前暂不生效(引擎仍走 SDPA)
+        # attention_backend 由 from_config 透传到 model,decode 路径已生效(Task 7)
         model.attention_backend = cfg.attention_backend
         model.fused_ops = cfg.fused_ops
         return cls(

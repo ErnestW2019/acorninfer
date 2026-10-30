@@ -164,9 +164,12 @@ class Qwen3Attention(nn.Module):
             from acorninfer.ops.paged_attention import (
                 build_tables, num_splits_for, paged_decode_attention,
             )
-            cache = views[0].cache
+            cache = views[0].cache  # 契约:全部 views 共享同一 PagedKVCache(引擎单一 cache 实例保证);
+            # 混用多 cache 会静默读错页 —— kernel 只按 views[0] 的页张量寻址(SDPA 分支对此容忍,triton 分支不容)
             for b, view in enumerate(views):
                 view.write(layer_idx, k[b : b + 1], v[b : b + 1])   # 纯 scatter,不 gather
+            # 已知固定开销:每层每步在此重建块表 + CPU→device 拷贝(tables/lens 层间相同);
+            # Task 8 计入基线账,若成瓶颈可提升到步首做一次
             tables, lens = build_tables(views, cache.page_size, q.device)
             out = paged_decode_attention(
                 q[:, :, 0, :],                       # [B, H, D];RMSNorm 输出,contiguous
@@ -285,7 +288,8 @@ class Qwen3ForCausalLM(nn.Module):
     def forward_decode(self, input_ids: torch.Tensor, views) -> torch.Tensor:
         """批量 decode:input_ids [B, 1] + 每序列的 PagedCacheView -> [B, vocab]。
 
-        契约:views[i] 与 input_ids[i] 一一对应;s 必须为 1(decode 步)。
+        契约:views 非空(B ≥ 1);views[i] 与 input_ids[i] 一一对应;
+        s 必须为 1(decode 步)。
         每序列位置 = 各自 cache.seq_len(互不相同);新 token 的 K/V 在
         attention 内写入各自分页块。
         """

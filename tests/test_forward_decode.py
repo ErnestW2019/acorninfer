@@ -92,7 +92,7 @@ def test_decode_backends_logits_equivalent(tiny_model, backend, fused):
     """
     model = tiny_model.to("cuda")
     torch.manual_seed(0)
-    lens = [11, 23, 47]
+    lens = [11, 23, 47]  # 异长且均跨多页、尾页不对齐;47+5=52 是下方 alloc 容量算式的输入
     prompts = [torch.randint(0, 256, (1, n), device="cuda") for n in lens]
     decode_tokens = torch.randint(0, 256, (5, 3, 1), device="cuda")
 
@@ -129,8 +129,8 @@ def test_decode_backends_logits_equivalent(tiny_model, backend, fused):
     assert steps.shape == (5, 3, 256)
     for t in range(5):
         torch.testing.assert_close(steps[t], baseline[t], **TOL_BF16)
+    worst = max(max_abs_diff(steps[t], baseline[t]) for t in range(5))
+    print(f"\n[{backend} fused={fused} vs sdpa baseline max|diff| = {worst:.6f}]")  # 标定输出
     if backend == "triton":
         again = run_combo()
         assert torch.equal(steps, again)  # kernel 确定性
-        worst = max(max_abs_diff(steps[t], baseline[t]) for t in range(5))
-        print(f"\n[triton fused={fused} vs sdpa baseline max|diff| = {worst:.6f}]")
