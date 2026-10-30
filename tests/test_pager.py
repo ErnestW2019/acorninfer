@@ -145,6 +145,109 @@ def test_write_then_gather_equals_update():
     assert len(t1) == len(t2) == 1 and view_a.seq_len == view_b.seq_len == 3
 
 
+# ---- M3 Task 9:decode 发射合批的新 API(ensure_append_capacity + scatter_decode)----
+
+
+def test_ensure_append_capacity_allocates_only_on_page_boundary():
+    """跨页序列(seq_len % page == 0)追加需新页;否则 no-op。
+
+    返回追加位 (page_id, slot_id);容量确保绝不触碰 _lens(提交是 scatter 的职责)。
+    """
+    cache = make_cache(num_blocks=8)
+    view = PagedCacheView(cache)
+    view.write(0, torch.randn(1, 2, 3, 8), torch.randn(1, 2, 3, 8))  # 3 < PAGE:页内有余量
+    live_before, free_before = cache.allocator.num_live, cache.allocator.num_free
+    assert view.ensure_append_capacity(0) == (view.table[0], 3)
+    assert len(view.table) == 1  # 未跨页:零分配
+    assert (cache.allocator.num_live, cache.allocator.num_free) == (live_before, free_before)
+    view.write(0, torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8))  # → 4:页满
+    old_table = list(view.table)
+    assert view.ensure_append_capacity(0) == (view.table[1], 0)  # 跨页:新页 + slot 0
+    assert len(view.table) == 2 and view.table[:1] == old_table
+    assert view.seq_len == 4  # 容量确保不提交长度
+
+
+def test_ensure_capacity_noop_when_all_sequences_have_page_room():
+    """全部序列不跨页:对每个 view 均 no-op,分配器零扰动(步首热路径的常态)。"""
+    cache = make_cache(num_blocks=8)
+    views = []
+    for n in (1, 2, 3):  # 全部 < PAGE
+        v = PagedCacheView(cache)
+        v.write(0, torch.randn(1, 2, n, 8), torch.randn(1, 2, n, 8))
+        views.append(v)
+    live, free = cache.allocator.num_live, cache.allocator.num_free
+    targets = [v.ensure_append_capacity(0) for v in views]
+    assert (cache.allocator.num_live, cache.allocator.num_free) == (live, free)
+    assert targets == [(views[i].table[0], i + 1) for i in range(3)]
+    assert all(len(v.table) == 1 for v in views)
+
+
+def test_batched_ensure_exhaustion_keeps_allocated_pages_lens_uncommitted():
+    """步首批量容量确保中途 BlockExhausted:已分配页留在各自 table
+    (与 write/update 的重试语义同:test_update_retry_after_exhaustion_is_coherent),
+    所有 _lens 未提交 —— 释放后可重试。"""
+    alloc = BlockAllocator(4)
+    cache = PagedKVCache(1, 2, 8, PAGE, alloc, "cpu", torch.float32)
+    views = [PagedCacheView(cache) for _ in range(3)]
+    for v in views:  # 各恰占满 1 页:后续追加全部跨页
+        v.write(0, torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
+    with pytest.raises(BlockExhausted):
+        [v.ensure_append_capacity(0) for v in views]
+    assert len(views[0].table) == 2  # 已成功跨页拿到的页留在表内
+    assert all(len(v.table) == 1 for v in views[1:])
+    assert all(v.seq_len == 4 for v in views)  # ensure 不提交长度
+    for v in views:
+        for b in v.table:
+            alloc.free(b)
+    alloc.assert_balanced()
+
+
+def test_scatter_decode_equals_per_view_write_bitwise():
+    """合批 scatter ≡ 逐序列 write(逐位):k/v 页内容、块表、_lens 全同。
+
+    覆盖三种槽位形态:页内尾槽、恰跨页(slot 0)、页中槽;
+    scatter 只提交被写层的 _lens,其余层不受扰(层间锁步由调用方保证)。
+    """
+    torch.manual_seed(0)
+    B, layers = 3, 2
+    lens = (3, 4, 5)  # view1 恰在页边界(PAGE=4):追加必跨页
+    pre_k = [torch.randn(1, 2, n, 8) for n in lens]
+    pre_v = [torch.randn(1, 2, n, 8) for n in lens]
+    k_new = torch.randn(B, 2, 1, 8)
+    v_new = torch.randn(B, 2, 1, 8)
+
+    def run(mode):
+        cache = PagedKVCache(layers, 2, 8, PAGE, BlockAllocator(8), "cpu", torch.float32)
+        views = [PagedCacheView(cache) for _ in range(B)]
+        for i in range(B):  # 预置等长等内容的页数据:两 run 分配序逐块一致
+            for layer in range(layers):
+                views[i].write(layer, pre_k[i], pre_v[i])
+        if mode == "loop":
+            for b in range(B):
+                views[b].write(0, k_new[b : b + 1], v_new[b : b + 1])
+            targets = None
+        else:
+            targets = [views[b].ensure_append_capacity(0) for b in range(B)]
+            pages = torch.tensor([p for p, _ in targets], dtype=torch.long)
+            slots = torch.tensor([s for _, s in targets], dtype=torch.long)
+            cache.scatter_decode(views, 0, k_new, v_new, pages, slots)
+        return cache, views, targets
+
+    cache_a, views_a, _ = run("loop")
+    cache_b, views_b, targets_b = run("batch")
+    # 槽位形态自查:3→页内尾槽、4→跨页新页 slot 0、5→次页 slot 1
+    assert targets_b == [
+        (views_b[0].table[0], 3), (views_b[1].table[1], 0), (views_b[2].table[1], 1),
+    ]
+    for i in range(B):
+        assert views_a[i].table == views_b[i].table
+        assert views_a[i]._lens == views_b[i]._lens
+    assert views_b[1]._lens == {0: 5, 1: 4}  # 只提交被写层(layer 0 = pre 4 + 1)
+    for layer in range(layers):
+        assert torch.equal(cache_a.k_pages[layer], cache_b.k_pages[layer])
+        assert torch.equal(cache_a.v_pages[layer], cache_b.v_pages[layer])
+
+
 def test_write_exhaustion_leaves_no_partial_state():
     """块不足时 write 原样抛 BlockExhausted、_lens 未提交(与 update 同语义)。"""
     cache = make_cache(num_blocks=1, layers=1)

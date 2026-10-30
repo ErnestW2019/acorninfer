@@ -124,7 +124,8 @@ class Qwen3Attention(nn.Module):
 
     def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
                        positions=None, inv_freq=None, fused_ops=False,
-                       attention_backend="sdpa"):
+                       attention_backend="sdpa",
+                       tables=None, lens=None, scatter=None):
         """批量 decode: hidden [B, 1, hidden], cos/sin [B, 1, 1, D]。
 
         GEMM 批量化(continuous batching 的收益所在);attention 逐序列
@@ -134,9 +135,13 @@ class Qwen3Attention(nn.Module):
         且 cos/sin 必须为 None(否则 torch 路径的 cos/sin 与 kernel 内重算
         会二选一,传双份是调用方 bug)。
         attention_backend="triton" 时走 K3 分页 decode attention:各序列
-        write 进页(纯 scatter)后 build_tables,kernel 按块表直读页张量、
-        不 gather;lens 含本步新 token,与 SDPA 分支 update() 的可见性
-        语义一致(都 attend 到含新 token 的全序列)。
+        write 进页(纯 scatter)后按块表直读页张量、不 gather;lens 含本步
+        新 token,与 SDPA 分支 update() 的可见性语义一致(都 attend 到含
+        新 token 的全序列)。
+        tables/lens/scatter(M3 Task 9):顶层步首一次准备好的块表 / 长度 /
+        各序列追加位 (pages, slots);非 None 时本层只做单次合批 scatter,
+        不再逐序列 write + build_tables(那曾是每层每步的固定 CPU 开销)。
+        None 时回退自建,保持独立调用可用性。
         """
         if attention_backend not in ("sdpa", "triton"):
             raise ValueError(
@@ -166,11 +171,15 @@ class Qwen3Attention(nn.Module):
             )
             cache = views[0].cache  # 契约:全部 views 共享同一 PagedKVCache(引擎单一 cache 实例保证);
             # 混用多 cache 会静默读错页 —— kernel 只按 views[0] 的页张量寻址(SDPA 分支对此容忍,triton 分支不容)
-            for b, view in enumerate(views):
-                view.write(layer_idx, k[b : b + 1], v[b : b + 1])   # 纯 scatter,不 gather
-            # 已知固定开销:每层每步在此重建块表 + CPU→device 拷贝(tables/lens 层间相同);
-            # Task 8 计入基线账,若成瓶颈可提升到步首做一次
-            tables, lens = build_tables(views, cache.page_size, q.device)
+            if tables is not None:
+                # M3 Task 9 合批路径:步首已完成容量分配与建表,此处单次
+                # scatter + _lens 提交(原每层 B 次小发射收拢为 2 次)
+                pages, slots = scatter
+                cache.scatter_decode(views, layer_idx, k, v, pages, slots)
+            else:
+                for b, view in enumerate(views):
+                    view.write(layer_idx, k[b : b + 1], v[b : b + 1])   # 纯 scatter,不 gather
+                tables, lens = build_tables(views, cache.page_size, q.device)
             out = paged_decode_attention(
                 q[:, :, 0, :],                       # [B, H, D];RMSNorm 输出,contiguous
                 cache.k_pages[layer_idx], cache.v_pages[layer_idx],
@@ -218,12 +227,14 @@ class Qwen3Block(nn.Module):
 
     def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
                        positions=None, inv_freq=None, fused_ops=False,
-                       attention_backend="sdpa"):
+                       attention_backend="sdpa",
+                       tables=None, lens=None, scatter=None):
         if not fused_ops:
             hidden = hidden + self.self_attn.forward_decode(
                 self.input_layernorm(hidden), cos, sin, views, layer_idx,
                 positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
                 attention_backend=attention_backend,
+                tables=tables, lens=lens, scatter=scatter,
             )
             hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
             return hidden
@@ -235,6 +246,7 @@ class Qwen3Block(nn.Module):
             normed, cos, sin, views, layer_idx,
             positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
             attention_backend=attention_backend,
+            tables=tables, lens=lens, scatter=scatter,
         )
         normed, residual = fused_add_rmsnorm(
             hidden, residual, self.post_attention_layernorm.weight,
@@ -292,6 +304,10 @@ class Qwen3ForCausalLM(nn.Module):
         s 必须为 1(decode 步)。
         每序列位置 = 各自 cache.seq_len(互不相同);新 token 的 K/V 在
         attention 内写入各自分页块。
+        triton 后端(M3 Task 9):层循环前步首一次 prepare —— 各序列容量确保
+        (跨页分新页)+ 块表/长度(含本步新 token = pre-write + 1)+ scatter
+        目标一次构建并随层下传,消除原每层每步的 build_tables 重建与逐序列
+        write 小发射;RoPE 位置仍为 pre-write seq_len(容量确保不提交长度)。
         """
         if input_ids.shape[1] != 1:
             # s>1 会静默腐败:cos/sin 广播成同位置、update 多写 token
@@ -308,6 +324,29 @@ class Qwen3ForCausalLM(nn.Module):
             cos = cos[:, None, None, :]
             sin = sin[:, None, None, :]
             inv_freq = None
+        tables = lens = scatter = None
+        if self.attention_backend == "triton":
+            # M3 Task 9:步首一次 prepare(层循环之前),替代原每层每步的
+            # 28×(逐序列 write 小算子 + build_tables CPU 构造 + H2D 同步)。
+            page_size = views[0].cache.page_size
+            targets = [v.ensure_append_capacity(0) for v in views]  # 跨页者在此分新页
+            scatter = (
+                torch.tensor([p for p, _ in targets],
+                             device=input_ids.device, dtype=torch.long),
+                torch.tensor([s for _, s in targets],
+                             device=input_ids.device, dtype=torch.long),
+            )
+            # lens 含本步新 token(pre-write + 1):旧路径 build_tables 在
+            # layer-0 write 之后取 seq_len,得值与此逐位相同;块表行宽
+            # (max_pages)与零填充构造同构,kernel 输入逐位不变。
+            lens_list = [int(v.seq_len) + 1 for v in views]
+            max_pages = max(1, max(-(-n // page_size) for n in lens_list))
+            t = torch.zeros((len(views), max_pages), dtype=torch.int32)
+            for i, v in enumerate(views):
+                n = -(-lens_list[i] // page_size)
+                t[i, :n] = torch.tensor(v.table[:n], dtype=torch.int32)
+            tables = t.to(input_ids.device)
+            lens = torch.tensor(lens_list, dtype=torch.int32, device=input_ids.device)
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
             hidden = layer.forward_decode(
@@ -315,6 +354,7 @@ class Qwen3ForCausalLM(nn.Module):
                 positions=positions, inv_freq=inv_freq,
                 fused_ops=self.fused_ops,
                 attention_backend=self.attention_backend,
+                tables=tables, lens=lens, scatter=scatter,
             )
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]

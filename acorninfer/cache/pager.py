@@ -84,6 +84,34 @@ class PagedKVCache:
         self.k_pages = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(num_layers)]
         self.v_pages = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(num_layers)]
 
+    def scatter_decode(
+        self,
+        views: list[PagedCacheView],
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pages: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> None:
+        """decode 步合批写入(M3 Task 9):单次高级索引 scatter + 逐 view 提交 _lens。
+
+        k/v: [B, kv_heads, 1, head_dim];pages/slots: [B] long(各序列追加位,
+        由 PagedCacheView.ensure_append_capacity 在步首算好/分配好)。
+        位值语义 ≡ 逐 view.write(layer_idx, k[b:b+1], v[b:b+1])(单测钉住):
+        无算术、无 cast 舍入差异,同一 (page,slot) 写入同值。
+        容量分配不在此发生(步首 ensure 已完成),故本方法不可能抛 BlockExhausted;
+        _lens 提交 = 各 view 现长 +1(decode 每层恰追加 1 token)。
+        层间锁步(各层等长,引擎路径恒成立)由调用方保证。
+        """
+        B = len(views)
+        assert k.shape[2] == 1 and v.shape[2] == 1, "scatter_decode is decode-only (s=1)"
+        assert B == k.shape[0] == v.shape[0] == pages.shape[0] == slots.shape[0]
+        # 与 write 的逐 token 行对齐同构:token 轴转前 (permute(1,0,2) 的 s=1 形态)
+        self.k_pages[layer_idx][pages, slots] = k[:, :, 0, :].to(self.dtype)
+        self.v_pages[layer_idx][pages, slots] = v[:, :, 0, :].to(self.dtype)
+        for view in views:
+            view._lens[layer_idx] = view._lens.get(layer_idx, 0) + 1
+
 
 class PagedCacheView:
     """每序列视图:块表 + update()/seq_len,与 M1 KVCache 接口镜像。
@@ -128,6 +156,22 @@ class PagedCacheView:
         c.k_pages[layer_idx][rows, slots] = k_new[0].permute(1, 0, 2).to(c.dtype)
         c.v_pages[layer_idx][rows, slots] = v_new[0].permute(1, 0, 2).to(c.dtype)
         self._lens[layer_idx] = base + s
+
+    def ensure_append_capacity(self, layer_idx: int = 0) -> tuple[int, int]:
+        """decode 合批路径的步首容量确保(M3 Task 9):若在 _lens[layer_idx] 处
+        追加 1 token 会跨页(seq_len % page_size == 0),先分配新页号追加进
+        table,否则 no-op(页内余量足够)。
+
+        返回追加位 (page_id, slot_id) —— scatter_decode 的写入目标。
+        BlockExhausted 语义与 write 一致:分配循环中途抛出时,已拿到的页
+        留在 table、_lens 未提交(释放后重试连贯,同 update 的钉死语义)。
+        """
+        base = self._lens.get(layer_idx, 0)
+        page = self.cache.page_size
+        needed = base // page + 1  # 追加 1 token 落在第 base//page 页
+        while len(self.table) < needed:
+            self.table.append(self.cache.allocator.allocate())
+        return self.table[base // page], base % page
 
     def update(
         self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor
