@@ -79,6 +79,10 @@ def triton_engine(model):
     eng = _make_engine(model)
     yield eng
     eng.assert_balanced()
+    # 复位后端属性:triton 阶段结束不留全局状态,sdpa 门的前置自检不再
+    # 隐式依赖测试文件顺序
+    model.attention_backend = "sdpa"
+    model.fused_ops = False
 
 
 def _concurrent_matches_sequential(engine: Engine, label: str) -> None:
@@ -103,13 +107,17 @@ def _concurrent_matches_sequential(engine: Engine, label: str) -> None:
         return orig_decode(seqs, views)
 
     engine.executor.decode_batch = spying_decode
-    sids = [
-        engine.submit(ids, SamplingParams(temperature=0.0), max_tokens=MAX_NEW_TOKENS)
-        for ids in prompt_ids
-    ]
-    while engine.has_pending():
-        engine.step()
-    engine.executor.decode_batch = orig_decode
+    try:
+        sids = [
+            engine.submit(
+                ids, SamplingParams(temperature=0.0), max_tokens=MAX_NEW_TOKENS
+            )
+            for ids in prompt_ids
+        ]
+        while engine.has_pending():
+            engine.step()
+    finally:
+        engine.executor.decode_batch = orig_decode
     assert batch_sizes and max(batch_sizes) >= 2, (
         f"批量 decode 未发生(batch_sizes={batch_sizes}),验收对象落空"
     )
