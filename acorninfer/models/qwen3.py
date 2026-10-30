@@ -122,11 +122,17 @@ class Qwen3Attention(nn.Module):
         out = out.transpose(1, 2).reshape(b, s, -1)
         return self.o_proj(out)
 
-    def forward_decode(self, hidden, cos, sin, views, layer_idx):
+    def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
+                       positions=None, inv_freq=None, fused_ops=False,
+                       attention_backend="sdpa"):
         """批量 decode: hidden [B, 1, hidden], cos/sin [B, 1, 1, D]。
 
         GEMM 批量化(continuous batching 的收益所在);attention 逐序列
         (KV 长度不同,q_len=1 无需掩码 —— M1 分支 2 的推广)。
+
+        fused_ops=True 时走 K2 fused RoPE:需要 positions[B] + inv_freq[D/2],
+        且 cos/sin 必须为 None(否则 torch 路径的 cos/sin 与 kernel 内重算
+        会二选一,传双份是调用方 bug)。
         """
         B, s, _ = hidden.shape
         q = self.q_proj(hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
@@ -137,8 +143,14 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k)
 
         # RoPE:每个序列自己的位置;cos/sin 已是 [B,1,1,D],不走 _apply_rope(形状约定不同)
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        if fused_ops:
+            if positions is None or inv_freq is None or cos is not None:
+                raise ValueError("fused_ops requires positions+inv_freq and no cos/sin")
+            from acorninfer.ops.rope import fused_rope_inplace
+            fused_rope_inplace(q, k, positions, inv_freq)   # 就地;q/k decode 布局 contiguous
+        else:
+            q = q * cos + _rotate_half(q) * sin
+            k = k * cos + _rotate_half(k) * sin
 
         rep = self.num_heads // self.num_kv_heads
         outs = []
@@ -178,10 +190,12 @@ class Qwen3Block(nn.Module):
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
 
-    def forward_decode(self, hidden, cos, sin, views, layer_idx, *, fused_ops=False):
+    def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
+                       positions=None, inv_freq=None, fused_ops=False):
         if not fused_ops:
             hidden = hidden + self.self_attn.forward_decode(
-                self.input_layernorm(hidden), cos, sin, views, layer_idx
+                self.input_layernorm(hidden), cos, sin, views, layer_idx,
+                positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
             )
             hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
             return hidden
@@ -189,7 +203,10 @@ class Qwen3Block(nn.Module):
         normed, residual = fused_add_rmsnorm(
             hidden, None, self.input_layernorm.weight, self.input_layernorm.eps
         )
-        hidden = self.self_attn.forward_decode(normed, cos, sin, views, layer_idx)
+        hidden = self.self_attn.forward_decode(
+            normed, cos, sin, views, layer_idx,
+            positions=positions, inv_freq=inv_freq, fused_ops=fused_ops,
+        )
         normed, residual = fused_add_rmsnorm(
             hidden, residual, self.post_attention_layernorm.weight,
             self.post_attention_layernorm.eps,
@@ -250,13 +267,24 @@ class Qwen3ForCausalLM(nn.Module):
             # s>1 会静默腐败:cos/sin 广播成同位置、update 多写 token
             raise ValueError("forward_decode expects [B, 1] input_ids (decode step)")
         positions = torch.tensor([v.seq_len for v in views], device=input_ids.device)
-        dtype = self.embed_tokens.weight.dtype
-        cos, sin = self.rope(positions, dtype, input_ids.device)  # [B, head_dim]
-        cos = cos[:, None, None, :]  # [B, 1, 1, D]
-        sin = sin[:, None, None, :]
+        if self.fused_ops:
+            # K2:cos/sin 不再预算,kernel 内由 positions×inv_freq 重算
+            # (inv_freq 是 fp32 buffer,模块 .to(dtype) 后变 bf16,wrapper 内 .float() 还原)
+            cos = sin = None
+            inv_freq = self.rope.inv_freq
+        else:
+            dtype = self.embed_tokens.weight.dtype
+            cos, sin = self.rope(positions, dtype, input_ids.device)  # [B, head_dim]
+            cos = cos[:, None, None, :]
+            sin = sin[:, None, None, :]
+            inv_freq = None
         hidden = self.embed_tokens(input_ids)
         for i, layer in enumerate(self.layers):
-            hidden = layer.forward_decode(hidden, cos, sin, views, i, fused_ops=self.fused_ops)
+            hidden = layer.forward_decode(
+                hidden, cos, sin, views, i,
+                positions=positions, inv_freq=inv_freq,
+                fused_ops=self.fused_ops,
+            )
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
 
