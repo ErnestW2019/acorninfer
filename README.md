@@ -6,6 +6,8 @@
 
 状态:设计文档见 `docs/superpowers/specs/`;M0、M1、M2 已完成(tag `m0-acceptance` / `m1-acceptance`,M2 tag 由验收流程补)。M2 实测:并发 8 聚合 110.68 tok/s(单流 36.99,见 `docs/benchmarks.md`)。
 
+M3(进行中):`acorninfer/ops/` 融合算子层已落地——K1 fused_add_rmsnorm / K2 fused RoPE / K3 flash-decoding 分页 attention(SDPA 路径保留为 reference),压测与验收判定见 `docs/benchmarks.md`。
+
 ## M0 用法
 
 ```bash

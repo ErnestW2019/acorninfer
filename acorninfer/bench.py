@@ -16,6 +16,8 @@ prompt 由 --seed 决定:每档独立重播种,因此各档第 1 条 prompt 相�
 
 运行(GPU 0 被外部服务占用,统一走 GPU 1):
     CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8
+    CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 \
+        --attention-backend triton --fused-ops
 """
 
 from __future__ import annotations
@@ -108,6 +110,8 @@ def main() -> None:
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--max-running", type=int, default=8)
     parser.add_argument("--watermark-blocks", type=int, default=8)
+    parser.add_argument("--attention-backend", default="sdpa", choices=["sdpa", "triton"])
+    parser.add_argument("--fused-ops", action="store_true")
     parser.add_argument("--in-tokens", type=int, default=128)
     parser.add_argument("--out-tokens", type=int, default=32)
     parser.add_argument(
@@ -128,9 +132,14 @@ def main() -> None:
         max_running=args.max_running,
         watermark_blocks=args.watermark_blocks,
     )
+    # M3 后端开关(bench.py 直接构造 Engine,不经 EngineConfig —— 属性赋值与
+    # Engine.from_config 同一机制;K1/K2/K3 均在 forward_decode 读属性生效)
+    model.attention_backend = args.attention_backend
+    model.fused_ops = args.fused_ops
     vocab = model.cfg.vocab_size
     print(f"engine ready: num_blocks={args.num_blocks} page={args.page_size} "
-          f"max_running={args.max_running} watermark={args.watermark_blocks}")
+          f"max_running={args.max_running} watermark={args.watermark_blocks} "
+          f"backend={model.attention_backend} fused_ops={model.fused_ops}")
 
     try:
         # warmup:1 条短请求,触发 prefill/decode/paged-cache 的 CUDA 路径,
