@@ -32,6 +32,9 @@ class Executor:
             [[s.generated_ids[-1]] for s in seqs], device=self.device, dtype=torch.long
         )
         logits = self.model.forward_decode(x, views)  # [B, vocab]
+        if all(s.sampling.temperature == 0 for s in seqs):
+            # 全 greedy:与 runner 同款合批 argmax(单次 D2H)
+            return [int(t) for t in logits.argmax(dim=1).tolist()]
         return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
 
     @staticmethod

@@ -226,3 +226,73 @@ def test_engine_decode_graph_eos_shrinks_batch():
     assert eager == graph                              # 缩批后 token 仍逐位
     assert len(eager[0]) == 2 and len(eager[1]) == 2   # 陷阱序列恰在第 1 个 decode 步终止
     assert all(len(s) == 8 for s in eager[2:])         # 余者跑满 → 桶 4→2 切换确有发生
+
+
+@pytest.mark.gpu
+def test_executor_decode_batch_greedy_matches_per_row_argmax():
+    """eager decode(graph off)全 greedy:合批 argmax(dim=1) 与逐行 argmax
+    token 逐位一致(防实现滑步);这正是 bench eager 锚点走的路径。
+
+    两腿同 seed 独立重建引擎(同实现双跑对拍锚):合批改造前后都必须绿 ——
+    改造只许把 B 次 D2H 同步并为 1 次,不许改变任何 token。
+    """
+
+    def run_leg():
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+        model.attention_backend = "triton"
+        model.fused_ops = True
+        model.decode_graph = False                 # Executor 无 runner → eager 路径
+        engine = Engine(model, None, num_blocks=64, page_size=4, max_running=8)
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        sids = []
+        for L in [6, 10]:
+            ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
+            sids.append(engine.submit(ids[0].tolist(),
+                                      SamplingParams(temperature=0.0), max_tokens=4))
+        toks = {sid: [] for sid in sids}
+        while engine.has_pending():
+            for o in engine.step():
+                toks[o.seq_id].append(o.token_id)
+        for sid in sids:
+            engine.drop(sid)
+        engine.assert_balanced()
+        model.to("cpu")
+        return [toks[s] for s in sids]
+
+    assert run_leg() == run_leg()
+
+
+@pytest.mark.gpu
+def test_executor_decode_batch_mixed_temperature_falls_back_per_row():
+    """混合温度批(graph off):temp>0 行必须走逐行 _sample/Sampler(RNG 交织
+    契约),全 greedy 才允许合批 argmax。钉住分流条件。
+
+    同一 view 连跑两次会推进 KV _lens(前向只增不减),无碍断言:两问的
+    x/views 同构,greedy 行 logits 逐位相同 → argmax 与批构成无关。
+    """
+    from types import SimpleNamespace
+
+    from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
+    from acorninfer.engine.executor import Executor
+
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+    ex = Executor(model)   # graph_runner=None → eager
+    greedy = SimpleNamespace(sampling=SamplingParams(temperature=0.0),
+                             generated_ids=[7])
+    sampled = SimpleNamespace(sampling=SamplingParams(temperature=0.5, top_p=0.9),
+                              generated_ids=[11])
+    alloc = BlockAllocator(32)
+    cache = PagedKVCache(2, 2, 16, page_size=4, allocator=alloc,
+                         device="cuda", dtype=torch.bfloat16)
+    view = PagedCacheView(cache, [])
+    model(torch.full((1, 4), 5, device="cuda", dtype=torch.long), view)  # 预热 KV
+    torch.manual_seed(123)
+    mixed = ex.decode_batch([greedy, sampled], [view, view])
+    torch.manual_seed(123)
+    all_greedy = ex.decode_batch(
+        [greedy, SimpleNamespace(sampling=SamplingParams(temperature=0.0),
+                                 generated_ids=[11])], [view, view])
+    assert mixed[0] == all_greedy[0]   # greedy 行与批构成无关(确定性)
+    assert isinstance(mixed[1], int)

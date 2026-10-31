@@ -125,7 +125,8 @@ class DecodeGraphRunner:
         st.graph.replay()
         # 图输出缓冲原址覆写:仅本步有效;parity 测试的对拍观察点
         self.last_logits = st.logits
-        return [int(row.argmax()) for row in st.logits[:B]]
+        # 合批 argmax:B 次 D2H 同步 → 1 次(图外残差清理,M4.1 Task 1)
+        return [int(t) for t in st.logits[:B].argmax(dim=1).tolist()]
 
     def _commit_lens(self, views, new_len) -> None:
         # pager 私有状态的图外代行(pager 本里程碑禁改):与 scatter_decode 的
