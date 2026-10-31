@@ -23,16 +23,18 @@ class Executor:
         return self._sample(seq, logits)
 
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
+        # 全批 greedy 谓词只求值一次:runner 派发与 eager 合批共用同一局部值
+        greedy = all(s.sampling.temperature == 0 for s in seqs)
         # runner 契约 = triton(构造期钉死)+ greedy(与 _sample 的 argmax 分支同义)+ B ≤ 8
         if (self.graph_runner is not None
                 and len(views) <= BUCKETS[-1]
-                and all(s.sampling.temperature == 0 for s in seqs)):
+                and greedy):
             return self.graph_runner.decode_batch(seqs, views)
         x = torch.tensor(
             [[s.generated_ids[-1]] for s in seqs], device=self.device, dtype=torch.long
         )
         logits = self.model.forward_decode(x, views)  # [B, vocab]
-        if all(s.sampling.temperature == 0 for s in seqs):
+        if greedy:
             # 全 greedy:与 runner 同款合批 argmax(单次 D2H)
             return [int(t) for t in logits.argmax(dim=1).tolist()]
         return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]

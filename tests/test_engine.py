@@ -265,11 +265,16 @@ def test_executor_decode_batch_greedy_matches_per_row_argmax():
 
 @pytest.mark.gpu
 def test_executor_decode_batch_mixed_temperature_falls_back_per_row():
-    """混合温度批(graph off):temp>0 行必须走逐行 _sample/Sampler(RNG 交织
-    契约),全 greedy 才允许合批 argmax。钉住分流条件。
+    """混合温度批(graph off)的分流钉子,三重:
+    1. 独立 KV 对拍:两腿各自 allocator/cache/view(同模型同预热输入 → row-0
+       上下文逐位同构),greedy 行 token 与批构成无关 —— 结构性断言,非巧合;
+    2. mixed 批(temp=0 + temp=0.5)→ 整批恰走逐行 _sample(2 次;逐行 fallback
+       对全批循环,temp==0 行在 _sample 内部 argmax 分支解析),其中恰 1 行
+       到达 Sampler(temp>0)—— 合批 gate 若被删、argmax 吞掉 temp>0 行 → 0 → 红;
+    3. all-greedy 批 0 次 _sample:真走合批 argmax;实现退化成逐行 → 2 → 红。
 
-    同一 view 连跑两次会推进 KV _lens(前向只增不减),无碍断言:两问的
-    x/views 同构,greedy 行 logits 逐位相同 → argmax 与批构成无关。
+    spy = 实例属性 shadow Executor._sample,转发真函数,不改返回语义与
+    RNG 消耗;计数每次 decode_batch 前清零,用完 del 卸 shadow。
     """
     from types import SimpleNamespace
 
@@ -278,21 +283,52 @@ def test_executor_decode_batch_mixed_temperature_falls_back_per_row():
 
     torch.manual_seed(0)
     model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
-    ex = Executor(model)   # graph_runner=None → eager
-    greedy = SimpleNamespace(sampling=SamplingParams(temperature=0.0),
-                             generated_ids=[7])
-    sampled = SimpleNamespace(sampling=SamplingParams(temperature=0.5, top_p=0.9),
-                              generated_ids=[11])
-    alloc = BlockAllocator(32)
-    cache = PagedKVCache(2, 2, 16, page_size=4, allocator=alloc,
-                         device="cuda", dtype=torch.bfloat16)
-    view = PagedCacheView(cache, [])
-    model(torch.full((1, 4), 5, device="cuda", dtype=torch.long), view)  # 预热 KV
-    torch.manual_seed(123)
-    mixed = ex.decode_batch([greedy, sampled], [view, view])
-    torch.manual_seed(123)
-    all_greedy = ex.decode_batch(
-        [greedy, SimpleNamespace(sampling=SamplingParams(temperature=0.0),
-                                 generated_ids=[11])], [view, view])
-    assert mixed[0] == all_greedy[0]   # greedy 行与批构成无关(确定性)
-    assert isinstance(mixed[1], int)
+
+    def make_view():
+        # 独立 KV:同模型同预热输入 → 各腿起始 KV 逐位同构,互不污染
+        alloc = BlockAllocator(32)
+        cache = PagedKVCache(2, 2, 16, page_size=4, allocator=alloc,
+                             device="cuda", dtype=torch.bfloat16)
+        view = PagedCacheView(cache, [])
+        model(torch.full((1, 4), 5, device="cuda", dtype=torch.long), view)  # 预热 KV
+        return view
+
+    with torch.inference_mode():
+        view_a = make_view()   # 腿 A:mixed 批
+        view_b = make_view()   # 腿 B:all-greedy 批
+        ex = Executor(model)   # graph_runner=None → eager
+        real = ex._sample
+        calls = {"total": 0, "sampled": 0}   # sampled = temp>0 行(到 Sampler 分支)
+
+        def spy(s, logits):
+            calls["total"] += 1
+            if s.sampling.temperature > 0:
+                calls["sampled"] += 1
+            return real(s, logits)
+
+        ex._sample = spy
+        try:
+            greedy = SimpleNamespace(sampling=SamplingParams(temperature=0.0),
+                                     generated_ids=[7])
+            torch.manual_seed(123)
+            calls["total"] = calls["sampled"] = 0
+            mixed = ex.decode_batch(
+                [greedy,
+                 SimpleNamespace(sampling=SamplingParams(temperature=0.5, top_p=0.9),
+                                 generated_ids=[11])],
+                [view_a, view_a])
+            assert calls["total"] == 2     # 逐行 fallback 循环全批,两行都过 _sample
+            assert calls["sampled"] == 1   # 仅 temp>0 行到 Sampler;gate 删/吞行 → 0 → 红
+            assert isinstance(mixed[1], int)
+            torch.manual_seed(123)
+            calls["total"] = calls["sampled"] = 0
+            all_greedy = ex.decode_batch(
+                [greedy,
+                 SimpleNamespace(sampling=SamplingParams(temperature=0.0),
+                                 generated_ids=[11])],
+                [view_b, view_b])
+            assert calls["total"] == 0     # 全 greedy 真走合批 argmax;退化逐行 → 2 → 红
+            assert calls["sampled"] == 0
+            assert mixed[0] == all_greedy[0]   # greedy 行与批构成无关(结构性)
+        finally:
+            del ex._sample
