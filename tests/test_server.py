@@ -146,6 +146,75 @@ async def test_completions_roundtrip(client, engine):
     engine.assert_balanced()
 
 
+async def test_completions_token_id_prompt_parity(client, engine):
+    """token-id 数组 prompt(vLLM parity,bench_remote 协议):ids 绕过编码直进引擎。
+
+    同一组 ids 与 str-prompt(FakeTok 编码后同一 token 序)必须产出相同贪心
+    文本(engine 侧不重分词);usage.prompt_tokens == len(ids)。
+    """
+    ids = FakeTok().encode("abc")  # [97, 98, 99]
+    ref = (
+        await client.post(
+            "/v1/completions", json={"prompt": "abc", "max_tokens": 5, "temperature": 0.0}
+        )
+    ).json()["choices"][0]["text"]
+    r = await client.post(
+        "/v1/completions", json={"prompt": ids, "max_tokens": 5, "temperature": 0.0}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "text_completion"
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["choices"][0]["text"] == ref  # 同 token 序 → 同贪心输出
+    assert body["usage"] == {
+        "prompt_tokens": len(ids),
+        "completion_tokens": 5,
+        "total_tokens": len(ids) + 5,
+    }
+    # 空 ids 数组走既有零 token 400(与空 str 同路径,不加自造校验)
+    r_empty = await client.post(
+        "/v1/completions", json={"prompt": [], "max_tokens": 2, "temperature": 0.0}
+    )
+    assert r_empty.status_code == 400
+    engine.assert_balanced()
+
+
+async def test_completions_stream_ids_include_usage(client, engine):
+    """bench_remote 协议:ids 直投 + stream_options.include_usage → 流尾 usage 块。
+
+    vLLM parity:末块 choices==[] 只带 usage,prompt_tokens == len(ids);
+    内容块拼接与非流式贪心一致;之后才是 [DONE]。
+    """
+    ids = FakeTok().encode("hi")
+    ref = (
+        await client.post(
+            "/v1/completions", json={"prompt": ids, "max_tokens": 4, "temperature": 0.0}
+        )
+    ).json()["choices"][0]["text"]
+    payload = {
+        "prompt": ids, "max_tokens": 4, "temperature": 0.0,
+        "stream": True, "stream_options": {"include_usage": True},
+    }
+    async with client.stream("POST", "/v1/completions", json=payload) as r:
+        assert r.status_code == 200
+        lines = [ln async for ln in r.aiter_lines()]
+    data = [ln[len("data: ") :] for ln in lines if ln.startswith("data: ")]
+    assert data[-1] == "[DONE]"
+    chunks = [json.loads(d) for d in data[:-1]]
+    assert all(c["object"] == "text_completion" for c in chunks)
+    text = "".join(c["choices"][0]["text"] for c in chunks if c["choices"])
+    assert text == ref  # 流式 == 非流式(同 ids 贪心)
+    tail = chunks[-1]
+    assert tail["choices"] == []  # 尾包只有 usage,无内容(vLLM 语义)
+    assert tail["usage"] == {
+        "prompt_tokens": len(ids),
+        "completion_tokens": 4,
+        "total_tokens": len(ids) + 4,
+    }
+    assert chunks[-2]["choices"][0]["finish_reason"] == "length"  # 尾包前是收尾块
+    engine.assert_balanced()
+
+
 async def test_validation_422_engine_untouched(client, engine):
     cases = [
         ("/v1/completions", {"prompt": "x", "temperature": -1.0, "max_tokens": 2}),

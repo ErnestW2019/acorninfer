@@ -18,7 +18,9 @@
   executor 的贪心分支(OpenAI 语义);SamplingParams 在 pydantic 边界校验
   (temperature>=0、top_p>0、top_k>=0、max_tokens>=1),坏参数到不了引擎。
 - 兼容性声明:`max_completion_tokens` 与 `stop` 接受但忽略(声明式子集,
-  前者落到默认 max_tokens=16);id 仅进程内唯一。
+  前者落到默认 max_tokens=16);id 仅进程内唯一;`/v1/completions` 的
+  prompt 兼容 token-id 数组(直进引擎不重分词);流式 include_usage 发
+  usage 尾包(vLLM parity,bench_remote 协议)。
 """
 
 from __future__ import annotations
@@ -57,10 +59,23 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
-class PromptCompletionRequest(CompletionRequest):
-    """/v1/completions 请求体。"""
+class StreamOptions(BaseModel):
+    """OpenAI stream_options 子集:仅 include_usage(流末尾补 usage 块)。"""
 
-    prompt: str
+    include_usage: bool = False
+
+
+class PromptCompletionRequest(CompletionRequest):
+    """/v1/completions 请求体。
+
+    prompt 双形态(vLLM parity,bench_remote 直投 token-id 数组):str 经
+    tokenizer 编码;list[int] 视为已编码 ids 直进引擎(不做重分词)。
+    stream_options.include_usage=True 时流末尾追加 choices=[] 的 usage 块
+    (vLLM/OpenAI 语义,bench_remote 依赖它读 completion_tokens)。
+    """
+
+    prompt: str | list[int]
+    stream_options: StreamOptions | None = None
 
 
 class ChatCompletionRequest(CompletionRequest):
@@ -302,9 +317,11 @@ def create_app(engine: Engine) -> FastAPI:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def _stream_sse(
-        seq_id: int, model: str, created: int, *, chat: bool
+        seq_id: int, model: str, created: int, *,
+        chat: bool, prompt_len: int = 0, include_usage: bool = False,
     ):
-        """SSE:chat 首块带 role → 内容逐块 → 末块空 delta+finish_reason → [DONE]。
+        """SSE:chat 首块带 role → 内容逐块 → 末块空 delta+finish_reason
+        → (include_usage 时)choices=[] 的 usage 块 → [DONE]。
 
         客户端断连时生成器被关闭:不再产出(无 [DONE]),但 finally 仍执行
         _release —— 断连安全,弃管序列由 pump 收尾。
@@ -313,8 +330,10 @@ def create_app(engine: Engine) -> FastAPI:
         sid = f"chatcmpl-{seq_id}" if chat else f"cmpl-{seq_id}"
         detok = _Detok(engine.tokenizer)
         first = True
+        n = 0
         try:
             async for out in _outputs(seq_id):
+                n += 1
                 delta = detok.push(out.token_id)
                 if first and chat:
                     first = False
@@ -332,6 +351,17 @@ def create_app(engine: Engine) -> FastAPI:
                             finish_reason=out.stop_reason,
                         )
                     )
+            if include_usage:
+                yield _sse(
+                    {
+                        "id": sid,
+                        "object": obj,
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage(prompt_len, n),
+                    }
+                )
             yield "data: [DONE]\n\n"
         finally:
             await _release(seq_id)
@@ -383,7 +413,10 @@ def create_app(engine: Engine) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(req: PromptCompletionRequest):
-        prompt_ids = engine.tokenizer.encode(req.prompt)
+        if isinstance(req.prompt, str):
+            prompt_ids = engine.tokenizer.encode(req.prompt)
+        else:  # list[int]:已编码 ids 直投(vLLM parity),不做重分词
+            prompt_ids = req.prompt
         if not prompt_ids:
             raise HTTPException(status_code=400, detail="prompt encoded to zero tokens")
         prompt_len = len(prompt_ids)
@@ -392,7 +425,12 @@ def create_app(engine: Engine) -> FastAPI:
         created = int(time.time())
         if req.stream:
             return StreamingResponse(
-                _stream_sse(seq_id, req.model, created, chat=False),
+                _stream_sse(
+                    seq_id, req.model, created, chat=False, prompt_len=prompt_len,
+                    include_usage=bool(
+                        req.stream_options and req.stream_options.include_usage
+                    ),
+                ),
                 media_type="text/event-stream",
             )
         try:
