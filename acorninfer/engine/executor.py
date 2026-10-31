@@ -11,16 +11,23 @@ from acorninfer.sampler import Sampler
 
 
 class Executor:
-    def __init__(self, model: Qwen3ForCausalLM, graph_runner: DecodeGraphRunner | None = None):
+    def __init__(self, model: Qwen3ForCausalLM, graph_runner: DecodeGraphRunner | None = None,
+                 tp=None):
         self.model = model
         self.graph_runner = graph_runner
+        self.tp = tp  # TPLink | None:None = 单卡原路径(TP=1 逐字节硬门)
         self.device = next(model.parameters()).device
 
     def prefill(self, seq: Sequence, view) -> int:
         """整段(all_ids)一次前向,选出新 token。抢占重放同一路径。"""
         ids = torch.tensor([seq.all_ids], device=self.device, dtype=torch.long)
         logits = self.model(ids, view, num_logits_to_keep=1)[0, -1]
-        return self._sample(seq, logits)
+        if self.tp is None:
+            return self._sample(seq, logits)
+        # TP 采样点(M5 Task 4):rank0 采样 → 广播 token ids → 两 rank 同 token
+        if self.tp.rank == 0:
+            return self.tp.sync_tokens([self._sample(seq, logits)])[0]
+        return self.tp.sync_tokens(None)[0]
 
     def prefill_batch(self, seqs: list[Sequence], views) -> list[int]:
         """多序列同批 prefill(M4.1):右 padding 合批前向,逐行采样
@@ -32,7 +39,11 @@ class Executor:
             ids[i, : lens[i]] = torch.tensor(s.all_ids, dtype=torch.long,
                                              device=self.device)
         logits = self.model.forward_prefill_batch(ids, views, real_lens=lens)
-        return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
+        if self.tp is None:
+            return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
+        toks = ([self._sample(s, logits[i]) for i, s in enumerate(seqs)]
+                if self.tp.rank == 0 else None)
+        return self.tp.sync_tokens(toks)
 
     def extend(self, seqs: list[Sequence], views,
                chunks: list[tuple[Sequence, int, int]]) -> list[int | None]:
@@ -52,11 +63,19 @@ class Executor:
             )
         logits = self.model.forward_extend(ids, views, starts=starts,
                                            chunk_lens=lens)
-        return [
+        if self.tp is None:
+            return [
+                self._sample(s, logits[i])
+                if start + length == len(s.all_ids) else None
+                for i, (s, start, length) in enumerate(chunks)
+            ]
+        # TP:完成行几何 SPMD 全同(chunk 由调度器同构决策),rank0 对完成行采样
+        toks = ([
             self._sample(s, logits[i])
             if start + length == len(s.all_ids) else None
             for i, (s, start, length) in enumerate(chunks)
-        ]
+        ] if self.tp.rank == 0 else None)
+        return self.tp.sync_tokens(toks)
 
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
         # 全批 greedy 谓词只求值一次:runner 派发与 eager 合批共用同一局部值
@@ -65,11 +84,24 @@ class Executor:
         if (self.graph_runner is not None
                 and len(views) <= BUCKETS[-1]
                 and greedy):
-            return self.graph_runner.decode_batch(seqs, views)
+            toks = self.graph_runner.decode_batch(seqs, views)
+            if self.tp is None:
+                return toks
+            # TP:两 rank 都必须 replay(推进各自 KV);token 采 rank0 的(spec 决策)
+            return self.tp.sync_tokens(toks)
         x = torch.tensor(
             [[s.generated_ids[-1]] for s in seqs], device=self.device, dtype=torch.long
         )
         logits = self.model.forward_decode(x, views)  # [B, vocab]
+        if self.tp is not None:
+            # TP:两 rank 前向都跑(推进 KV);采样只在 rank0,RNG 防漂移
+            if greedy:
+                toks = ([int(t) for t in logits.argmax(dim=1).tolist()]
+                        if self.tp.rank == 0 else None)
+                return self.tp.sync_tokens(toks)
+            toks = ([self._sample(s, logits[i]) for i, s in enumerate(seqs)]
+                    if self.tp.rank == 0 else None)
+            return self.tp.sync_tokens(toks)
         if greedy:
             # 全 greedy:与 runner 同款合批 argmax(单次 D2H)
             return [int(t) for t in logits.argmax(dim=1).tolist()]

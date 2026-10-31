@@ -28,17 +28,21 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import types
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from acorninfer.config import EngineConfig
+from acorninfer.config import EngineConfig, Qwen3Config
 from acorninfer.engine.engine import Engine
+from acorninfer.engine.tp_engine import TPEngine, TPLink, install_parent_guard, tp_rank1_loop
 from acorninfer.models.qwen3 import from_pretrained
+from acorninfer.models.qwen3_tp import Qwen3TPForCausalLM, build_shard_fn
 from acorninfer.sampler import SamplingParams
 from acorninfer.tokenizer import Tokenizer
+from acorninfer.weights import load_safetensors_sharded
 
 IDLE_TIMEOUT_S = 120.0  # queue.get 空闲兜底:pump 意外消亡时请求不永久挂起
 
@@ -458,16 +462,57 @@ def create_app(engine: Engine) -> FastAPI:
     return app
 
 
-def _build_engine(args) -> Engine:
+def _build_tp_model(model_dir: str, rank: int, world: int, device: str, dtype):
+    """TP 模型构造(生产路径;测试经 monkeypatch 打桩):
+    config 读 checkpoint 同源 → CPU 全量载 + 结构化分片 → strict assign 装入
+    → 单次 .to(峰值显存 = 一份分片,与 from_pretrained 口径一致)。"""
+    cfg = Qwen3Config.from_json(f"{model_dir}/config.json")
+    state = load_safetensors_sharded(
+        model_dir, build_shard_fn(cfg, rank, world), rank, world, device="cpu",
+    )
+    model = Qwen3TPForCausalLM(cfg, rank, world)
+    model.load_state_dict(state, strict=True, assign=True)
+    return model.to(device=device, dtype=dtype).eval()
+
+
+def _build_engine(args, link: TPLink | None = None):
     """从解析后的 CLI 参数构造 Engine(生产路径;测试经 monkeypatch 打桩)。
 
-    构造与 Engine.from_config 同一(engine.py 本任务不动,from_config 尚无
+    --tp 1(缺省):与 M5 Task 2 逐字节同一(engine.py 的 from_config 尚无
     chunked_budget 透传,故内联;两处构造需保持同步):
     - attention_backend/fused_ops/decode_graph 在 Engine 构造前置位(decode
       graph runner 在 Engine.__init__ 捕获各桶);
     - chunked_budget 经 Engine 构造参数透传(M5 chunked prefill),缺省
       None = 每步全量 prefill,引擎行为与 M4.1 逐字节一致。
+    --tp >= 2:分片 TP 模型 + Engine(tp=link);rank0(link.rank==0)外罩
+    TPEngine 命令壳返回。rank1 由 _tp_rank1_main 经本函数以 TPLink(1) 构造
+    (返回裸 Engine,无壳)。
     """
+    tp = getattr(args, "tp", 1)
+    if tp == 1:
+        cfg = EngineConfig(
+            model_dir=args.model_dir,
+            device=args.device,
+            num_blocks=args.num_blocks,
+            page_size=args.page_size,
+            max_running=args.max_running,
+            watermark_blocks=args.watermark_blocks,
+        )
+        model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
+        model.attention_backend = cfg.attention_backend
+        model.fused_ops = cfg.fused_ops
+        model.decode_graph = cfg.decode_graph
+        tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
+        return Engine(
+            model,
+            tok,
+            num_blocks=cfg.num_blocks,
+            page_size=cfg.page_size,
+            max_running=cfg.max_running,
+            watermark_blocks=cfg.watermark_blocks,
+            chunked_budget=args.chunked_budget,
+        )
+    assert link is not None, "--tp >= 2 需要 link(TPLink(rank))"
     cfg = EngineConfig(
         model_dir=args.model_dir,
         device=args.device,
@@ -476,12 +521,12 @@ def _build_engine(args) -> Engine:
         max_running=args.max_running,
         watermark_blocks=args.watermark_blocks,
     )
-    model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
+    model = _build_tp_model(args.model_dir, link.rank, tp, cfg.device, cfg.dtype)
     model.attention_backend = cfg.attention_backend
     model.fused_ops = cfg.fused_ops
     model.decode_graph = cfg.decode_graph
-    tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
-    return Engine(
+    tok = Tokenizer(f"{args.model_dir}/tokenizer.json") if link.rank == 0 else None
+    engine = Engine(
         model,
         tok,
         num_blocks=cfg.num_blocks,
@@ -489,12 +534,48 @@ def _build_engine(args) -> Engine:
         max_running=cfg.max_running,
         watermark_blocks=cfg.watermark_blocks,
         chunked_budget=args.chunked_budget,
+        tp=link,
     )
+    if link.rank == 0:
+        return TPEngine(engine, link)
+    return engine
+
+
+def _tp_rank1_main(args_dict: dict, init_dir: str) -> None:
+    """server rank1 入口(spawn 子进程):孤儿防护 → NCCL → 同构 engine →
+    命令循环。rank0 死 → 本进程必死(install_parent_guard);FINI → 优雅收尾。"""
+    install_parent_guard(poll_s=5.0)
+    import os
+
+    from acorninfer.distributed import destroy, setup
+
+    args = types.SimpleNamespace(**args_dict)
+    setup(1, args.tp, f"file://{init_dir}/nccl")
+    try:
+        link = TPLink(1)
+        engine = _build_engine(args, link=link)
+        tp_rank1_loop(engine, link)
+    finally:
+        # destroy 收尾有时挂(T0 先例):限 10s,挂了硬退兜底 —— 显存必放,
+        # 不给 T6 的 PID kill 纪律新增僵尸类
+        import threading
+
+        t = threading.Thread(target=destroy, daemon=True)
+        t.start()
+        t.join(timeout=10.0)
+    os._exit(0)
 
 
 def main() -> None:
-    """生产入口:CLI 参数接 EngineConfig + 真实 tokenizer(测试不经过此路径)。"""
+    """生产入口:CLI 参数接 EngineConfig + 真实 tokenizer(测试不经过此路径)。
+
+    --tp 2:父进程 = rank0(持 FastAPI),spawn 子进程 rank1(同参 + file://
+    init);rank0 退出路径(uvicorn 返回/异常)广播 FINI → join → 兜底硬杀,
+    不留孤儿。
+    """
     import argparse
+    import multiprocessing as mp
+    import tempfile
 
     import uvicorn
 
@@ -511,10 +592,36 @@ def main() -> None:
         "--chunked-budget", type=int, default=None,
         help="每步 prefill token 预算(M5 chunked prefill);缺省 None = 不切块",
     )
+    parser.add_argument(
+        "--tp", type=int, default=1,
+        help="张量并行度(M5 Task 4);缺省 1 = 单卡逐字节现行为",
+    )
     args = parser.parse_args()
 
-    engine = _build_engine(args)
-    uvicorn.run(create_app(engine), host=args.host, port=args.port)
+    if args.tp == 1:
+        engine = _build_engine(args)
+        uvicorn.run(create_app(engine), host=args.host, port=args.port)
+        return
+
+    init_dir = tempfile.mkdtemp(prefix="acorninfer-tp-")
+    ctx = mp.get_context("spawn")
+    child = ctx.Process(target=_tp_rank1_main, args=(vars(args), init_dir))
+    child.start()
+    from acorninfer.distributed import destroy, setup
+
+    engine = None
+    try:
+        setup(0, args.tp, f"file://{init_dir}/nccl")
+        engine = _build_engine(args, link=TPLink(0))
+        uvicorn.run(create_app(engine), host=args.host, port=args.port)
+    finally:
+        if engine is not None:
+            engine.shutdown()      # FINI 广播:rank1 优雅收尾
+        child.join(timeout=30)
+        if child.is_alive():
+            child.kill()           # 兜底硬杀:不许孤儿(T6 PID kill 纪律依赖)
+            child.join(timeout=10)
+        destroy()
 
 
 if __name__ == "__main__":

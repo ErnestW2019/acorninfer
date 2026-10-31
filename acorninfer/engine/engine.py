@@ -37,16 +37,20 @@ class Engine:
         max_running: int = 8,
         watermark_blocks: int = 8,
         chunked_budget: int | None = None,
+        tp=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
+        self.tp = tp  # TPLink | None:None = 单卡原路径(TP=1 逐字节硬门)
         cfg = model.cfg
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
         self.allocator = BlockAllocator(num_blocks)
         self.cache = PagedKVCache(
             cfg.num_hidden_layers,
-            cfg.num_key_value_heads,
+            # TP:每卡独立 cache 按 local kv 头数构造(pager/kv 零改动;
+            # 单卡模型无此属性 → cfg 原值,逐字节不变)
+            getattr(model, "num_kv_heads_local", cfg.num_key_value_heads),
             cfg.head_dim,
             page_size,
             self.allocator,
@@ -62,7 +66,7 @@ class Engine:
         self.graph_runner = None
         if getattr(model, "decode_graph", False):
             self.graph_runner = DecodeGraphRunner(model, self.cache, self.allocator)
-        self.executor = Executor(model, self.graph_runner)
+        self.executor = Executor(model, self.graph_runner, tp=tp)
         self.page_size = page_size
         self.seqs: dict[int, Sequence] = {}
         self._views: dict[int, PagedCacheView] = {}
@@ -207,6 +211,10 @@ class Engine:
                     self.allocator.free(b)
                 seq.block_table.clear()
                 seq.num_pages = 0
+        if self.tp is not None:
+            # 决策漂移哨兵(R3,每步):rank0 广播页表快照,rank1 逐位比对;
+            # 漂移即硬退(调度决策输入全同 → 页表必须全同)
+            self.tp.check_views(self._views)
         return outputs
 
     def drop(self, seq_id: int) -> None:
