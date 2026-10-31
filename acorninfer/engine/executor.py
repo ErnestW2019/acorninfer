@@ -1,4 +1,4 @@
-"""批量前向执行:prefill 单序列 / decode 批量化,采样按序列参数。"""
+"""批量前向执行:prefill 单序列/同批多序列 / decode 批量化,采样按序列参数。"""
 
 from __future__ import annotations
 
@@ -21,6 +21,18 @@ class Executor:
         ids = torch.tensor([seq.all_ids], device=self.device, dtype=torch.long)
         logits = self.model(ids, view, num_logits_to_keep=1)[0, -1]
         return self._sample(seq, logits)
+
+    def prefill_batch(self, seqs: list[Sequence], views) -> list[int]:
+        """多序列同批 prefill(M4.1):右 padding 合批前向,逐行采样
+        (_sample 语义不变:temp==0 argmax;temp>0 逐行 Sampler)。"""
+        lens = [len(s.all_ids) for s in seqs]
+        Lmax = max(lens)
+        ids = torch.zeros(len(seqs), Lmax, dtype=torch.long, device=self.device)
+        for i, s in enumerate(seqs):
+            ids[i, : lens[i]] = torch.tensor(s.all_ids, dtype=torch.long,
+                                             device=self.device)
+        logits = self.model.forward_prefill_batch(ids, views, real_lens=lens)
+        return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
 
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
         # 全批 greedy 谓词只求值一次:runner 派发与 eager 合批共用同一局部值

@@ -332,3 +332,128 @@ def test_executor_decode_batch_mixed_temperature_falls_back_per_row():
             assert mixed[0] == all_greedy[0]   # greedy 行与批构成无关(结构性)
         finally:
             del ex._sample
+
+
+@pytest.mark.gpu
+def test_engine_prefill_batch_matches_staggered_bitwise():
+    """一次性提交 4 序列(一步批量 prefill)vs 逐条提交逐条排空(N=1 原路径):
+    生成 token 逐位一致(经验锚:批量 GEMM 与逐条 GEMM 有 ~1 bf16 ulp 差异,
+    greedy argmax 翻转概率极低但非零 —— 本测试钉的是本机/本构建的回归不变量);
+    钉死批量腿确曾走 prefill_batch(spy),逐条腿零批量调用。"""
+
+    def run(stagger, pin_calls):
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+        model.attention_backend = "sdpa"
+        model.fused_ops = False
+        model.decode_graph = False
+        engine = Engine(model, None, num_blocks=64, page_size=4, max_running=8)
+        gen = torch.Generator(device="cuda").manual_seed(13)
+        prompts = []
+        for L in [6, 10, 14, 5]:
+            ids = torch.randint(0, 256, (1, L), generator=gen, device="cuda")
+            prompts.append(ids[0].tolist())
+        calls = {"n": 0}
+        if pin_calls:
+            real = engine.executor.prefill_batch   # Executor 无此方法 → 红
+
+            def spy(seqs, views):
+                calls["n"] += 1
+                return real(seqs, views)
+
+            engine.executor.prefill_batch = spy   # 实例 shadow,照 Task 1 的 _sample spy 模式
+        try:
+            sids, toks = [], {}
+            for p in prompts:
+                sid = engine.submit(p, SamplingParams(temperature=0.0), max_tokens=6)
+                sids.append(sid)
+                toks[sid] = []
+                if stagger:   # 逐条腿:提交一条立刻排空(每步 prefills 恰 1 → N=1 原路径)
+                    while engine.has_pending():
+                        for o in engine.step():
+                            toks[o.seq_id].append(o.token_id)
+            if not stagger:   # 批量腿:全部提交后一次排空(首步 4 序列同批 prefill)
+                while engine.has_pending():
+                    for o in engine.step():
+                        toks[o.seq_id].append(o.token_id)
+            for sid in sids:
+                engine.drop(sid)
+            engine.assert_balanced()
+            model.to("cpu")
+            return [toks[s] for s in sids], calls["n"]
+        finally:
+            if pin_calls:
+                del engine.executor.prefill_batch
+
+    batched, calls_b = run(stagger=False, pin_calls=True)
+    staggered, calls_s = run(stagger=True, pin_calls=True)
+    assert calls_b >= 1       # 批量腿确曾走 prefill_batch(防假绿)
+    assert calls_s == 0       # 逐条腿零批量调用(N=1 原路径未动)
+    assert batched == staggered   # 生成 token 逐位一致(经验锚,见 docstring)
+
+
+@pytest.mark.gpu
+def test_executor_prefill_batch_mixed_temperature_per_row_sampling():
+    """批量 prefill 采样结构:一次 forward_prefill_batch + 每行恰一次 _sample
+    (temp>0 行走 Sampler,greedy 行 argmax);greedy 行 token == 同一 logits
+    对象的 argmax(同 logits 下精确,非跨路径巧合)。
+
+    不断言跨路径 token 相等:批量与逐条 forward 有 ~1 bf16 ulp 差异,
+    temp>0 采样对 1-ulp 概率扰动敏感 —— 故用结构性钉子(spy 计数 +
+    同 logits argmax 对照 + 各行 KV 只写到各自 real_len),不锁采样值。
+    """
+    from types import SimpleNamespace
+
+    from acorninfer.cache.pager import BlockAllocator, PagedCacheView, PagedKVCache
+    from acorninfer.engine.executor import Executor
+
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(Qwen3Config.tiny()).to("cuda", torch.bfloat16).eval()
+
+    def make_view():
+        # 独立 KV:各行 cache 状态互不污染(页表/Lens 各自持有)
+        alloc = BlockAllocator(32)
+        cache = PagedKVCache(2, 2, 16, page_size=4, allocator=alloc,
+                             device="cuda", dtype=torch.bfloat16)
+        return PagedCacheView(cache)
+
+    with torch.inference_mode():
+        views = [make_view() for _ in range(2)]
+        ex = Executor(model)   # graph_runner=None;prefill_batch 不经 runner
+        seqs = [
+            SimpleNamespace(all_ids=_ids(7, 0),
+                            sampling=SamplingParams(temperature=0.0)),
+            SimpleNamespace(all_ids=_ids(4, 1),
+                            sampling=SamplingParams(temperature=0.5, top_p=0.9)),
+        ]
+        captured = {}
+        real_fpfb = ex.model.forward_prefill_batch   # 捕获批量 logits,转发真函数
+
+        def spy_fpfb(ids, vs, *, real_lens):
+            logits = real_fpfb(ids, vs, real_lens=real_lens)
+            captured["logits"] = logits
+            return logits
+
+        ex.model.forward_prefill_batch = spy_fpfb
+        real_sample = ex._sample
+        sample_calls = {"n": 0}
+
+        def spy_sample(s, logits):
+            sample_calls["n"] += 1
+            return real_sample(s, logits)
+
+        ex._sample = spy_sample
+        try:
+            returned = ex.prefill_batch(seqs, views)
+        finally:
+            del ex.model.forward_prefill_batch
+            del ex._sample
+        logits = captured["logits"]
+        assert logits.shape == (2, 256)
+        assert sample_calls["n"] == 2   # 每行恰一次 _sample(吞掉逐行采样 → <2 → 红)
+        assert returned[0] == int(logits[0].argmax())   # greedy 行 == 同 logits argmax
+        assert isinstance(returned[1], int)   # temp>0 行走 Sampler,返回 int
+        # 变长右 padding:各行 KV 只写到各自 real_len(pad 永不入 KV;_lens 为
+        # per-layer dict,对照法同 Task 4 的 prefill_batch 测试)
+        assert views[0]._lens == {0: 7, 1: 7}
+        assert views[1]._lens == {0: 4, 1: 4}

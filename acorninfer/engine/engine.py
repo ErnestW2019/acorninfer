@@ -123,13 +123,25 @@ class Engine:
         prefills, decodes = self.scheduler.schedule()
         outputs: list[TokenOutput] = []
         try:
+            built = []
             for seq in prefills:
                 # 块表共享同一 list 对象:调度器 _release 清空它即同时清空视图
                 view = PagedCacheView(self.cache, seq.block_table)
                 self._views[seq.seq_id] = view
+                built.append((seq, view))
+            if len(built) == 1:
+                # N=1 原路径:byte-identical(零回归面)
+                seq, view = built[0]
                 token = self.executor.prefill(seq, view)
                 seq.num_pages = len(view.table)
                 self._record(seq, token, outputs)
+            elif built:
+                # M4.1:同批多序列一次批量 prefill(调度器本就一步全准入)
+                tokens = self.executor.prefill_batch(
+                    [s for s, _ in built], [v for _, v in built])
+                for (seq, view), token in zip(built, tokens):
+                    seq.num_pages = len(view.table)
+                    self._record(seq, token, outputs)
             if decodes:
                 views = [self._views[s.seq_id] for s in decodes]
                 tokens = self.executor.decode_batch(decodes, views)
