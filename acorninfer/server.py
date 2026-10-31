@@ -34,8 +34,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from acorninfer.config import EngineConfig
 from acorninfer.engine.engine import Engine
+from acorninfer.models.qwen3 import from_pretrained
 from acorninfer.sampler import SamplingParams
+from acorninfer.tokenizer import Tokenizer
 
 IDLE_TIMEOUT_S = 120.0  # queue.get 空闲兜底:pump 意外消亡时请求不永久挂起
 
@@ -455,14 +458,45 @@ def create_app(engine: Engine) -> FastAPI:
     return app
 
 
+def _build_engine(args) -> Engine:
+    """从解析后的 CLI 参数构造 Engine(生产路径;测试经 monkeypatch 打桩)。
+
+    构造与 Engine.from_config 同一(engine.py 本任务不动,from_config 尚无
+    chunked_budget 透传,故内联;两处构造需保持同步):
+    - attention_backend/fused_ops/decode_graph 在 Engine 构造前置位(decode
+      graph runner 在 Engine.__init__ 捕获各桶);
+    - chunked_budget 经 Engine 构造参数透传(M5 chunked prefill),缺省
+      None = 每步全量 prefill,引擎行为与 M4.1 逐字节一致。
+    """
+    cfg = EngineConfig(
+        model_dir=args.model_dir,
+        device=args.device,
+        num_blocks=args.num_blocks,
+        page_size=args.page_size,
+        max_running=args.max_running,
+        watermark_blocks=args.watermark_blocks,
+    )
+    model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
+    model.attention_backend = cfg.attention_backend
+    model.fused_ops = cfg.fused_ops
+    model.decode_graph = cfg.decode_graph
+    tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
+    return Engine(
+        model,
+        tok,
+        num_blocks=cfg.num_blocks,
+        page_size=cfg.page_size,
+        max_running=cfg.max_running,
+        watermark_blocks=cfg.watermark_blocks,
+        chunked_budget=args.chunked_budget,
+    )
+
+
 def main() -> None:
     """生产入口:CLI 参数接 EngineConfig + 真实 tokenizer(测试不经过此路径)。"""
     import argparse
 
     import uvicorn
-
-    from acorninfer.config import EngineConfig
-    from acorninfer.tokenizer import Tokenizer
 
     parser = argparse.ArgumentParser(prog="acorninfer-server")
     parser.add_argument("--model-dir", default="/home/ernest/model-weight/Qwen3-8B")
@@ -473,18 +507,13 @@ def main() -> None:
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--max-running", type=int, default=8)
     parser.add_argument("--watermark-blocks", type=int, default=8)
+    parser.add_argument(
+        "--chunked-budget", type=int, default=None,
+        help="每步 prefill token 预算(M5 chunked prefill);缺省 None = 不切块",
+    )
     args = parser.parse_args()
 
-    cfg = EngineConfig(
-        model_dir=args.model_dir,
-        device=args.device,
-        num_blocks=args.num_blocks,
-        page_size=args.page_size,
-        max_running=args.max_running,
-        watermark_blocks=args.watermark_blocks,
-    )
-    tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
-    engine = Engine.from_config(cfg, tok)
+    engine = _build_engine(args)
     uvicorn.run(create_app(engine), host=args.host, port=args.port)
 
 

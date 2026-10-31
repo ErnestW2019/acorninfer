@@ -465,3 +465,67 @@ best 变体逐格(µs | effbw GB/s | 变体;当日第二轮,与前一轮完整�
 **复跑 vs 控制器测量(收编验证,同带)**:四类 ratio 0.555/0.531/0.541/0.469 对控制器 0.553/0.530/0.541/0.469;总账 15.65/8.16 ms vs 15.64/8.15 ms(ratio 0.522 vs 0.521);投影 13.63 ms / 1.45× vs ~13.6 ms / ~1.45×——比值同位,绝对值差 <0.7%。
 
 **判定数据小结(裁决行,控制器已裁)**:① decode allreduce 57 KiB 图内 17.84 µs,< 50 µs 参考门;② NCCL allreduce CUDA graph 捕获四档全成(零 GRAPH_CAPTURE_FAIL);③ 冷权重半宽/全宽 GEMM ratio 0.522(四类 0.469–0.555)≥ 40% 门。**三线全过,控制器判定:TP=2 GO。**
+
+### 段 1:chunked prefill 中间账(HTTP 对照,2026-10-31,`acorninfer.server --chunked-budget` + `scripts/bench_remote.py` + `python -m acorninfer.bench`,真机输出)
+
+背景:Task 1 已落地 chunked prefill(Engine 参数 `chunked_budget`,None = 每步全量 prefill、引擎行为与 M4.1 逐字节一致,fast 122 + slow 17 全绿零改动)。本段在 HTTP 产品路径上量化三件事:CLI 默认路径对 Task 0 基线的带内性(A)、预算大到不触发切块的哨兵(B)、强制切块的主数据(C);并以 in-process 回归线证明默认路径吞吐零回退。**方法学边界(如实,不粉饰)**:bench prompt 固定 128 tokens、同刻批量到达——chunking 的核心收益「连续到达请求不被长 prefill 阻塞」在本协议下不触发,本轮测的是**切块本身的代价/中性性**;收益侧数据留给后续连续到达协议。
+
+CLI 接线:server `--chunked-budget`(int,缺省 None)经 `_build_engine` 透传 `Engine(chunked_budget=...)`(测试 `test_build_engine_chunked_budget_passthrough` 钉住;EngineConfig 不加字段,engine.py 本任务不动)。服务每跑 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8200 [--chunked-budget N]`(其余全默认:sdpa、无 fused、无 graph——与 Task 0 基线服务口径逐字一致),压测每跑 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:8200 --concurrency 1 4 8`(seed 默认 20261027,prompt 128 tokens 同批直投);每跑之间定向 kill 服务真实 PID(`ss -tlnp` 取 PID,**包装壳陷阱实录**:跑 A 首轮 `$!` 捕到的是后台包装子壳(607627),kill 后真身(607630,父进程已转 1)仍占端口持 18.7 GB——docs 段 0 注记 4 场景复现,按注记以 `ss` 定向 kill 真身,kill 后确认端口空 + GPU 回落 4 MiB 才起下一跑;每跑前 GPU 1 均 4 MiB / 0 进程)。
+
+RESULT 行逐字(stdout;`RESULT-VLLM` 前缀为 `bench_remote` 固定标签):
+
+- 跑 A(None,CLI 默认路径;首跑):`RESULT-VLLM C=1 ttft_p50=0.0364s ttft_mean=0.0364s tpot_mean=27.48ms tok_s=36.03`
+- （A 续)`RESULT-VLLM C=4 ttft_p50=0.0884s ttft_mean=0.0885s tpot_mean=42.92ms tok_s=89.08`
+- （A 续)`RESULT-VLLM C=8 ttft_p50=0.1927s ttft_mean=0.1733s tpot_mean=57.11ms tok_s=116.77`
+- 跑 A′(None,同协议复跑):`RESULT-VLLM C=1 ttft_p50=0.0375s ttft_mean=0.0375s tpot_mean=28.17ms tok_s=35.13`
+- （A′ 续)`RESULT-VLLM C=4 ttft_p50=0.1230s ttft_mean=0.1012s tpot_mean=42.87ms tok_s=88.85`
+- （A′ 续)`RESULT-VLLM C=8 ttft_p50=0.1915s ttft_mean=0.1725s tpot_mean=58.93ms tok_s=113.11`
+- 跑 B(`--chunked-budget 512`,哨兵:128-token prompt 不触发切块):`RESULT-VLLM C=1 ttft_p50=0.0415s ttft_mean=0.0415s tpot_mean=27.84ms tok_s=35.37`
+- （B 续)`RESULT-VLLM C=4 ttft_p50=0.1247s ttft_mean=0.1027s tpot_mean=43.60ms tok_s=87.37`
+- （B 续)`RESULT-VLLM C=8 ttft_p50=0.1427s ttft_mean=0.1693s tpot_mean=58.84ms tok_s=112.95`
+- 跑 C(`--chunked-budget 64`,强制 2 块/序列):`RESULT-VLLM C=1 ttft_p50=0.0829s ttft_mean=0.0829s tpot_mean=27.31ms tok_s=34.43`
+- （C 续)`RESULT-VLLM C=4 ttft_p50=0.2440s ttft_mean=0.2497s tpot_mean=44.10ms tok_s=74.80`
+- （C 续)`RESULT-VLLM C=8 ttft_p50=0.5200s ttft_mean=0.5455s tpot_mean=64.48ms tok_s=85.47`
+
+HTTP 四行对照(Task 0 基线为当日同机同协议归档引用,不重跑;差值列为算术):
+
+| 跑 | 预算 | C=1 tok/s | C=4 tok/s | C=8 tok/s | TTFT p50 C=1/4/8 (s) | TPOT mean C=1/4/8 (ms) |
+|---|---|---|---|---|---|---|
+| Task 0 基线 | None(无该参数) | 35.33 | 86.92 | 109.83 | 0.0380 / 0.1244 / 0.1947 | 27.99 / 43.86 / 60.83 |
+| A 首跑 | None | 36.03(+2.0%) | 89.08(+2.5%) | 116.77(+6.3%) | 0.0364 / 0.0884 / 0.1927 | 27.48 / 42.92 / 57.11 |
+| A′ 复跑 | None | 35.13(−0.6%) | 88.85(+2.2%) | 113.11(+3.0%) | 0.0375 / 0.1230 / 0.1915 | 28.17 / 42.87 / 58.93 |
+| B | 512 | 35.37(+0.1% vs A′) | 87.37(−1.7% vs A′) | 112.95(−0.1% vs A′) | 0.0415 / 0.1247 / 0.1427 | 27.84 / 43.60 / 58.84 |
+| C | 64 | 34.43(−2.0% vs A′) | 74.80(−15.8% vs A′) | 85.47(−24.4% vs A′) | 0.0829 / 0.2440 / 0.5200 | 27.31 / 44.10 / 64.48 |
+
+chunked 判读(如实,只陈述差值与机制,裁决留控制器):
+
+- **A vs 基线**:A′ 三档 tok_s −0.6%/+2.2%/+3.0%,±5% 带内,TTFT p50 逐档 ≤2% 吻合——CLI 默认路径带内成立。A 首跑 C=8 +6.3% 出带、C=4 TTFT p50 0.0884 对基线 0.1244 偏离(同跑 ttft_mean 0.0885 对基线 0.1024),A′ 与 B 的 C=4 TTFT(0.1230/0.1247)复刻基线轮廓(0.1244)——首跑为方差样本;C=8 档历史带本就宽(Task 0 审查复跑 +4.2%,本日 A 首跑 +6.3%,同向),两跑均逐字归档不作挑选。
+- **B vs A′**:tok_s 差 +0.7%/−1.7%/−0.1%——budget=512 下 128-token prompt 走单条全量 chunk(start=0 且 length=len(all_ids)),路由回既有 prefill_batch 原路径,与 None 行为同带,哨兵成立。
+- **C vs A′(主数据)**:tok_s −2.0%/−15.8%/−24.4%;TTFT p50 全档上升 +121%/+98%/+171%;TPOT −3.1%/+2.9%/+9.4%(decode 慢腿几乎不动)。机制(与 Task 1 调度契约逐条对应,非推测的仅两点):budget=64 < prompt 128 → 每序列切 2 块;且 FCFS 预算下一步只够一条序列的首块(64 恰耗尽预算)→ 准入串行化,TTFT 含排队步数放大(C=8 尾序列等 8 步才完成 prefill)。切块本身让 [N,128] 单次批量 prefill 变成两轮更小的前向,步界开销与更小 GEMM 的代价即为吞吐差——**同步批量到达协议下 chunking 只表现出代价;「连续到达不被长 prefill 阻塞」的收益本协议不覆盖**(见节首方法学边界)。
+
+in-process 回归线(Task 1 零回退证明;默认 None 路径,引擎直连,与 HTTP 无关;M4.1 段二收官数为当日归档引用):
+
+- graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32 --concurrency 1 4 8 --attention-backend triton --fused-ops --cuda-graph`
+- eager:同上,去掉 `--cuda-graph`
+
+RESULT 行逐字:
+
+- `RESULT C=1 ttft_p50=0.0352s ttft_mean=0.0352s tpot_mean=17.98ms tok_s=54.00`
+- `RESULT C=4 ttft_p50=0.0797s ttft_mean=0.0797s tpot_mean=19.63ms tok_s=185.99`
+- `RESULT C=8 ttft_p50=0.1493s ttft_mean=0.1493s tpot_mean=20.00ms tok_s=294.59`
+- `RESULT C=1 ttft_p50=0.0357s ttft_mean=0.0357s tpot_mean=19.30ms tok_s=50.48`
+- `RESULT C=4 ttft_p50=0.0766s ttft_mean=0.0766s tpot_mean=20.96ms tok_s=176.20`
+- `RESULT C=8 ttft_p50=0.1432s ttft_mean=0.1432s tpot_mean=21.15ms tok_s=283.20`
+
+(前 3 行 graph,后 3 行 eager。)
+
+| 腿 | M4.1 收官 tok/s (C=1/4/8) | 本日 tok/s | 差 | ±8% 判定 |
+|---|---|---|---|---|
+| graph | 54.17 / 187.13 / 296.76 | 54.00 / 185.99 / 294.59 | −0.3% / −0.6% / −0.7% | 带内 |
+| eager(triton+fused) | 50.84 / 176.38 / 283.16 | 50.48 / 176.20 / 283.20 | −0.7% / −0.1% / +0.0% | 带内 |
+
+两腿全部 ±1% 以内(远窄于 ±8% 门),TPOT 逐位同带(graph 17.98/19.63/20.00,eager 19.30/20.96/21.15,对归档 19.18/20.94/21.12)——Task 1 对默认路径零回退成立。
+
+辅助对照(同日实测,非 M4.1 配方):纯默认 bench(= HTTP server 同口径,sdpa、无 fused、无 graph)`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32` → C=1/4/8 = 36.62 / 91.07 / 117.71 tok_s,TTFT p50 0.0348/0.0762/0.1444 s。与 HTTP A′(35.13/88.85/113.11)差 +4.2%/+2.5%/+4.1%——HTTP 腿对 in-process 同口径的差价即客户端↔服务端+SSE 全程开销;亦解释 Task 0 节 HTTP(2.6×)对照的口径差:该表 in-process 列为 triton+fused 后端,HTTP server 为 sdpa 默认,后端不同(彼节归因本就留控制器,此处只并列本日同口径数)。
+
+口径注记(照 M4.1/Task 0 节同款):同日同机(物理 GPU 1,RTX 4090);HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);prompt 同一批随机 token ids(`_prompts` seed=20261027,token-id 数组直投、两端零分词差);temperature=0、max_tokens=32,计时前 1 条 warmup 不计入;四跑服务配置仅 `--chunked-budget` 一处不同,其余逐字一致;每跑之间服务收服验证(端口空 + GPU 4 MiB)。

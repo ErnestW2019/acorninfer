@@ -341,3 +341,45 @@ async def test_engine_poison_500_then_health_503_fast_fail(tiny_model, monkeypat
         assert h.status_code == 503
         r2 = await c.post("/v1/completions", json={"prompt": "y", "max_tokens": 2})
         assert r2.status_code == 500  # 快速失败,不再触碰中毒引擎
+
+
+def test_build_engine_chunked_budget_passthrough(monkeypatch):
+    """CLI --chunked-budget 透传 Engine 构造(M5 Task 2):缺省 None 与显式值
+    两条路径;from_pretrained/Tokenizer 打桩,不加载真模型。
+
+    同时钉 server 生产构造的后端开关默认(与 Task 0 HTTP 基线口径一致:
+    EngineConfig 默认 sdpa、无 fused、无 graph)与其余 EngineConfig 透传。"""
+    import types
+
+    import acorninfer.server as server_mod
+
+    created: dict = {}
+
+    def fake_from_pretrained(model_dir, device, dtype):
+        return types.SimpleNamespace()  # 属性袋:承接 backend 开关赋值
+
+    def fake_engine(model, tok, **kwargs):
+        created.clear()
+        created.update(kwargs)
+        created["model"] = model
+        created["tok"] = tok
+        return "ENGINE"
+
+    monkeypatch.setattr(server_mod, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(server_mod, "Engine", fake_engine)
+    monkeypatch.setattr(server_mod, "Tokenizer", lambda path: "TOK")
+
+    base = dict(model_dir="/m", device="cuda:0", num_blocks=8, page_size=16,
+                max_running=4, watermark_blocks=2, host="h", port=1,
+                chunked_budget=None)
+    assert server_mod._build_engine(types.SimpleNamespace(**base)) == "ENGINE"
+    assert created["chunked_budget"] is None  # 缺省:不切块(M4.1 逐字节行为)
+    assert created["model"].attention_backend == "sdpa"
+    assert created["model"].fused_ops is False
+    assert created["model"].decode_graph is False
+
+    server_mod._build_engine(
+        types.SimpleNamespace(**{**base, "chunked_budget": 64}))
+    assert created["chunked_budget"] == 64
+    assert created["num_blocks"] == 8 and created["page_size"] == 16
+    assert created["max_running"] == 4 and created["watermark_blocks"] == 2
