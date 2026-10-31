@@ -203,6 +203,48 @@ class Qwen3Attention(nn.Module):
         out = out.transpose(1, 2).reshape(B, s, -1)
         return self.o_proj(out)
 
+    def forward_prefill_batch(self, hidden, cos, sin, views, layer_idx, *,
+                              real_lens):
+        """批量 prefill(M4.1):hidden [N, Lmax, D](右 padding),cos/sin
+        [N, Lmax, head_dim],real_lens[i] = 第 i 行真实长度。
+
+        大 GEMM 合批:qkv/o 按 [N, Lmax] 一次算(pad 行垃圾值只在自己行内
+        传播);KV 写入与 attention 逐行 —— 与单序列 forward 的 prefill 分支
+        (cache 空,is_causal=(s>1))完全同一语义:update 截断 [:L],pad 永不
+        入 KV,逐行 SDPA 天然行间隔离。本方法不接 fused_ops /
+        attention_backend 选择器:prefill 批量化与 decode 后端开关解耦。
+        """
+        N, Lmax, _ = hidden.shape
+        q = self.q_proj(hidden).view(N, Lmax, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 批量 RoPE(逐 token):cos/sin [N,1,Lmax,D] 广播 [N,H,Lmax,D];
+        # pad 位算出的垃圾值随 [:L] 截断丢弃
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        rep = self.num_heads // self.num_kv_heads
+        outs = torch.zeros(N, self.num_heads, Lmax, self.head_dim,
+                           dtype=hidden.dtype, device=hidden.device)
+        for b, view in enumerate(views):
+            L = real_lens[b]
+            k_full, v_full = view.update(layer_idx, k[b : b + 1, :, :L],
+                                         v[b : b + 1, :, :L])
+            k_full = _repeat_kv(k_full, rep)
+            v_full = _repeat_kv(v_full, rep)
+            # 镜像单序列 prefill 分支:is_causal=(s>1);L==1 单 query 全可见
+            # 与 causal 等价(同 forward 的 s==1 注释)
+            outs[b, :, :L] = F.scaled_dot_product_attention(
+                q[b : b + 1, :, :L], k_full, v_full, is_causal=(L > 1))[0]
+        out = outs.transpose(1, 2).reshape(N, Lmax, -1)
+        return self.o_proj(out)
+
 
 class Qwen3MLP(nn.Module):
     def __init__(self, cfg: Qwen3Config):
@@ -256,6 +298,18 @@ class Qwen3Block(nn.Module):
             self.post_attention_layernorm.eps,
         )
         return residual + self.mlp(normed)
+
+    def forward_prefill_batch(self, hidden, cos, sin, views, layer_idx, *,
+                              real_lens):
+        """批量 prefill(M4.1):RMSNorm 逐 token,天然支持 [N, Lmax] 合批;
+        残差结构与单序列 forward 一致(torch 路径,无 fused 分支 —— prefill
+        批量化与 fused_ops 解耦)。"""
+        hidden = hidden + self.self_attn.forward_prefill_batch(
+            self.input_layernorm(hidden), cos, sin, views, layer_idx,
+            real_lens=real_lens,
+        )
+        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        return hidden
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -376,6 +430,42 @@ class Qwen3ForCausalLM(nn.Module):
             )
         hidden = self.norm(hidden)
         return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
+
+    def forward_prefill_batch(self, input_ids: torch.Tensor, views, *,
+                              real_lens) -> torch.Tensor:
+        """批量 prefill(M4.1):input_ids [N, Lmax](右 padding,pad 位值任意)
+        + real_lens[i](第 i 行真实长度)-> 各行末真实位 logits [N, vocab]
+        (float32)。
+
+        大 GEMM 合批 embed/RMSNorm/qkv/o/MLP(pad 行垃圾值只在其行内传播,
+        逐行 attention 天然隔离);KV 写入与 attention 逐行(view.update 截断
+        [:L])= 单序列 forward 的 prefill 分支同一语义;末层只对各行
+        real_lens[i]-1 位置过 lm_head。与 fused_ops/attention_backend 解耦
+        (prefill 分支现状即不接后端选择器)。
+        """
+        N, Lmax = input_ids.shape
+        if len(views) != N or len(real_lens) != N:
+            raise ValueError("views/real_lens 必须与 batch 维一一对应")
+        if min(real_lens) < 1 or max(real_lens) > Lmax:
+            # L==0 无末位可取;L>Lmax 会静默越界/截断错误
+            raise ValueError("real_lens 必须落在 [1, Lmax] 内")
+        device = input_ids.device
+        dtype = self.embed_tokens.weight.dtype
+        # 逐行位置(pad 位 0);展平为一次 rope 调用
+        pos = torch.zeros(N * Lmax, dtype=torch.long, device=device)
+        for i, L in enumerate(real_lens):
+            pos[i * Lmax: i * Lmax + L] = torch.arange(L, device=device)
+        cos, sin = self.rope(pos, dtype, device)      # [N*Lmax, head_dim]
+        cos = cos.view(N, Lmax, -1)
+        sin = sin.view(N, Lmax, -1)
+        hidden = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.forward_prefill_batch(hidden, cos, sin, views, i,
+                                                 real_lens=real_lens)
+        hidden = self.norm(hidden)
+        last = torch.tensor([L - 1 for L in real_lens], device=device)
+        hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
+        return self.lm_head(hidden).float()
 
 
 def map_hf_state_dict(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

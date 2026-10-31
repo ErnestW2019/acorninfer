@@ -201,3 +201,84 @@ def test_forward_decode_prepared_bundle_bitwise(tiny_model, monkeypatch, fused):
         for blk in v.table:
             alloc.free(blk)
     alloc.assert_balanced()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("fused", [True, False])
+def test_forward_prefill_batch_matches_sequential(tiny_model, fused):
+    """批量 prefill(M4.1)vs 逐条 forward:per-row 末位 logits 紧容差一致;
+    KV 写入逐行等长且页表一致(pad 永不入 KV、行间零串扰);fused 开关与
+    attention_backend 均不影响 prefill 分支(现状即如此),参数化 + 非默认
+    后端取值钉住这一解耦。
+
+    参考腿逐条走现有 forward(num_logits_to_keep=1),独立 allocator/cache
+    (页表互不污染);两腿 allocator 同构,LIFO 分配序一致 → 页表可逐位对拍。
+    """
+    model = tiny_model.to("cuda")
+    torch.manual_seed(0)
+    model.attention_backend = "triton"   # prefill 与后端解耦;取一个非默认值
+    model.fused_ops = fused
+    lens = [5, 9, 3]
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    prompts = [torch.randint(0, 256, (1, L), generator=gen, device="cuda")
+               for L in lens]
+    Lmax = max(lens)
+    ids = torch.zeros(3, Lmax, dtype=torch.long, device="cuda")  # 右 padding
+    # 批量腿
+    alloc = BlockAllocator(32)
+    cache = PagedKVCache(
+        model.cfg.num_hidden_layers,
+        model.cfg.num_key_value_heads,
+        model.cfg.head_dim,
+        4,
+        alloc,
+        "cuda",
+        torch.bfloat16,
+    )
+    views = [PagedCacheView(cache) for _ in range(3)]
+    for i, p in enumerate(prompts):
+        ids[i, : lens[i]] = p
+    with torch.inference_mode():
+        batch_logits = model.forward_prefill_batch(ids, views, real_lens=lens)
+    # 逐条参考腿(独立 cache/views,页表互不污染)
+    alloc2 = BlockAllocator(32)
+    cache2 = PagedKVCache(
+        model.cfg.num_hidden_layers,
+        model.cfg.num_key_value_heads,
+        model.cfg.head_dim,
+        4,
+        alloc2,
+        "cuda",
+        torch.bfloat16,
+    )
+    ref, ref_views = [], []
+    with torch.inference_mode():
+        for i, p in enumerate(prompts):
+            v = PagedCacheView(cache2)
+            ref.append(model(p, v, num_logits_to_keep=1)[0, -1])
+            ref_views.append(v)
+    ref = torch.stack(ref)
+    assert batch_logits.shape == (3, 256)
+    # 容差标定(TOL 协议):2026-10-31,命令 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python
+    # -m pytest tests/test_forward_decode.py -k prefill_batch -v -s` +
+    # 探针脚本打印逐元素 slack,实测 max|diff| = 0.0078125(= 2^-7,恰 1 个 bf16 ulp;
+    # argmax 处 ref=-1.039,batch=-1.031;407/768 元素有 ulp 级差异 —— 合批 GEMM 与
+    # [1,L] GEMM 选核/归约序差异的固有舍入)。按协议取实测 2-3 倍:atol=6e-3
+    # (≈0.77× 实测 max|diff|,覆盖小 |ref| 元素的 ≥1 ulp)+ rtol=1.6e-2(≈2 bf16
+    # ulp 的相对界,覆盖大 |ref|);对 |ref|<0.67(本 logits 分布均值 0.46)严于
+    # 全局 TOL_BF16(1e-2/1e-2)。最小 slack 0.0025,配置/驱动变化后按协议重标定。
+    tol = dict(rtol=1.6e-2, atol=6e-3)
+    torch.testing.assert_close(batch_logits, ref, **tol)
+    worst = max_abs_diff(batch_logits, ref)
+    print(f"\n[forward_prefill_batch fused={fused} vs sequential max|diff| = {worst:.6f}]")  # 标定输出
+    for i in range(3):
+        assert views[i]._lens == ref_views[i]._lens   # 逐层 KV 长度一致(pad 未入 KV)
+        assert views[i].table == ref_views[i].table   # 页表一致(无跨行写)
+    for v in views:
+        for blk in v.table:
+            alloc.free(blk)
+    for v in ref_views:
+        for blk in v.table:
+            alloc2.free(blk)
+    alloc.assert_balanced()
+    alloc2.assert_balanced()
