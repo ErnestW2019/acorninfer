@@ -298,3 +298,82 @@ RESULT 行逐字(stdout):
 - vLLM:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --concurrency 1 4 8`
 - graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 --attention-backend triton --fused-ops --cuda-graph`
 - eager:同上,去掉 `--cuda-graph`
+
+## M5 段 0 尖刀:NCCL allreduce / 半宽 GEMM / prefill 拆账(2026-10-31,`scripts/phase0_spike.py` + `scripts/profile_prefill.py`,真机输出)
+
+M5(chunked prefill + TP=2)开工前三决定点的实测。拓扑背景:本机 GPU0-GPU1 = NODE 拓扑(同 NUMA 走 PCIe 主桥,无 NVLink);torch 2.13.0+cu130(NCCL 随 torch 内置)。当日每腿跑前 `nvidia-smi` 确认无残留进程;HEAD = 96218e0。裁决输入仅为数据,判定行不在本节(留给控制器)。
+
+### allreduce 微基准(双卡,CUDA graph 捕获)
+
+命令:`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m torch.distributed.run --nproc-per-node 2 scripts/phase0_spike.py`(本仓 venv 无 torchrun 入口脚本,`-m torch.distributed.run` 为其模块入口等价;跑前双卡 4 MiB / 0 进程)。nccl backend,bf16 一维张量;每档 eager warmup 10 + 计 50 次取均值,graph 侧 CUDAGraph 捕获 50 次 allreduce(侧 stream warmup 3 次 + 全员 barrier 对齐),replay 2 次热身后计时 1 次 replay ÷50。数字为 rank0(rank1 同档差 <1%,顺手核对一致)。
+
+| 尺寸(B) | eager(µs/次) | graph(µs/次) | 有效带宽 eager(GB/s,简化口径) |
+|---|---|---|---|
+| 8 192 | 18.14 | 11.53 | 0.9 |
+| 58 368(57 KiB) | 18.66 | 17.84 | 6.3 |
+| 1 048 576(1 MiB) | 92.32 | 94.97 | 22.7 |
+| 8 388 608(8 MiB) | 567.70 | 570.55 | 29.6 |
+
+stdout 行逐字(rank0):`ALLOTSIZE=8192 eager=18.14 graph=11.53 bw_eager=0.9` / `ALLOTSIZE=58368 eager=18.66 graph=17.84 bw_eager=6.3` / `ALLOTSIZE=1048576 eager=92.32 graph=94.97 bw_eager=22.7` / `ALLOTSIZE=8388608 eager=567.70 graph=570.55 bw_eager=29.6`。
+
+口径注记(均为实测事实):
+
+1. **四档 graph 捕获全部成功,零 GRAPH_CAPTURE_FAIL**(M4 decode graph 捕获模型前向、TP=2 allreduce 须能入 graph 的前提,当日实测成立)。
+2. 有效带宽 = size×2/延迟(读+写两笔,简化口径;ring 系数不较真)。计划参考值「8MB 在 ~25GB/s 下 ~0.3ms/次」为推算非实测,当日 8 MiB 档实测 0.568 ms(eager)/ 0.571 ms(graph)。
+3. 稳定性:同日首跑(收尾挂死前数据已全部打印)四档 eager/graph 19.15/10.52、16.61/17.88、93.88/93.75、569.47/572.39,两轮差 <2%;57 KiB eager 档例外(16.61→18.66,±12%,小尺寸档噪声带)。
+4. **首跑发现:graph 捕获后 NCCL 进程组收尾路径(barrier/destroy_process_group)挂死在 CudaEventDestroy**(watchdog 480 s 无进展报警后终止进程,两 rank 同;错误行逐字:`ProcessGroupNCCL's watchdog got stuck for 480 seconds without making progress in monitoring enqueued collectives`、`Terminating the process after attempting to dump debug info, due to ProcessGroupNCCL watchdog hang`)。脚本已绕行(捕获图保活到结尾 + 数据行 flush 后 `os._exit(0)`),复跑干净退出。此为环境事实,TP server 生命周期(M5 后续任务)设计时须知。
+5. 位置参考(算术,非实测):decode 每步 72 次 allreduce(计划背景数字),若全为 57 KiB 档且全串行,按 graph 档 17.84 µs/次 ≈ 1.28 ms/步。
+
+### 半宽 GEMM 效率(双卡同测,rank0 为准)
+
+| 形状(M×K×N) | 档位 | TFLOPS |
+|---|---|---|
+| 7×4096×2048 | decode 半宽 | 4.28 |
+| 7×4096×3072 | decode 半宽 | 3.44 |
+| 7×4096×4096 | decode 全宽对照 | 11.46 |
+| 1024×4096×2048 | prefill 半宽 | 169.78 |
+
+stdout 行逐字(rank0):`GEMM M=7 K=4096 N=2048 tflops=4.28` / `GEMM M=7 K=4096 N=3072 tflops=3.44` / `GEMM M=7 K=4096 N=4096 tflops=11.46` / `GEMM M=1024 K=4096 N=2048 tflops=169.78` / `RATIO half/full=0.373`。
+
+注(实测事实 + 标注判读):RATIO = decode 半宽 N=2048 ÷ 全宽 N=4096 = 0.373(首跑 0.371;rank1 两轮 0.372/0.372,一致)。prefill 半宽(M=1024)169.78 TFLOPS 无塌方;decode 半宽塌至全宽的 37% —— 判读:塌方主体与 M=7 的 GEMV 形状相伴(N=2048 与 N=3072 两档同塌),非切半单独所致(推断)。
+
+### prefill 拆账(单卡物理 GPU 1,torch.profiler)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/profile_prefill.py`(对象 `forward_prefill_batch`,8B bf16,[8,128] 随机 ids,seed=20261027 与 bench 同源,× 10 步;每步 8 序列 × 8 页、步末全归还;跑前 GPU 1 = 4 MiB)。
+
+脚本原始输出行(逐字):`steps=10 wall/step=188.67ms gpu_kernel+memcpy/step=105.18ms gap/step=83.49ms`;`flops=14.22TFLOP/次(按 36 层静态 FLOP 估算) eff_wall=75.40TFLOPS eff_gpu=135.24TFLOPS`;`sanity: blocks live=0 (每步 8 序列 × 8 页步末全归还)`。
+
+| 指标 | 实测值 |
+|---|---|
+| 每步墙钟 wall/step(含 profiler 采样开销) | 188.67 ms |
+| GPU 自用时间(kernel+memcpy)/step | 105.18 ms |
+| gap/step(墙钟 − GPU 端) | 83.49 ms |
+| 有效 TFLOPS(墙钟口径) | 75.40(按 36 层静态 FLOP 估算 14.22 TFLOP/次) |
+| 有效 TFLOPS(GPU 侧口径) | 135.24(同上) |
+
+GPU 自用时间拆账(op 聚合,Self CUDA = 各自 kernel,行间不双计;10 步累计 → 折合每步;GEMM/attention/elementwise 归类):
+
+| 归类 | op(聚合) | Self CUDA(10 步) | 每步 | 占 GPU 忙时 | 次数/步 |
+|---|---|---|---|---|---|
+| GEMM | aten::mm | 844.969 ms | 84.50 ms | 80.33% | 253 |
+| elementwise(mul) | aten::mul | 53.689 ms | 5.37 ms | 5.10% | 471 |
+| 拷贝(归因为逐行 view.update/_repeat_kv 等,推断) | aten::copy_ | 50.544 ms | 5.05 ms | 4.81% | 2501 |
+| 行索引写入 | aten::_index_put_impl_ | 18.729 ms | 1.87 ms | 1.78% | 576 |
+| elementwise(残差 add) | aten::add | 18.161 ms | 1.82 ms | 1.73% | 289 |
+| attention(SDPA→flash) | aten::_flash_attention_forward | 16.673 ms | 1.67 ms | 1.59% | 288 |
+
+六项合计 95.3%,余为长尾 elementwise/reduce/memcpy。top 设备 kernel 为 4 个 cutlass bf16 GEMM:`ampere_bf16_s1688gemm_bf16_64x128...` 432.853 ms(41.15%,720 次)/ `..._128x64...` 220.697 ms(20.98%,360 次)/ `..._128x128...` 140.672 ms(13.37%,720 次)/ `ampere_bf16_s16816gemm_bf16_128x64...` 36.798 ms(3.50%,720 次),GEMM kernel 合计 831.02 ms(79.0%);Self CUDA time total: 1.052 s(10 步)。
+
+口径注记:wall/step 含 profiler 逐 kernel 采样开销(照 M4 口径注记 3;CPU 侧 Self CPU total 1.520 s,其中 aten::copy_ CPU total 866.939 ms —— 2501 次/步的小拷贝发射是 CPU 侧大头,CPU 算子行与 kernel 行双计、不入账),绝对吞吐以 bench 口径为准。与 M4.1 段二 in-process C=8 TTFT p50 0.1454 s 的算术对照(判读):批量 prefill 前向 GPU 自用 105.18 ms + gap 83.49 ms(profiler 含采样开销口径),与 145.4 ms 同量级;差值部分为步内调度/采样/传输等图外工作(推断,未单独计时)。
+
+### HTTP 方法学对齐腿(单卡物理 GPU 1)—— 当日 BLOCKED,无数据
+
+计划命令:起服 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8200`(全默认:model-dir 8B、device cuda:0、num_blocks 1024、page 16、max_running 8;EngineConfig 默认 sdpa、无 fused、无 graph —— server CLI 无后端开关,照现状),压测 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:8200 --concurrency 1 4 8`(实参 `--base`,脚本无 `--port`,照现状)。
+
+现场(均为实测事实):
+
+1. 起服成功:前台轮询 `/health` 200(约 40 s),GPU 1 驻留 18 532 MiB。
+2. 压测零档出数:warmup 请求即失败,客户端错误行逐字 `httpx.HTTPStatusError: Client error '422 Unprocessable Entity' for url 'http://127.0.0.1:8200/v1/completions'`;服务端日志逐字 `INFO:     127.0.0.1:34242 - "POST /v1/completions HTTP/1.1" 422 Unprocessable Entity`。**无任何 RESULT 行可录**。
+3. 根因(协议不匹配,非 CLI 参数拼写):`bench_remote` 以 token-id 数组直投 `prompt`(M3 基线节明言「绕开文本分词往返」,vLLM affordance);本引擎 `PromptCompletionRequest.prompt: str` 仅收文本,tokenizer 编码在服务端边界(`server.py` prompt 字段契约)。随机 id 序列经 str 传递再重编码不可保证等值(BPE 边界效应),无诚实绕行。
+4. 旁证:str-prompt smoke(1 条,`"The capital of France is"`,max_tokens=4,stream)流式正常产出(`Paris`/`.`/` The`/` capital`)→ server 本体可用,不匹配纯在客户端协议。二次定向 kill 实际 serve 进程(nohup 包装 PID 失效,M4.1 节口径注记 3 同情形)后 GPU 1 回落 4 MiB、`nvidia-smi --query-compute-apps` 为空。
+5. 后果:HTTP vs in-process 的 TTFT/tok/s 方法学差当日**无实测数字**;M4.1 遗留的 C=8 TTFT 0.1454 s vs vLLM 0.0809 s 重新归因无从量化,维持 M4.1 节记录原状。修复需动 server(补 token-id 输入契约)或 bench_remote(换文本协议)——均在本任务文件范围(2 脚本 + docs)之外,留裁决。
