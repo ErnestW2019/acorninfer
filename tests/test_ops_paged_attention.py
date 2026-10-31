@@ -111,3 +111,26 @@ def test_build_tables_shapes():
     t, lens = build_tables(views, 16, "cuda")
     assert t.shape == (2, 3) and t.dtype == torch.int32
     assert t[0].tolist() == [3, 4, 5] and lens.tolist() == [40, 1]
+
+
+# 纯 CPU 用例(无 gpu 标记):M4.1 Task 2 的 out= 契约门。
+def test_build_tables_out_fills_cpu_buffer_without_device_transfer():
+    """out= 契约:直接填调用方的 CPU 缓冲(out[:B],先清零),零 H2D;返回的
+    tables 是 out 前 B 行视图,lens 为 CPU 张量。默认路径行为不变。"""
+    class _V:  # lens_override 路径只读 table 属性(stub 无需 seq_len)
+        def __init__(self, table):
+            self.table = table
+    views = [_V([3, 7, 9]), _V([1])]
+    out = torch.full((4, 8), 99, dtype=torch.int32)   # 故意比需要大
+    t, lens = build_tables(views, 4, "cpu", lens_override=[11, 2], out=out)
+    assert t.data_ptr() == out.data_ptr()             # 零拷贝视图(前 B 行)
+    assert t.shape[0] == 2 and t.dtype == torch.int32
+    assert out[0, :3].tolist() == [3, 7, 9] and out[0, 3:].tolist() == [0] * 5
+    assert out[1, :1].tolist() == [1] and out[1, 1:].tolist() == [0] * 7
+    assert out[2:].tolist() == [[99] * 8, [99] * 8]   # 未触及行保持原值(调用方自管 padding)
+    assert lens.tolist() == [11, 2] and lens.device.type == "cpu"
+    t2, lens2 = build_tables(views, 4, "cpu", lens_override=[11, 2])  # 默认路径不变
+    # (草稿笔误修正:t2 是 (2,3)、out[:2] 是 (2,8),tolist 整体永不相等;
+    # 意图是"默认路径与 out 路径逐位同值",故按重叠区比较。)
+    assert t2.tolist() == out[:2, :t2.shape[1]].tolist()
+    assert lens2.tolist() == lens.tolist()

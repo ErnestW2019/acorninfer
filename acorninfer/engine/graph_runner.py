@@ -36,15 +36,26 @@ WARMUP_STEPS = 3
 @dataclass
 class _BucketState:
     bucket: int
-    ids: torch.Tensor        # [B, 1] long
-    positions: torch.Tensor  # [B] long
-    tables: torch.Tensor     # [B, W] int32;W = allocator.total(单序列页数上界)
-    lens: torch.Tensor       # [B] int32
-    pages: torch.Tensor      # [B] long
-    slots: torch.Tensor      # [B] long
+    # 扁平 GPU 静态块(M4.1):按 dtype 两块,保引用防 GC;下面六个静态字段
+    # 全是它们的切片视图(共享存储 = graph 捕获地址,warmup/capture/replay
+    # 三处地址一致)。布局:long = ids|positions|pages|slots 各 bucket 段;
+    # int32 = lens 一段 + tables [bucket, W] 一段。
+    flat_long: torch.Tensor            # [4*bucket] long
+    flat_i32: torch.Tensor             # [bucket*(1+W)] int32
+    ids: torch.Tensor        # [B, 1] long = flat_long[0:bucket] 视图
+    positions: torch.Tensor  # [B] long     = flat_long[bucket:2b] 视图
+    tables: torch.Tensor     # [B, W] int32 = flat_i32[bucket:] 视图;W = allocator.total
+    lens: torch.Tensor       # [B] int32    = flat_i32[0:bucket] 视图
+    pages: torch.Tensor      # [B] long     = flat_long[2b:3b] 视图
+    slots: torch.Tensor      # [B] long     = flat_long[3b:4b] 视图
     views: list              # [B] dummy PagedCacheView(捕获期 views 实参)
     graph: torch.cuda.CUDAGraph
     logits: torch.Tensor | None  # [B, vocab] float32;捕获后由图冻结
+    # pinned CPU 镜像(M4.1):与 flat 同构布局,每步 CPU 侧填满(含 tables
+    # 构建与 padding 重写),然后每 dtype 一次 H2D —— 6-7 次小传输 → 2 次
+    pin_long: torch.Tensor | None = None      # [4*bucket] long 镜像
+    pin_i32: torch.Tensor | None = None       # [bucket*(1+W)] int32 镜像
+    pin_tables: torch.Tensor | None = None    # [B, W] = pin_i32[bucket:] 视图
 
 
 class DecodeGraphRunner:
@@ -67,19 +78,48 @@ class DecodeGraphRunner:
 
     def _build_state(self, bucket: int) -> _BucketState:
         dev = self.device
+        W = self.allocator.total
+        # 扁平 GPU 块:静态字段 = 切片视图(共享存储 = graph 捕获地址)。
+        # GPU 侧初值逐字段对齐重构前(pages=scratch / lens=1 / 其余 0):draft
+        # 只种 pinned 镜像、GPU 侧留全零,warmup/capture 的 scatter 落点会打到
+        # 池内真 0 页而非 scratch,违背模块 docstring 的 scratch 契约 —— 故
+        # GPU/镜像两侧同种(捕获期 KV 写落点与旧实现逐字节一致)。
+        flat_long = torch.zeros(4 * bucket, dtype=torch.long, device=dev)
+        flat_i32 = torch.zeros(bucket * (1 + W), dtype=torch.int32, device=dev)
+        flat_long[2 * bucket:3 * bucket].fill_(self.scratch)  # pages 初值 = scratch
+        flat_i32[0:bucket].fill_(1)                           # lens 初值 = 1
         st = _BucketState(
             bucket=bucket,
-            ids=torch.zeros(bucket, 1, dtype=torch.long, device=dev),
-            positions=torch.zeros(bucket, dtype=torch.long, device=dev),
-            tables=torch.zeros(bucket, self.allocator.total, dtype=torch.int32, device=dev),
-            lens=torch.ones(bucket, dtype=torch.int32, device=dev),
-            pages=torch.full((bucket,), self.scratch, dtype=torch.long, device=dev),
-            slots=torch.zeros(bucket, dtype=torch.long, device=dev),
+            flat_long=flat_long,
+            flat_i32=flat_i32,
+            ids=flat_long[0:bucket].view(bucket, 1),
+            positions=flat_long[bucket:2 * bucket],
+            pages=flat_long[2 * bucket:3 * bucket],
+            slots=flat_long[3 * bucket:4 * bucket],
+            lens=flat_i32[0:bucket],
+            tables=flat_i32[bucket:].view(bucket, W),
             views=[PagedCacheView(self.cache, [self.scratch]) for _ in range(bucket)],
             graph=torch.cuda.CUDAGraph(),
             logits=None,
         )
+        # pinned CPU 镜像(同构布局);平台不支持 pinned 时回退普通内存。
+        #(draft 用 torch.empty:ids/positions/slots/lens 的 padding 区成为
+        # 未初始化内存,首发 H2D 即上传垃圾 —— embed 越界查表 / scatter slot
+        # 越界写页风险,且违背逐字节契约。必须零初始化。)
+        st.pin_long = self._pinned(4 * bucket, torch.long)
+        st.pin_i32 = self._pinned(bucket * (1 + W), torch.int32)
+        st.pin_long[2 * bucket:3 * bucket].fill_(self.scratch)  # padding pages 常量场
+        st.pin_i32[0:bucket].fill_(1)                           # padding lens 恒 1
+        st.pin_tables = st.pin_i32[bucket:].view(bucket, W)
+        st.pin_tables[:, 0].fill_(self.scratch)                 # padding 行 tables 第 0 列
         return st
+
+    @staticmethod
+    def _pinned(numel: int, dtype) -> torch.Tensor:
+        try:
+            return torch.zeros(numel, dtype=dtype, pin_memory=True)
+        except RuntimeError:   # 平台/驱动不支持 pinned:回退(收益略降,正确性不变)
+            return torch.zeros(numel, dtype=dtype)
 
     def _capture(self, st: _BucketState) -> None:
         s = torch.cuda.Stream()
@@ -102,25 +142,33 @@ class DecodeGraphRunner:
         assert 1 <= B <= BUCKETS[-1]
         assert len(seqs) == B, "seqs/views 必须一一对应"
         st = self.states[min(b for b in BUCKETS if b >= B)]
+        bk = st.bucket
         targets = [v.ensure_append_capacity(0) for v in views]
         pre = [int(v.seq_len) for v in views]
         new_len = [p + 1 for p in pre]
-        st.pages[:B].copy_(torch.tensor([p for p, _ in targets], dtype=torch.long))
-        st.slots[:B].copy_(torch.tensor([s for _, s in targets], dtype=torch.long))
-        st.positions[:B].copy_(torch.tensor(pre, dtype=torch.long))
-        st.lens[:B].copy_(torch.tensor(new_len, dtype=torch.int32))
-        t, _ = build_tables(views, self.page_size, self.device, lens_override=new_len)
-        st.tables.zero_()
-        st.tables[:B, : t.shape[1]].copy_(t)
-        # padding 行三场每步重置(pages/slots/tables 首列):缩批后旧 padding 行
-        # 残留退休序列的真 (page,slot) —— 引擎 free 该页、allocator LIFO 把它
-        # 发给下一个 prefill 后,不重置的 replay scatter 会写花活序列 KV(静默
-        # 腐败;tables 首列 zero_ 后须重写,kernel 按 padding lens=1 只读首列);
-        # lens[B:] 恒为 init 的 1(每步写入只切 [:B]),无需重置。
-        st.pages[B:].fill_(self.scratch)
-        st.slots[B:].zero_()
-        st.tables[B:, 0] = self.scratch
-        st.ids[:B].copy_(torch.tensor([[s.generated_ids[-1]] for s in seqs], dtype=torch.long))
+        # CPU 镜像填充(pinned):真行 [:B];每 dtype 一块扁平镜像,末尾单发
+        st.pin_long[0:B] = torch.tensor([s.generated_ids[-1] for s in seqs],
+                                        dtype=torch.long)
+        st.pin_long[bk:bk + B] = torch.tensor(pre, dtype=torch.long)
+        st.pin_long[2 * bk:2 * bk + B] = torch.tensor([p for p, _ in targets],
+                                                      dtype=torch.long)
+        st.pin_long[3 * bk:3 * bk + B] = torch.tensor([s for _, s in targets],
+                                                      dtype=torch.long)
+        st.pin_i32[0:B] = torch.tensor(new_len, dtype=torch.int32)
+        st.pin_tables.zero_()                                # 全清(B 真行 + padding)
+        build_tables(views, self.page_size, self.device,
+                     lens_override=new_len, out=st.pin_tables)   # 直填 CPU 镜像
+        # padding 行每步压回常量场(draft 声称"init 常量、[:B] 之外不动"不成立:
+        # 缩批后 [B:] 残留上一步真 (page,slot),不压回则 replay scatter 写花
+        # 已退休复用的页 —— 对拍门 step 3/4 专钉此回归;旧代码逐字段 fill_/
+        # zero_ 的镜像侧同职责。lens[B:] 恒 init 1(写真行只切 [:B]),ids/
+        # positions[B:] 陈旧无害(旧代码同样不重置,字节写历史一致)。
+        st.pin_long[2 * bk + B:3 * bk].fill_(self.scratch)
+        st.pin_long[3 * bk + B:4 * bk].zero_()
+        st.pin_tables[B:, 0] = self.scratch
+        # 单发 H2D(每 dtype 一次;切片视图地址 = 捕获地址,replay 原位可见)
+        st.flat_long.copy_(st.pin_long)
+        st.flat_i32.copy_(st.pin_i32)
         self._commit_lens(views, new_len)
         st.graph.replay()
         # 图输出缓冲原址覆写:仅本步有效;parity 测试的对拍观察点
