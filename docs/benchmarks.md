@@ -229,9 +229,11 @@ C=8 档两配置 out/token-stats 均 `min=2 max=32 / 32`(总 226/256 token,一�
 | kernel 事件次数/step | 1430.0 | 1418.0 | 未归档 | 1418.0 |
 | memcpy 次数/step | 13.00 | 7.00 | 未归档 | 3.00 |
 
-脚本原始输出行(逐字):graph `steps=20 wall/step=21.50ms gpu_kernel+memcpy/step=19.81ms gap/step=1.70ms`;`launches/step=1418.0 memcpy/step=3.00`。eager `steps=20 wall/step=26.61ms gpu_kernel+memcpy/step=19.97ms gap/step=6.64ms`;`launches/step=1418.0 memcpy/step=7.00`。两轮 sanity 行均逐字 `sanity: alive=7/8 generated_per_seq=25 (batch 恒定贯穿计时窗口)`(batch=7 非 8,同 M4 口径注记 2);GPU 忙时合计(20 步,Self CUDA time total)graph 396.130 ms / eager 399.331 ms。launches/memcpy 按 GPU 侧事件计,graph 模式下不反映 CPU 发射数(M4 已知属性)。
+注:表内 kernel/memcpy 两行标签较 M4 表改「事件」,以反映 GPU 侧计数口径(M4 表原标签「kernel 启动次数」「H2D/D2H memcpy 次数」)。
 
-段一改动在当日账目上的实测映照(计数对照,均为 GPU 侧事件):
+脚本原始输出行(逐字):graph `steps=20 wall/step=21.50ms gpu_kernel+memcpy/step=19.81ms gap/step=1.70ms`;`launches/step=1418.0 memcpy/step=3.00`。eager `steps=20 wall/step=26.61ms gpu_kernel+memcpy/step=19.97ms gap/step=6.64ms`;`launches/step=1418.0 memcpy/step=7.00`。两轮 sanity 行均逐字 `sanity: alive=7/8 generated_per_seq=25 (batch 恒定贯穿计时窗口)`(batch=7 非 8,同 M4 口径注记 2);GPU 忙时合计(20 步,Self CUDA time total)graph 396.130 ms / eager 399.331 ms。launches/memcpy 按 GPU 侧事件计,graph 模式下不反映 CPU 发射数——图内 kernel 仍逐条入账,计数与 eager 同源。
+
+段一改动在当日账目上的实测映照(计数对照):
 
 - eager memcpy/step 13.00 → 7.00(−6.00):与 argmax 合批的 D2H 数目变化吻合(B=7 逐序列 D2H → 1 次);
 - eager kernel 事件/step 1430.0 → 1418.0(−12.0):与 argmax 逐序列 → 单次合批的 kernel 次数精简方向一致;
@@ -240,13 +242,59 @@ C=8 档两配置 out/token-stats 均 `min=2 max=32 / 32`(总 226/256 token,一�
 
 ### 残差判定(graph gap)
 
-**gap 实测 1.70 ms/步,段一目标 ≤1 ms 未达**(对照 T6 账 1.80 ms:−0.10 ms;占当日 graph 墙钟的 7.9%(1.70/21.50);当日 graph 相对 eager 回收发射间隙的 74.4%((6.64−1.70)/6.64))。残差构成,实测锚点与推断分别标注:
+**gap 实测 1.70 ms/步,段一目标 ≤1 ms(M4.1 计划预设门)未达**(对照 T6 账 1.80 ms:−0.10 ms;占当日 graph 墙钟的 7.9%(1.70/21.50);当日 graph 相对 eager 回收发射间隙的 74.4%((6.64−1.70)/6.64))。残差构成,实测锚点与推断分别标注:
 
 1. 实测:每步 GPU 侧 memcpy 恰 3 次(2 H2D + 1 D2H);argmax 合批后的 1 次 D2H(`logits.argmax().tolist()`)是 decode_batch 路径内唯一的设备同步点——同步返回后 GPU 队列为空,至下一次 `graph.replay()` 之间的全部图外 CPU 工作直接暴露为 gap;
 2. 实测:同日 eager gap 6.64 ms → graph 1.70 ms,差值 4.94 ms 为逐 kernel CPU 发射路径被 graph 消除的部分(eager 当日账内 cuLaunchKernelEx Self CPU 13.561 ms/20 步 = 0.678 ms/步、216 次/步,为该路径的实测组成之一);
-3. 图外 CPU 每步工作清单(`graph_runner.decode_batch` 代码路径可数,未单独计时):`ensure_append_capacity` 逐 view 循环;CPU 镜像填充(4+1 次 `torch.tensor` 构造 + pinned 切片赋值,`pin_tables.zero_()` + `build_tables` CPU 直填,padding 压回 3 次);`_commit_lens` 逐 view × 逐层 python 循环(B=7 × 36 层 = 252 次赋值/步);调度 python。何者主导为推断。
+3. **推断(未单独计时)**:图外 CPU 每步工作清单(`graph_runner.decode_batch` 代码路径可数):`ensure_append_capacity` 逐 view 循环;CPU 镜像填充(4+1 次 `torch.tensor` 构造 + pinned 切片赋值,`pin_tables.zero_()` + `build_tables` CPU 直填,padding 复制压回至 3 次);`_commit_lens` 逐 view × 逐层 python 循环(B=7 × 36 层 = 252 次赋值/步);调度 python。何者主导为推断。
 
 口径注记(均为实测事实):
 
 1. eager wall/step 含 profiler 逐 kernel 采样开销(M4 口径注记 3 沿用);eager gap 7.38 → 6.64 ms(−0.74 ms)与 argmax 同步减少方向一致,但采样事件数同变(1430.0 → 1418.0),不作精确归因。
 2. graph 模式 wall/step 21.50 ms 与 T6 账 21.64 ms 基本持平,段一两改动(同步 7→1、镜像单发 H2D)在 gap 上的当日净变化为 1.80 → 1.70 ms;bench 侧当日 graph 三档净增益仍为正(见上表)。
+
+段二(批量 prefill)与最终当日配对账见下方「M4.1 段二(批量 prefill)+ 最终当日配对」节。
+
+## M4.1 段二(批量 prefill)+ 最终当日配对(2026-10-31,`scripts/bench_remote.py` + `python -m acorninfer.bench`,真机输出)
+
+段二改动(HEAD = 3f98e1b):模型层 `forward_prefill_batch`——右 padding 合批、逐行 attention(M4.1 Task 4)+ `Executor.prefill_batch`——[B, Lmax] 一次前向、逐行 `_sample`(采样语义与单序列不变)+ Engine `step()` N>1 分流:同批多序列一次批量 prefill;N=1 仍走原 `prefill` 路径,byte-identical(零回归面)。本节为段二落地后的最终当日配对验收:vLLM 起服、三腿压测、关服在同一工作时段内完成(健康探活 200 于 15:14:00,vLLM 腿压测 15:14:03–15:14:06,graph 腿 15:14:15–15:15:05,eager 腿 15:15:19–15:16:09,末轮完成随即关服),消机时漂移。聚合吞吐(tok/s):
+
+| 并发 | vLLM(当日配对) | 本引擎 graph | 本引擎 eager | graph vs eager | 达标率(graph ÷ 当日 vLLM) | M4 验收达标率 | 较 M4 验收 |
+|---|---|---|---|---|---|---|---|
+| 1 | 58.01 | 54.17 | 50.84 | +6.6% | **93.4%,未过 100%** | 92.9% | +0.5 pp |
+| 4 | 207.43 | 187.13 | 176.38 | +6.1% | **90.2%,未过 100%** | 83.0% | +7.2 pp |
+| 8 | 355.39 | 296.76 | 283.16 | +4.8% | **83.5%,未过 100%** | 72.2% | +11.3 pp |
+
+达标率算术(graph ÷ 当日 vLLM):C=1 54.17/58.01 = 93.4%;C=4 187.13/207.43 = 90.2%;C=8 296.76/355.39 = 83.5%。较 M4 验收(2026-10-31 配对,92.9%/83.0%/72.2%):+0.5 / +7.2 / +11.3 pp,逐档距 100% 线尚余 6.6% / 9.8% / 16.5%。
+
+TTFT p50 / TPOT mean(格式 `TTFT / TPOT`):
+
+| 并发 | vLLM(当日配对) | graph | eager |
+|---|---|---|---|
+| 1 | 0.0273 s / 16.92 ms | 0.0352 s / 17.92 ms | 0.0347 s / 19.18 ms |
+| 4 | 0.0684 s / 17.87 ms | 0.0776 s / 19.56 ms | 0.0766 s / 20.94 ms |
+| 8 | 0.0809 s / 17.83 ms | 0.1454 s / 19.95 ms | 0.1440 s / 21.12 ms |
+
+**C=8 TTFT 对照(批量 prefill 是否兑现,如实)**:graph TTFT p50 0.1454 s vs 当日 vLLM 0.0809 s——M4 当日为 0.1467 vs 0.0817 s,今值 −1.3 ms(0.1454−0.1467),基本持平,仍为 vLLM 的 1.80×(0.1454/0.0809;M4 当日同为 1.80×)。**判读:批量 prefill 在 TTFT p50 维度未兑现**(实测依据:graph C=8 TTFT p50 段一/M4 验收/当日三账 0.1469/0.1467/0.1454 s 基本一线)。兑现处不在 TTFT 而在 TPOT(当日实测):graph C=8 TPOT 19.95 ms vs M4 验收日 23.95(−4.00 ms)、段一日 23.68(−3.73 ms);eager C=8 21.12 vs 24.89/24.88(−3.77/−3.76 ms);C=4 graph 21.25 → 19.56 ms。机制判读(推断,实测锚点标注):旧路径一步内逐序列串行 prefill(段二前 engine 代码路径可数),早 prefill 序列的首 token 提前落账、其第 2 token 却要等串行 prefill 全部结束,TPOT 被该等待垫高;今 TTFT mean = p50 = 0.1454 s 恰相等,即 8 条首 token 同刻落账的实测指纹(单次 [8×128] 批量前向)——垫高消失,TPOT 回落,与段一节 profiler 账 GPU 侧 19.8 ms/步同量级;C=8 档当日吞吐 +15.1%(296.76/257.75)的主体即来自此项。
+
+RESULT 行逐字(stdout):
+
+- vLLM:`RESULT-VLLM C=1 ttft_p50=0.0273s ttft_mean=0.0273s tpot_mean=16.92ms tok_s=58.01` / `RESULT-VLLM C=4 ttft_p50=0.0684s ttft_mean=0.0578s tpot_mean=17.87ms tok_s=207.43` / `RESULT-VLLM C=8 ttft_p50=0.0809s ttft_mean=0.0742s tpot_mean=17.83ms tok_s=355.39`
+- graph:`RESULT C=1 ttft_p50=0.0352s ttft_mean=0.0352s tpot_mean=17.92ms tok_s=54.17` / `RESULT C=4 ttft_p50=0.0776s ttft_mean=0.0776s tpot_mean=19.56ms tok_s=187.13` / `RESULT C=8 ttft_p50=0.1454s ttft_mean=0.1454s tpot_mean=19.95ms tok_s=296.76`
+- eager:`RESULT C=1 ttft_p50=0.0347s ttft_mean=0.0347s tpot_mean=19.18ms tok_s=50.84` / `RESULT C=4 ttft_p50=0.0766s ttft_mean=0.0766s tpot_mean=20.94ms tok_s=176.38` / `RESULT C=8 ttft_p50=0.1440s ttft_mean=0.1440s tpot_mean=21.12ms tok_s=283.16`
+
+口径注记(均为实测事实):
+
+1. **机时漂移核对**:当日 vLLM 对 M4 验收当日漂移 −0.1%/−0.3%/+0.1%(58.01/58.06、207.43/208.15、355.39/354.92),在 M3 节记录的 ±2-3% 机时漂移带内,配对口径成立;本引擎 graph 当日对段一日 +0.1%/+7.8%/+15.1%(54.17/54.12、187.13/173.60、296.76/257.75)——C=1 在漂移带内,C=4/C=8 为段二改动的当日净变化,且 eager 同幅受益(+8.5%/+15.2%:176.38/162.54、283.16/245.89),收益来自 prefill/调度路径而非 graph 本身(判读)。
+2. **C=8 档提前 EOS 复现**:graph/eager 两列 out/token-stats 均 `min=2 max=32 / 32`(总 226/256 token,一条请求第 2 token 命中 EOS),与 M2/M3/M4/段一侧既有记录逐项一致;TPOT 按 n>1 的 8/8 序计算。
+3. **GPU 分工与清理**:起服前双卡 ~4 MiB / 0 进程;vLLM 独占物理 GPU 0、引擎压测独占物理 GPU 1;关服后 GPU 0 回落 4 MiB,`nvidia-smi --query-compute-apps` 为空(无残留计算进程)。收服过程注记:起服 `$!` 记到的是 nohup 包装进程,kill 后实际 serve 进程(PID 2507157,ps 反查)仍驻留至二次定向 kill——此后 GPU 0 即回落,无残留。
+
+**验收判定(逐档 ≥100% 当日 vLLM 与否,如实):三档均未过——C=1 线的 93.4%、C=4 线的 90.2%、C=8 线的 83.5%。** 段二(批量 prefill)当日兑现 C=4/C=8 两档(较 M4 验收 +7.2/+11.3 pp),C=1 持平(+0.5 pp);graph 相对 eager 的当日净增益 +6.6%/+6.1%/+4.8%,与段一日(+6.9%/+6.8%/+4.8%)同带;C=8 残余缺口主体仍在 GPU 侧 GEMM 利用率与 TTFT 维度(0.1454 vs 0.0809 s,上节 profiler 账 GEMM 占 GPU 忙时 88.55%)——此句为对实测数字的归因推断。北极星「逐档 ≥100%」维持挂账,`m4-acceptance` tag 本日不打。
+
+回归(当日,HEAD = 3f98e1b,任务仅改 docs 零代码变动):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -m slow -q` → `17 passed, 106 deselected in 501.66s`,含 test_golden_m0–m4 全部 golden,零换题;fast 套件(默认 `-m 'not slow'`)当日复跑 `106 passed`(首跑出现 1 例 `test_server.py::test_cancelled_request_cleans_up` 失败,单测隔离复跑通过、全套件复跑全绿,判定偶发,如实记)。
+
+命令(照 M4 节当日配对 A/B 验收配方)。服务(物理 GPU 0,与 M3/M4 基线记录逐字一致):`CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --dtype bfloat16 --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90`(nohup 后台,前台轮询 `/health` 至 200)。压测三连(物理 GPU 1,每条前台执行;seed 默认 20261027,与 M3/M4 同):
+
+- vLLM:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --concurrency 1 4 8`
+- graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 --attention-backend triton --fused-ops --cuda-graph`
+- eager:同上,去掉 `--cuda-graph`
