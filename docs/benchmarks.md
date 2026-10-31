@@ -529,3 +529,39 @@ RESULT 行逐字:
 辅助对照(同日实测,非 M4.1 配方):纯默认 bench(= HTTP server 同口径,sdpa、无 fused、无 graph)`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32` → C=1/4/8 = 36.62 / 91.07 / 117.71 tok_s,TTFT p50 0.0348/0.0762/0.1444 s。与 HTTP A′(35.13/88.85/113.11)差 +4.2%/+2.5%/+4.1%——HTTP 腿对 in-process 同口径的差价即客户端↔服务端+SSE 全程开销;亦解释 Task 0 节 HTTP(2.6×)对照的口径差:该表 in-process 列为 triton+fused 后端,HTTP server 为 sdpa 默认,后端不同(彼节归因本就留控制器,此处只并列本日同口径数)。
 
 口径注记(照 M4.1/Task 0 节同款):同日同机(物理 GPU 1,RTX 4090);HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);prompt 同一批随机 token ids(`_prompts` seed=20261027,token-id 数组直投、两端零分词差);temperature=0、max_tokens=32,计时前 1 条 warmup 不计入;四跑服务配置仅 `--chunked-budget` 一处不同,其余逐字一致;每跑之间服务收服验证(端口空 + GPU 4 MiB)。
+
+### 段 2:TP=2 8B 冒烟(强制流协议,2026-11-01,`scripts/smoke_tp2_8b.py`,真机输出)
+
+8B(Qwen3-8B,bf16)TP=2 对拍冒烟。**协议修正(相对计划原文,以 M4/T3 先例为准):不做贪婪链逐位断言**——bf16 精确平局翻 argmax 是结构性现象,本日 8B 实测再度证实:强制流全池 top-2 gap **min = 0、p01 = 0**(264 位中精确平局真实存在),median 0.4375。改用:①强制输入流(预生成 token 喂入,平局不级联);②逐步 logits TOL;③强 gap 步 argmax 逐步断言;④自由贪婪只做分歧记账(不设零门;**强 gap 步分裂 = 疑 bug 信号 → BLOCKED**)。
+
+标定(TOL 协议,先 `--calibrate` 取实测再写死进脚本;命令:`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python scripts/smoke_tp2_8b.py --model-dir /home/ernest/model-weight/Qwen3-8B --calibrate`,归档 /tmp/opencode/m5t5/):
+
+- 33 次前向(prefill [8,128] + 32 forced decode)x 8 行全词表 logits(fp32)vs TP=1 参照:**max|diff| = 0.21875**(两次独立跑同值,确定性)。量级判读:≈1-2 bf16 ulp @|logit|≈32——TP 切分归约序差经 36 层逐层放大,远大于 tiny 单层的 ~1.5 ulp(T3),但仍是 ulp 级噪声非 bug。
+- **TOL = 0.5**(≈2.3x 实测;真错权重会差 O(10));**margin = 1.75 = 8 x 实测噪声**(T3/T4 口径)。物理翻转向阈值 ≈ 2 x max|diff| ≈ 0.44,margin 再留 4x。
+
+正式跑(`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python scripts/smoke_tp2_8b.py --model-dir /home/ernest/model-weight/Qwen3-8B`,EXIT=0,SMOKE status OK;跑前双卡 4 MiB / 收尾双卡 4 MiB):
+
+| 阶段 | 断言面 | 结果 |
+|---|---|---|
+| B(模型级强制流) | 逐步 max\|diff\| ≤ 0.5 | 0.21875 ✓(逐行 0.094-0.219 带) |
+| B | 强 gap 位(gap≥1.75)argmax 逐步 | 17/17 全对,0 分叉 ✓ |
+| B | 页表 vs TP=1 参照逐位 + 长度 = 160 | 逐位同 ✓ |
+| B/D | rank 间位级(logits sha256 / 链 sha256 / 页表 / C 流) | 全同 ✓(SPMD) |
+| D(自由贪婪记账) | 平局步(gap<1.75)/ 分裂行 / 强 gap 分裂 | 76/256 步平局带;4 行首分叉(gap 0.25/0/0.125/0 全在噪声解释带内);**强 gap 分裂 0** ✓ |
+| C(chunked×TP 引擎级) | 中间块零发射、首 token 出自 extend 完成行 | 64 发射,首发射 kind=extend(4/4)✓ |
+| C | 逐 seq 首 token gap 门控(ref gap≥1.75 必须 token 同) | 强分叉 0;平局翻转向 2(均 gap=0.0)✓ |
+| C | 页表逐步逐位(rank0 vs 参照;rank0 vs rank1) | 逐步逐位同 ✓ |
+
+分叉记账明细(D 腿,4 行如实,不设零门):row4 首分叉@17 gap=0.25 不回归;row5@29 gap=0 不回归;row6@13 gap=0.125 **回归**;row7@6 gap=0 不回归。C 腿平局翻转向 2 处(sid=1@5、sid=2@2,均 gap=0.0)。全部落在平局解释带(≤0.44),无一强 gap 分叉。
+
+分装备忘:全量加载(阶段 A,from_pretrained)35.7 s;分片加载(load_safetensors_sharded,热页缓存)rank0 1.6 s / rank1 2.1 s。
+
+粗计时(**非官方数字,官方以 T6 graph/HTTP 为准**;eager sdpa,B=8,RTX 4090 x2 PCIe NODE 无 NVLink):
+
+| 腿 | decode 步均(ms) | prefill [8,128] 一步(ms) |
+|---|---|---|
+| TP=1 eager | 64.9 | 321.0 |
+| TP=2 eager | 65.8 | 3148.1 |
+| 比值 | 0.99x | — |
+
+判读(与段 0 尖刀数字自洽,标推断):decode 无收益——每步 74 次集合(allreduce x72 + all-gather + embed)在 PCIe NODE 上(~18-19 µs/次 ≈ 1.3-1.4 ms)叠加段 0 实测的 decode 半宽 GEMM 塌方(37% 效率),吃满 2x 权重读取的节省。TP=2 prefill 3148 ms 为**冷启动伪象**(该腿是 TP 进程首个前向:NCCL communicator 建立 + 两 rank cublas 首初始化都记在这一步;decode 均值亦含首步 warmup),不作为稳态结论。
