@@ -69,8 +69,14 @@ def test_shard_rows_cols():
 
 @pytest.mark.gpu
 def test_column_parallel_matches_full_slice():
-    """列并行分片前向 == 全宽 GEMM 对应输出列切片(TOL;bf16 合批 GEMM
-    形状差与 M4.1 对拍同源)。"""
+    """列并行分片前向 == 全宽 GEMM 对应输出切片(TOL;bf16 合批 GEMM
+    形状差与 M4.1 对拍同源)。
+
+    标定:2026-11-01,`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest
+    tests/test_parallel.py -k column_parallel`(seed 0,另核 seed 1/2/7 同值):
+    实测 max|diff| = 0.0——列切 K 维不变、同序 GEMM,逐位同(与
+    test_tp_eager 容差注释"列切 GEMM 同序无差"互证);写死 atol 门只为
+    守未来实现漂移。"""
     device = "cuda"
     torch.manual_seed(0)
     x = torch.randn(5, 8, device=device, dtype=torch.bfloat16)

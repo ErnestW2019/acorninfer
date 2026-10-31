@@ -28,6 +28,8 @@ class Scheduler:
         watermark_blocks: int = 0,
         chunked_budget: int | None = None,
     ):
+        if chunked_budget is not None and chunked_budget < 1:
+            raise ValueError(f"chunked_budget must be >= 1, got {chunked_budget}")
         self.allocator = allocator
         self.page_size = page_size
         self.max_running = max_running
@@ -57,7 +59,8 @@ class Scheduler:
 
         返回 (chunks, 本步追加页数, 剩余预算)。追加页 = ceil((cursor+len)/page)
         - num_pages,属"步内即时占块"(与页满 decode 同理,准入不得动用)。
-        预算耗尽时该序列本步停滞(不 chunk 也不 decode),下一轮仍 FCFS 优先。
+        预算耗尽时该序列本步停滞:不 chunk(不进 chunks 名单),下一轮仍
+        FCFS 优先(decodes 过滤只剔除本轮 chunked 名单)。
         """
         chunks: list[tuple[Sequence, int, int]] = []
         append_pages = 0

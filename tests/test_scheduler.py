@@ -26,6 +26,17 @@ def mkseq(sid, prompt_len, gen=0):
     return s
 
 
+def test_chunked_budget_must_be_positive():
+    """chunked_budget ≤ 0 构造期 ValueError(0/-1 会让每步零预算空转)。"""
+    for bad in (0, -1):
+        try:
+            Scheduler(BlockAllocator(8), PAGE, chunked_budget=bad)
+        except ValueError as e:
+            assert "chunked_budget" in str(e)
+        else:
+            raise AssertionError(f"chunked_budget={bad} 应构造期拒绝")
+
+
 def test_fcfs_admission_order():
     alloc = BlockAllocator(8)
     sch = Scheduler(alloc, PAGE)
@@ -293,8 +304,9 @@ def test_chunks_preempt_resets_cursor():
     assert chunks == [] and [s.seq_id for s in decodes] == [1]
 
 
-def test_chunks_stalled_midprefill_not_in_decodes():
-    """预算耗尽停滞的 mid-prefill 序列:不 chunk 也不 decode(下一轮 FCFS 优先)。"""
+def test_chunks_midprefill_chunked_not_in_decodes():
+    """chunked 的 mid-prefill 序列不入本步 decodes(decodes 只收 decode 级);
+    预算同时挡住新准入,s1 留 waiting(FCFS 队头阻塞)。"""
     alloc = BlockAllocator(64)
     sch = Scheduler(alloc, PAGE, chunked_budget=4)
     s0, s1 = mkseq(0, 9), mkseq(1, 9)

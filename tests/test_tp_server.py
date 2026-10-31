@@ -302,6 +302,7 @@ def _make_serve_ckpt(ckpt_dir) -> None:
     e2e 用 token-ids prompt 不触发 encode;decode 对任意 id 合法)。"""
     import json as _json
     import shutil
+    from pathlib import Path as _Path
 
     import torch as _torch
     from safetensors.torch import save_file
@@ -329,8 +330,10 @@ def _make_serve_ckpt(ckpt_dir) -> None:
     full = _Full(cfg)
     sd = {k: v.contiguous() for k, v in full.state_dict().items()}
     save_file(sd, str(ckpt_dir / "model.safetensors"))
-    shutil.copy("/home/ernest/model-weight/Qwen3-8B/tokenizer.json",
-                ckpt_dir / "tokenizer.json")
+    tok_src = _Path("/home/ernest/model-weight/Qwen3-8B/tokenizer.json")
+    if not tok_src.exists():
+        pytest.skip("本机无 Qwen3-8B tokenizer.json,e2e 词汇表来源缺失")
+    shutil.copy(tok_src, ckpt_dir / "tokenizer.json")
 
 
 @pytest.mark.gpu

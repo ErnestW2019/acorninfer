@@ -74,6 +74,11 @@ class Engine:
 
     @classmethod
     def from_config(cls, cfg: EngineConfig, tokenizer: Tokenizer) -> "Engine":
+        """EngineConfig → Engine(from_pretrained 全量模型,单卡路径)。
+
+        与 server._build_engine 为双构造路径:那边内联本逻辑并多出
+        chunked_budget / --tp 分支 —— 改一处必查另一处。
+        """
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
         # attention_backend/decode_graph 由 from_config 透传到 model,decode 路径
         # 已生效(Task 7);decode_graph 必须在 Engine 构造前置位(graph runner

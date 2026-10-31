@@ -40,6 +40,8 @@ def shard_qkv(
 
     q 行段 [0, n_q·hd) 取 rank 段 (n_q/world) 头;k 行段 [n_q·hd, (n_q+n_kv)·hd)
     与 v 行段各取 rank 段 (n_kv/world) 头;concat 保持 q/k/v 序。
+    注:spec §4.1 融合布局的参考实现;生产路径走分立投影 + shard_rows/cols,
+    本函数由单测守门。
     """
     cq = (n_q // world) * head_dim
     ck = (n_kv // world) * head_dim
@@ -54,7 +56,10 @@ def shard_qkv(
 
 def shard_gate_up(w: torch.Tensor, rank: int, world: int) -> torch.Tensor:
     """融合 gate_up [2·inter, hidden] 列切:gate 行段取半 + up 行段取半,
-    concat 保持 gate/up 序(spec §4.1)。"""
+    concat 保持 gate/up 序(spec §4.1)。
+    注:spec §4.1 融合布局的参考实现;生产路径走分立投影 + shard_rows/cols,
+    本函数由单测守门。
+    """
     inter = w.shape[0] // 2
     h = inter // world
     return torch.cat([

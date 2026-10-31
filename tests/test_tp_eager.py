@@ -197,8 +197,9 @@ def test_tp2_eager_decode_matches_full(ckpt_and_ref, tmp_path):
 # TP=2 与 TP=1 的数值差来源(结构性,不可消除):o/down 行并行两路 K/2 部分
 # GEMM + bf16 allreduce,对比单次 K 全长 GEMM 的归约序差;列切 GEMM(qkv/
 # gate/up/lm_head)K 维不变,同序无差。噪声经残差流复合。
-# 标定:2026-10-31,强制流协议(seed0 tiny,172 步×B×256 logits):
-# `CUDA_VISIBLE_DEVICES=0,1 ../.venv/bin/python /tmp/opencode/tp_measure/run_measure.py`
+# 标定:2026-10-31,强制流协议(seed0 tiny,本文件 _decode_protocol 全协议步
+# × 每步全 [B,256] logits,TP=2 双卡对单卡参照逐位取 max|diff|;测量脚本
+# 不入库,口径即本文件协议):
 # 实测 ALL max|diff| = 0.009766(≈1.25 bf16 ulp @|logit|≈2);argmax 分叉 0;
 # gap<0.08 的平局位 21 个。
 _TP_LOGITS_TOL = dict(rtol=1.6e-2, atol=1.2e-2)  # 实测 0.009766 之上留 ~20% 裕量;真 bug(错头分片)差 O(1) 必红

@@ -400,7 +400,7 @@ HTTP 腿(本引擎,eager,8200 端口)与 in-process eager 腿(M4.1 段二节当�
 
 口径注记(照 M4.1 节同款):同日同机(物理 GPU 1,RTX 4090);HTTP 腿 TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径,产品真实路径);prompt 为同一批随机 token ids(`_prompts` 同 seed=20261027,token-id 数组直投、两端零分词差);temperature=0、max_tokens=32,计时前 1 条 warmup 不计入。
 
-复测稳定性:审查复跑三档 tok_s 34.58 / 87.83 / 114.44,对主跑 35.33 / 86.92 / 109.83 差 −2.1% / +1.0% / +4.2%(**审查复跑 ±4.2% 带内**)。
+复测稳定性:审查复跑三档 tok_s 34.58 / 87.83 / 114.44,对主跑 35.33 / 86.92 / 109.83 差 −2.1% / +1.0% / +4.2%(**审查复跑差均在个位数百分比带内**)。
 
 ### 段 0 补充:半宽 GEMM 核选矩阵(2026-10-31,`scripts/phase0_spike.py --gemm-variants`,真机输出)
 
@@ -539,7 +539,7 @@ RESULT 行逐字:
 - 33 次前向(prefill [8,128] + 32 forced decode)x 8 行全词表 logits(fp32)vs TP=1 参照:**max|diff| = 0.21875**(两次独立跑同值,确定性)。量级判读:≈1-2 bf16 ulp @|logit|≈32——TP 切分归约序差经 36 层逐层放大,远大于 tiny 单层的 ~1.5 ulp(T3),但仍是 ulp 级噪声非 bug。
 - **TOL = 0.5**(≈2.3x 实测;真错权重会差 O(10));**margin = 1.75 = 8 x 实测噪声**(T3/T4 口径)。物理翻转向阈值 ≈ 2 x max|diff| ≈ 0.44,margin 再留 4x。
 
-正式跑(`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python scripts/smoke_tp2_8b.py --model-dir /home/ernest/model-weight/Qwen3-8B`,EXIT=0,SMOKE status OK;跑前双卡 4 MiB / 收尾双卡 4 MiB):
+正式跑(`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python scripts/smoke_tp2_8b.py --model-dir /home/ernest/model-weight/Qwen3-8B`,EXIT=0,SMOKE status OK;跑前双卡 4 MiB / 收尾双卡 4 MiB)。注:输出中夹杂 NCCL monitor 诊断行(`TORCH_NCCL_ENABLE_MONITORING` 周期性集合通信统计)——非致命诊断噪声,与任何判定项无关:
 
 | 阶段 | 断言面 | 结果 |
 |---|---|---|
