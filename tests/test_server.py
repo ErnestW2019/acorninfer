@@ -343,6 +343,51 @@ async def test_engine_poison_500_then_health_503_fast_fail(tiny_model, monkeypat
         assert r2.status_code == 500  # 快速失败,不再触碰中毒引擎
 
 
+def test_build_engine_backend_recipe_passthrough(monkeypatch):
+    """CLI --attention-backend/--fused-ops/--cuda-graph 透传(M5 Task 6):
+    fake-engine 风格照 chunked_budget 钉子;缺省(旧调用方 args 无字段)=
+    sdpa/无 fused/无 graph 逐字节;--cuda-graph 须 triton(EngineConfig 校验)。"""
+    import types
+
+    import pytest
+
+    import acorninfer.server as server_mod
+
+    created: dict = {}
+
+    def fake_from_pretrained(model_dir, device, dtype):
+        return types.SimpleNamespace()
+
+    def fake_engine(model, tok, **kwargs):
+        created["model"] = model
+        return "ENGINE"
+
+    monkeypatch.setattr(server_mod, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(server_mod, "Engine", fake_engine)
+    monkeypatch.setattr(server_mod, "Tokenizer", lambda path: "TOK")
+
+    base = dict(model_dir="/m", device="cuda:0", num_blocks=8, page_size=16,
+                max_running=4, watermark_blocks=2, host="h", port=1,
+                chunked_budget=None)
+    # 旧调用方(args 无配方字段):缺省逐字节
+    assert server_mod._build_engine(types.SimpleNamespace(**base)) == "ENGINE"
+    assert created["model"].attention_backend == "sdpa"
+    assert created["model"].fused_ops is False
+    assert created["model"].decode_graph is False
+    # 满配方透传
+    full = types.SimpleNamespace(**base, attention_backend="triton",
+                                 fused_ops=True, cuda_graph=True)
+    assert server_mod._build_engine(full) == "ENGINE"
+    assert created["model"].attention_backend == "triton"
+    assert created["model"].fused_ops is True
+    assert created["model"].decode_graph is True
+    # 非法组合:graph 须 triton(EngineConfig __post_init__,构造期爆)
+    bad = types.SimpleNamespace(**base, attention_backend="sdpa",
+                                cuda_graph=True)
+    with pytest.raises(ValueError, match="triton"):
+        server_mod._build_engine(bad)
+
+
 def test_build_engine_chunked_budget_passthrough(monkeypatch):
     """CLI --chunked-budget 透传 Engine 构造(M5 Task 2):缺省 None 与显式值
     两条路径;from_pretrained/Tokenizer 打桩,不加载真模型。

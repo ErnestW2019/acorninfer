@@ -566,7 +566,7 @@ RESULT 行逐字:
 
 判读(与段 0 尖刀数字自洽,标推断):decode 无收益——每步 74 次集合(allreduce x72 + all-gather + embed)在 PCIe NODE 上(~18-19 µs/次 ≈ 1.3-1.4 ms)叠加段 0 实测的 decode 半宽 GEMM 塌方(37% 效率),吃满 2x 权重读取的节省。TP=2 prefill 3148 ms 为**冷启动伪象**(该腿是 TP 进程首个前向:NCCL communicator 建立 + 两 rank cublas 首初始化都记在这一步;decode 均值亦含首步 warmup),不作为稳态结论。
 
-### 双轨配对终账(2026-11-01,`scripts/bench_remote.py` + `python -m acorninfer.bench`,真机输出;轨 2 AcornInfer 腿 BLOCKED 带现场)
+### 双轨配对终账(2026-11-01,`scripts/bench_remote.py` + `python -m acorninfer.bench`,真机输出;轨 2 经修复补测收官,原 BLOCKED 现场如实保留)
 
 M5 收官仪式:同日窗口、串行执行、每引擎切换间 `nvidia-smi` 验净(实录见口径注记)。**仪式前提核实现场(先于任何起服)**:`acorninfer/server.py` CLI 旗标全集为 `--model-dir/--host/--port/--device/--num-blocks/--page-size/--max-running/--watermark-blocks/--chunked-budget/--tp`——**无 `--attention-backend/--fused-ops/--cuda-graph`**;`_build_engine` 两条路径(tp==1 与 tp≥2)均以 `EngineConfig` 缺省值(sdpa、无 fused、无 graph)构造。server.py 属保护文件禁改 → **「AcornInfer HTTP 腿开满后端配方」server 不支持,按仪式规则记 BLOCKED(硬前提不成立,别绕)**;T2/段 0 补账已证缺省 sdpa 腿对 in-process 满配方捐 1.4-2.6×(下文有同日修正归因),故缺省配方 HTTP 腿数字只作补充口径,不进验收算术。轨 1 的 AcornInfer 侧以 in-process 满配方(bench CLI 有全套旗标,M4.1 口径延续)为验收腿。
 
@@ -574,7 +574,7 @@ M5 收官仪式:同日窗口、串行执行、每引擎切换间 `nvidia-smi` �
 
 - vLLM TP=1:`CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90 --dtype bfloat16`
 - vLLM TP=2:同上,`CUDA_VISIBLE_DEVICES=0,1` + `--tensor-parallel-size 2`(就绪 75 s,含 compile)
-- AcornInfer HTTP 缺省配方(补充口径):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8200`;TP=2 版 `CUDA_VISIBLE_DEVICES=0,1 ... --tp 2`(装载即崩,见轨 2 BLOCKED)
+- AcornInfer HTTP 缺省配方(补充口径):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8200`;TP=2 满配方(修复后补测):`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --tp 2 --attention-backend triton --fused-ops --cuda-graph`(原 `--tp 2` 缺省配方装载即崩,见轨 2 BLOCKED 段)
 - in-process:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32 --attention-backend triton --fused-ops --cuda-graph`(graph);同去 `--cuda-graph`(eager)
 - 压测:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:{8100|8200} --concurrency 1 4 8`
 
@@ -595,6 +595,9 @@ RESULT 行逐字(stdout;`RESULT-VLLM` 前缀为 `bench_remote` 固定标签,四�
 - vLLM TP=2:`RESULT-VLLM C=1 ttft_p50=0.0266s ttft_mean=0.0266s tpot_mean=9.52ms tok_s=99.44`
 - (续)`RESULT-VLLM C=4 ttft_p50=0.0750s ttft_mean=0.0612s tpot_mean=10.66ms tok_s=321.79`
 - (续)`RESULT-VLLM C=8 ttft_p50=0.0811s ttft_mean=0.0733s tpot_mean=10.98ms tok_s=541.94`
+- AcornInfer TP=2 满配方 HTTP(修复后补测,见轨 2 BLOCKED 段的修复注):`RESULT-VLLM C=1 ttft_p50=0.0359s ttft_mean=0.0359s tpot_mean=13.00ms tok_s=72.92`
+- (续)`RESULT-VLLM C=4 ttft_p50=0.1117s ttft_mean=0.1116s tpot_mean=13.97ms tok_s=233.09`
+- (续)`RESULT-VLLM C=8 ttft_p50=0.1789s ttft_mean=0.1613s tpot_mean=15.55ms tok_s=349.40`
 
 graph 稳定性注记(如实):graph 腿当日首跑因取尾管道截去 C=1 行,可见部分 C=4 186.58 / C=8 285.40,与第二跑(上表,全量)差 +0.1%/+3.8%,在段 2 记录的 C=8 历史带宽内;两跑均归档不作挑选。
 
@@ -609,28 +612,30 @@ graph 稳定性注记(如实):graph 腿当日首跑因取尾管道截去 C=1 行
 
 轨 1 达标率算术(逐档,AcornInfer ÷ vLLM):graph 腿 C=1 53.66/58.07 = **92.4%**、C=4 186.81/207.63 = **90.0%**、C=8 296.71/354.32 = **83.7%**(对 M4.1 收官 93.4%/90.2%/83.5%:−1.0/−0.2/+0.2 pp,机时漂移带内;距 100% 线余 7.6%/10.0%/16.3%)。eager 腿 87.2%/84.5%/79.6%。HTTP 缺省配方腿 61.7%/42.4%/32.6%(含已知配方差,非验收口径)。
 
-**轨 2 表(TP=2;AcornInfer 腿 BLOCKED 带现场):**
+**轨 2 表(TP=2;AcornInfer 腿为修复后补测,见下):**
 
 | 腿 | C=1 tok/s | C=4 tok/s | C=8 tok/s | TTFT p50 C=1/4/8 (s) | TPOT mean C=1/4/8 (ms) |
 |---|---|---|---|---|---|
 | vLLM TP=2 HTTP | 99.44 | 321.79 | 541.94 | 0.0266 / 0.0750 / 0.0811 | 9.52 / 10.66 / 10.98 |
-| AcornInfer TP=2 HTTP | **BLOCKED** | **BLOCKED** | **BLOCKED** | — | — |
+| AcornInfer TP=2 HTTP(满配方,修复后) | 72.92 | 233.09 | 349.40 | 0.0359 / 0.1117 / 0.1789 | 13.00 / 13.97 / 15.55 |
 
-轨 2 BLOCKED 现场(两重,均如实采证):
+轨 2 BLOCKED 现场(两重,均如实采证;**当段补测已修复,见注**):
 
 1. **满配方缺失**(仪式硬前提,轨 1 同源):server 无后端配方旗标,`_build_engine` tp≥2 路径同样硬编码缺省;TP=2 下 rank0/rank1 各自独立进程构造,即使外部改 rank0 也与 rank1 SPMD 配方分裂,无合法开法。
-2. **生产装载线崩溃**(缺省配方即崩,先于配方问题):`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m acorninfer.server --port 8200 --tp 2` 两 rank 双双 `KeyError: 未知的 TP 分片目标: model.embed_tokens.weight`(qwen3_tp.py `shard_fn` 对 embed/lm_head 用精确名匹配 `"embed_tokens.weight"/"lm_head.weight"`,8B HF 权重键带 `model.` 前缀而 fall-through 到 KeyError;其余层走 `endswith` 不受累)。rank1(SpawnProcess-1)先崩、rank0 随后同错。**Task 5 冒烟能过是因为脚本自带 `_shard_fn8b` 包装(`name.removeprefix("model.")` 再交 `build_shard_fn`,smoke_tp2_8b.py:294 有注)——该剥前缀包装未进生产 `server._build_tp_model` 装载线**。修复点在 qwen3_tp.py(保护文件,本任务禁改)→ 原样 BLOCKED,判读留下的谱系账见下。崩溃后现场:端口闭、无孤儿进程、双卡回落 4 MiB。
+2. **生产装载线崩溃**(缺省配方即崩,先于配方问题):`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m acorninfer.server --port 8200 --tp 2` 两 rank 双双 `KeyError: 未知的 TP 分片目标: model.embed_tokens.weight`(qwen3_tp.py `shard_fn` 对 embed/lm_head 用精确名匹配 `"embed_tokens.weight"/"lm_head.weight"`,8B HF 权重键带 `model.` 前缀而 fall-through 到 KeyError;其余层走 `endswith` 不受累)。rank1(SpawnProcess-1)先崩、rank0 随后同错。**Task 5 冒烟能过是因为脚本自带 `_shard_fn8b` 包装(`name.removeprefix("model.")` 再交 `build_shard_fn`,smoke_tp2_8b.py:294 有注)——该剥前缀包装未进生产 `server._build_tp_model` 装载线**。崩溃后现场:端口闭、无孤儿进程、双卡回落 4 MiB。
 
-轨 2 达标率:无法计算(无 AcornInfer TP=2 可用腿)——**TP=2 逐档 ≥100% 判定挂账**。
+**修复与轨 2 补测(同日,控制器授权后)**:①装载边界键归一落 `server.py::_prefix_normalized_shard_fn`(生产 shard_fn 调用点;剥离 `model.` 前缀后转发 `build_shard_fn`,返回 state 复用单卡 `map_hf_state_dict` 同口径归一;**qwen3_tp.py 零改动**;红→绿:`test_tp_shard_prefix_normalization` 两套键型逐名同分片 + e2e 参数化 `test_tp2_server_e2e_http[hf-full-recipe]` 双卡过);②server CLI 加 `--attention-backend/--fused-ops/--cuda-graph`(bench 同名旗标,缺省 = 旧行为逐字节,`EngineConfig.__post_init__` 校验 graph 须 triton),两条 `_build_engine` 路径透传(钉子:`test_build_engine_backend_recipe_passthrough` / `..._tp2_backend_recipe_passthrough`;fast 138 全绿)。补测命令:`CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --tp 2 --attention-backend triton --fused-ops --cuda-graph`(就绪 ~5 s,双卡各 10126 MiB;TP=2 + graph 引擎级数值对拍由既有 `test_tp_engine::test_tp2_graph_matches_eager` 钉,不重复造);收服:真身 PID 1653464 定向 kill,FINI 广播 rank1 优雅退出,双卡回落 4 MiB。
+
+轨 2 达标率算术(逐档,AcornInfer ÷ vLLM):C=1 72.92/99.44 = **73.3%**、C=4 233.09/321.79 = **72.4%**、C=8 349.40/541.94 = **64.5%**(TTFT p50 比 1.35×/1.49×/2.21×;TPOT 比 1.37×/1.31×/1.42×)——逐档未过 100%。
 
 判读(如实,推断处标注):
 
-1. **TP=2 decode 增益是否兑现——谱系三分**:段 0 投影 1.45×(allreduce 17.84 µs + 半宽 GEMM 不塌方假设)→ 段 2 自家 eager 实测 0.99×(半宽 GEMM 37% 效率塌方 + 74 次集合开销吃满)→ 本日 vLLM TP=2 实测 TPOT 16.91→9.52 ms(**1.78×** decode 提速,吞吐 +71.2%/+55.0%/+53.0%)。含义(推断):4090 PCIe NODE 上 TP=2 decode 增益**真实存在**,vLLM 的 kernel/通信栈兑现了它;AcornInfer 未兑现的缺口按段 0/段 2 账目锚定在自家半宽 GEMM 效率与每步集合次数,非「本机 TP=2 无收益」。AcornInfer TP=2 产品路径因装载缺陷无数据,追赶账留给下一里程碑。
+1. **TP=2 decode 增益是否兑现——谱系闭合(四分)**:段 0 投影 1.45×(allreduce 17.84 µs + 半宽 GEMM 不塌方假设)→ 段 2 自家 eager 实测 0.99×(半宽 GEMM 37% 效率塌方 + 74 次集合开销吃满)→ 本日 vLLM TP=2 实测 TPOT 16.91→9.52 ms(**1.78×** decode 提速,吞吐 +71.2%/+55.0%/+53.0%)→ **本日自家满配方 TP=2 TPOT 17.95→13.00 ms(1.38×,投影的 95%)**。修复后自家增益兑现:TP=1 graph 把每步发射开销回收后,TP=2 的集合通信代价不再被发射噪声淹没(段 2 eager 0.99× 与本日 1.38× 不矛盾——eager 腿下发射开销主导两者;推断)。自家吞吐对自身 TP=1:C=1 72.92/53.66 = **+35.9%**(对自家缺方 HTTP 腿 35.82 则 +104%,配方+并行复合)。与 vLLM 残余差距(TPOT 1.37×@C=1)锚定在 kernel/通信栈效率差,非结构性不可为。
 2. **TTFT/TPOT**:轨 1 C=1 差价拆解——TTFT 0.0398 vs 0.0269 s(Acorn prefill 慢 1.48×,贡献 ~13 ms),TPOT 17.95 vs 16.91 ms(差 +6%,贡献 ~32 ms/31 步):吞吐差主体在 prefill 与发射侧,decode kernel 已接近。vLLM TP=2 TTFT 逐档与自身 TP=1 持平(0.0266/0.0750/0.0811 vs 0.0269/0.0681/0.0830)——prefill 侧 TP=2 无增益(PCIe 通信吃掉切分收益;与段 2 prefill 观察同向,推断)。AcornInfer HTTP 缺省腿 TPOT 27.57/43.24/58.15 ms 对同配方 in-process 缺省(段 1 辅助线 19.18-21.15 ms 带外大涨)为排队/发射合批差异,C≥4 档 TTFT 0.1248/0.1931 s 复刻段 1 A′ 轮廓(0.1230/0.1915)。
 3. **chunked 判定(引段 1,不重裁)**:同步批量到达协议下 chunking 只表现代价(段 1 C vs A′:tok_s −2.0%/−15.8%/−24.4%,TTFT +121%/+98%/+171%),「连续到达不被长 prefill 阻塞」的收益场景不在本协议内。本仪式四腿均为同步到达,该判定原样延续。
 4. **2.6× 后端配方差的修正归因(同日同卡实测闭环)**:当日 in-process 满配方 ÷ HTTP 缺省配方 = C=1 53.66/35.82 = **1.50×**、C=4 **2.12×**、C=8 **2.57×**;而 HTTP 全程开销本身极小——段 1 同配方对照(HTTP 缺省 35.13 vs in-process 缺省 36.62)= 0.96×,本日 HTTP 缺省(35.82)对段 1 in-process 缺省(36.62)= 0.98×(跨日引用,注机时)。**修正归因:2.6× ≈ 后端配方差(×1.5~2.6,主体,C≥4 档近全额)× HTTP/SSE 全程开销(×~0.96-1.0,小修正项)**——T2「缺省 sdpa 腿捐 2.5×」由配方差解释,非 HTTP 协议本身贵;这也把段 0 补账「后端不同(彼节归因本就留控制器)」的悬案收口。
 5. **收服实录(每引擎切换验净)**:vLLM TP=1 起服前双卡 4 MiB → 压测毕 `ss -tlnp` 取真身 PID(1232431)kill,与 AcornInfer TP=1(PID 1268808)同收,双卡 4 MiB 端口闭;vLLM TP=2 起服前双卡 4 MiB → 就绪 75 s → 压测毕真身 PID 1283772 kill,双卡 4 MiB;AcornInfer TP=2 装载崩溃自净,双卡 4 MiB、无计算进程。全程无 pkill 模糊匹配,包装壳陷阱(段 1 实录)以 `ss -tlnp` 定位真身规避。
 
-**判定行(如实,对照 spec 验收锚「双轨配对 + TP=2 逐档 ≥100%」):轨 1 双腿齐——92.4%/90.0%/83.7%,逐档未过 100%(与 M4.1 挂账同带延续,缺口的 prefill/发射侧归因见判读 2);轨 2 AcornInfer 腿 BLOCKED(满配方 server 不支持 + 生产装载线 8B 前缀崩溃,现场已采)——TP=2 逐档 ≥100% 无法判定,挂账。双轨配对仪式数据面收官;M5 不打 tag、不 push(留用户)。**
+**判定行(如实,对照 spec 验收锚「双轨配对 + TP=2 逐档 ≥100%」):轨 1 双腿齐——92.4%/90.0%/83.7%,逐档未过 100%(与 M4.1 挂账同带延续,缺口的 prefill/发射侧归因见判读 2);轨 2 修复后双腿齐——73.3%/72.4%/64.5%,逐档未过 100%,**TP=2 逐档 ≥100% 北极星维持挂账**;但自家 TP=2 decode 增益已兑现(1.38×,谱系闭合,判读 1),与 vLLM 的差距从「无数据/不可判」变为可归因的工程差距(kernel/通信栈,判读 1/2)。双轨配对仪式数据面收官;M5 不打 tag、不 push(留用户)。**
 
-口径注记(照前节同款):同日同机(RTX 4090 ×2,GPU0-GPU1 PCIe NODE 无 NVLink);四组 HTTP 腿与两组 in-process 腿全部 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);轨内各腿同窗口串行,轨间(vLLM TP=1 → vLLM TP=2)切换以双卡 4 MiB 验净为界;vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;HEAD = 4f470bb(含本任务 commit 1 Minor 清账)。
+口径注记(照前节同款):同日同机(RTX 4090 ×2,GPU0-GPU1 PCIe NODE 无 NVLink);六组腿全部 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);轨内各腿同窗口串行,轨间(vLLM TP=1 → vLLM TP=2 → AcornInfer TP=2 补测)切换以双卡 4 MiB 验净为界;轨 2 补测为满配方旗标 + HF 前缀归一修复后的同一产品路径(修复与旗标落点见轨 2 BLOCKED 段修复注);vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;补测时点树 = 0e35482 + 本 commit 修复(未提交),修复与补测数据同 commit 入库(历史序如实)。

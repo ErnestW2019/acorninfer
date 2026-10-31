@@ -138,6 +138,88 @@ def test_tp_engine_single_flight_serializes():
         )
 
 
+def test_tp_shard_prefix_normalization():
+    """装载边界 HF 前缀归一(server 层,qwen3_tp 零改动):带/不带 "model."
+    前缀的同名键命中同一分片目标(8B HF 原生 vs 仓库自存 tiny 两套键型;
+    仪式 BLOCKED 现场 = model.embed_tokens.weight KeyError,此处钉死)。"""
+    import torch as _torch
+
+    import acorninfer.server as server_mod
+    from acorninfer.config import Qwen3Config as _Cfg
+    from acorninfer.models.qwen3_tp import build_shard_fn
+
+    cfg = _Cfg.tiny()
+    hd = cfg.head_dim
+    g = _torch.Generator().manual_seed(0)
+    full = {
+        "embed_tokens.weight": _torch.randn(cfg.vocab_size, cfg.hidden_size, generator=g),
+        "norm.weight": _torch.randn(cfg.hidden_size, generator=g),
+        "lm_head.weight": _torch.randn(cfg.vocab_size, cfg.hidden_size, generator=g),
+        "layers.0.self_attn.q_proj.weight": _torch.randn(
+            cfg.num_attention_heads * hd, cfg.hidden_size, generator=g),
+        "layers.0.self_attn.o_proj.weight": _torch.randn(
+            cfg.num_attention_heads * hd, cfg.num_attention_heads * hd, generator=g),
+    }
+    # 原始 build_shard_fn 只认无前缀名(HF 前缀键 KeyError = 仪式崩型,钉住)
+    with pytest.raises(KeyError):
+        build_shard_fn(cfg, 0, 2)("model.embed_tokens.weight",
+                                  full["embed_tokens.weight"], 0, 2)
+    # 归一层:两套键型逐名同分片
+    fn = server_mod._prefix_normalized_shard_fn(cfg, 0, 2)
+    for name, t in full.items():
+        got_hf = fn("model." + name, t, 0, 2)
+        got_bare = fn(name, t, 0, 2)
+        assert _torch.equal(got_hf, got_bare), name
+
+
+def test_build_engine_tp2_backend_recipe_passthrough(monkeypatch):
+    """_build_engine --tp 2 后端配方旗标透传(--attention-backend/--fused-ops/
+    --cuda-graph):照 chunked_budget 透传钉子,缺省 = 旧行为(老测试零改动),
+    显式满配方经 cfg 置位到模型。"""
+    import acorninfer.server as server_mod
+
+    created: dict = {}
+
+    def fake_sharded(model_dir, shard_fn, rank, world, *, device,
+                     dtype=torch.bfloat16):
+        return {}
+
+    def fake_tp_model(cfg, rank, world):
+        m = types.SimpleNamespace(cfg=cfg)
+
+        def load(state, strict=True, assign=True):
+            pass
+        m.load_state_dict = load
+        m.to = lambda device=None, dtype=None: m
+        m.eval = lambda: m
+        return m
+
+    def fake_engine(model, tok, **kwargs):
+        created["model"] = model
+        return "ENGINE"
+
+    monkeypatch.setattr(server_mod, "load_safetensors_sharded", fake_sharded)
+    monkeypatch.setattr(server_mod, "Qwen3Config",
+                        types.SimpleNamespace(from_json=lambda p: "CFG"))
+    monkeypatch.setattr(server_mod, "build_shard_fn",
+                        lambda cfg, rank, world: "SHARD_FN")
+    monkeypatch.setattr(server_mod, "Qwen3TPForCausalLM", fake_tp_model)
+    monkeypatch.setattr(server_mod, "Engine", fake_engine)
+    monkeypatch.setattr(server_mod, "TPEngine", lambda e, link: "TPENGINE")
+    monkeypatch.setattr(server_mod, "Tokenizer", lambda path: "TOK")
+
+    base = dict(model_dir="/m", device="cuda:0", num_blocks=8, page_size=16,
+                max_running=4, watermark_blocks=2, chunked_budget=None, tp=2)
+    link = FakeLink(rank=0)
+    # 满配方透传
+    args = types.SimpleNamespace(**base, attention_backend="triton",
+                                 fused_ops=True, cuda_graph=True)
+    assert server_mod._build_engine(args, link=link) == "TPENGINE"
+    assert created["model"].attention_backend == "triton"
+    assert created["model"].fused_ops is True
+    assert created["model"].decode_graph is True
+
+
 def test_build_engine_tp2_uses_sharded_tp_model(monkeypatch):
     """_build_engine --tp 2:分片加载器构造 TP 模型(不走 from_pretrained)、
     attention 后端开关照旧置位、Engine 注入 tp link、外壳 TPEngine 包裹。"""
@@ -297,9 +379,12 @@ def test_tp_parent_guard_kills_orphan(tmp_path):
 # ---------- 真 server e2e(双卡;M5T4 审查补课)----------
 
 
-def _make_serve_ckpt(ckpt_dir) -> None:
+def _make_serve_ckpt(ckpt_dir, hf_prefix: bool = False) -> None:
     """tiny ckpt:config.json + model.safetensors + tokenizer.json(拷 8B,
-    e2e 用 token-ids prompt 不触发 encode;decode 对任意 id 合法)。"""
+    e2e 用 token-ids prompt 不触发 encode;decode 对任意 id 合法)。
+
+    hf_prefix=True 存成 HF 原生键型(8B 实测):解码器参数带 "model." 前缀、
+    lm_head 裸名——生产装载线前缀归一的回归夹具(两套键型都盖)。"""
     import json as _json
     import shutil
     from pathlib import Path as _Path
@@ -329,6 +414,9 @@ def _make_serve_ckpt(ckpt_dir) -> None:
     _torch.manual_seed(0)
     full = _Full(cfg)
     sd = {k: v.contiguous() for k, v in full.state_dict().items()}
+    if hf_prefix:
+        sd = {k if k.startswith("lm_head.") else "model." + k: v
+              for k, v in sd.items()}
     save_file(sd, str(ckpt_dir / "model.safetensors"))
     tok_src = _Path("/home/ernest/model-weight/Qwen3-8B/tokenizer.json")
     if not tok_src.exists():
@@ -338,10 +426,21 @@ def _make_serve_ckpt(ckpt_dir) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="TP=2 需要 2 张卡")
-def test_tp2_server_e2e_http(tmp_path):
+@pytest.mark.parametrize("hf_prefix,extra_flags", [
+    pytest.param(False, [], id="flat-default"),
+    pytest.param(True, ["--attention-backend", "triton", "--fused-ops",
+                        "--cuda-graph"], id="hf-full-recipe"),
+])
+def test_tp2_server_e2e_http(tmp_path, hf_prefix, extra_flags):
     """真 uvicorn --tp 2 起服 + 真 HTTP 首条 /v1/completions(M5T4 审查
     Blocker 的结构性漏洞:此前无任何测试覆盖真 server 双卡路径——Blocker
     (rank1 模型被 cfg.device 放上 GPU0,comm/张量跨卡脑裂死锁)正是漏网)。
+
+    两夹具盖两套键型 × 配方:flat-default = 仓库自存无前缀键 + 缺省配方
+    (旧行为逐字节);hf-full-recipe = HF 原生前缀键(8B 仪式崩型)+ 满配方
+    (triton+fused+graph)——同时盖前缀归一与配方旗标透传的 server 端到端
+    (graph 数值面对拍由 test_tp_engine::test_tp2_graph_matches_eager 钉,
+    此处只证 server 配方路径可构造可服务)。
 
     断言面:health 就绪 → 首条 completions 200 + token 合理 → 复发请求
     仍 200 → 收服干净(T6 纪律:定向 kill、端口闭、双卡回落)。
@@ -354,7 +453,7 @@ def test_tp2_server_e2e_http(tmp_path):
 
     root = _Path(__file__).resolve().parents[1]
     ckpt = tmp_path / "serve_ckpt"
-    _make_serve_ckpt(ckpt)
+    _make_serve_ckpt(ckpt, hf_prefix=hf_prefix)
 
     with _socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -364,7 +463,8 @@ def test_tp2_server_e2e_http(tmp_path):
     log0 = (tmp_path / "rank0.log").open("w")   # rank1 继承同 stdio
     proc = _subprocess.Popen(
         [_sys.executable, "-m", "acorninfer.server",
-         "--model-dir", str(ckpt), "--tp", "2", "--port", str(port)],
+         "--model-dir", str(ckpt), "--tp", "2", "--port", str(port),
+         *extra_flags],
         cwd=str(root), env=env, stdout=log0, stderr=log0,
     )
     rank1_pid = None

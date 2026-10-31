@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 from acorninfer.config import EngineConfig, Qwen3Config
 from acorninfer.engine.engine import Engine
 from acorninfer.engine.tp_engine import TPEngine, TPLink, install_parent_guard, tp_rank1_loop
-from acorninfer.models.qwen3 import from_pretrained
+from acorninfer.models.qwen3 import from_pretrained, map_hf_state_dict
 from acorninfer.models.qwen3_tp import Qwen3TPForCausalLM, build_shard_fn
 from acorninfer.sampler import SamplingParams
 from acorninfer.tokenizer import Tokenizer
@@ -462,14 +462,35 @@ def create_app(engine: Engine) -> FastAPI:
     return app
 
 
+def _prefix_normalized_shard_fn(cfg, rank: int, world: int):
+    """装载边界键归一(与单卡 from_pretrained 的 map_hf_state_dict 同口径)。
+
+    checkpoint 两套键型:HF 原生解码器参数带 "model." 前缀(8B 实测,
+    lm_head 裸名),仓库自存 tiny ckpt 无前缀;qwen3_tp.build_shard_fn 的
+    匹配键为无前缀名(embed/lm_head/norm 精确名匹配,层名 endswith)。
+    剥离前缀后转发;load_safetensors_sharded 返回的 state 亦经
+    map_hf_state_dict 归一成仓库平铺键再 strict 装入。归一层驻 server
+    (生产 shard_fn 调用点),qwen3_tp.py 零改动。
+    """
+    inner = build_shard_fn(cfg, rank, world)
+
+    def shard_fn(name: str, t, r: int, w: int):
+        return inner(name.removeprefix("model."), t, r, w)
+
+    return shard_fn
+
+
 def _build_tp_model(model_dir: str, rank: int, world: int, device: str, dtype):
     """TP 模型构造(生产路径;测试经 monkeypatch 打桩):
-    config 读 checkpoint 同源 → CPU 全量载 + 结构化分片 → strict assign 装入
+    config 读 checkpoint 同源 → CPU 全量载 + 结构化分片(HF "model." 前缀
+    经 _prefix_normalized_shard_fn 归一,两套键型通吃)→ strict assign 装入
     → 单次 .to(峰值显存 = 一份分片,与 from_pretrained 口径一致)。"""
     cfg = Qwen3Config.from_json(f"{model_dir}/config.json")
     state = load_safetensors_sharded(
-        model_dir, build_shard_fn(cfg, rank, world), rank, world, device="cpu",
+        model_dir, _prefix_normalized_shard_fn(cfg, rank, world),
+        rank, world, device="cpu",
     )
+    state = map_hf_state_dict(state)
     model = Qwen3TPForCausalLM(cfg, rank, world)
     model.load_state_dict(state, strict=True, assign=True)
     return model.to(device=device, dtype=dtype).eval()
@@ -481,14 +502,24 @@ def _build_engine(args, link: TPLink | None = None):
     --tp 1(缺省):与 M5 Task 2 逐字节同一(engine.py 的 from_config 尚无
     chunked_budget 透传,故内联;两处构造需保持同步):
     - attention_backend/fused_ops/decode_graph 在 Engine 构造前置位(decode
-      graph runner 在 Engine.__init__ 捕获各桶);
+      graph runner 在 Engine.__init__ 捕获各桶);后端配方旗标
+      --attention-backend/--fused-ops/--cuda-graph(bench 同名)透传
+      EngineConfig,缺省 sdpa/无 fused/无 graph = Task 2 行为逐字节;
     - chunked_budget 经 Engine 构造参数透传(M5 chunked prefill),缺省
       None = 每步全量 prefill,引擎行为与 M4.1 逐字节一致。
-    --tp >= 2:分片 TP 模型 + Engine(tp=link);rank0(link.rank==0)外罩
-    TPEngine 命令壳返回。rank1 由 _tp_rank1_main 经本函数以 TPLink(1) 构造
-    (返回裸 Engine,无壳)。
+    --tp >= 2:分片 TP 模型(HF "model." 前缀经 _prefix_normalized_shard_fn
+    归一)+ Engine(tp=link);rank0(link.rank==0)外罩 TPEngine 命令壳返回。
+    rank1 由 _tp_rank1_main 经本函数以 TPLink(1) 构造(返回裸 Engine,无壳)。
     """
     tp = getattr(args, "tp", 1)
+    # 后端配方旗标(--attention-backend/--fused-ops/--cuda-graph,bench 同名;
+    # getattr 缺省 = CLI 缺省 = 旧调用方(SimpleNamespace 无字段)零改动;
+    # --cuda-graph 须 triton 由 EngineConfig.__post_init__ 构造期校验)
+    backend = dict(
+        attention_backend=getattr(args, "attention_backend", "sdpa"),
+        fused_ops=getattr(args, "fused_ops", False),
+        decode_graph=getattr(args, "cuda_graph", False),
+    )
     if tp == 1:
         cfg = EngineConfig(
             model_dir=args.model_dir,
@@ -497,6 +528,7 @@ def _build_engine(args, link: TPLink | None = None):
             page_size=args.page_size,
             max_running=args.max_running,
             watermark_blocks=args.watermark_blocks,
+            **backend,
         )
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
         model.attention_backend = cfg.attention_backend
@@ -520,6 +552,7 @@ def _build_engine(args, link: TPLink | None = None):
         page_size=args.page_size,
         max_running=args.max_running,
         watermark_blocks=args.watermark_blocks,
+        **backend,
     )
     # 设备放置(根因修复,M5T4 审查 Blocker):TP 下每 rank 必须用
     # f"cuda:{rank}"(CUDA_VISIBLE_DEVICES 序数映射,与全部测试/worker 同一口径)。
@@ -603,6 +636,18 @@ def main() -> None:
     parser.add_argument(
         "--tp", type=int, default=1,
         help="张量并行度(M5 Task 4);缺省 1 = 单卡逐字节现行为",
+    )
+    parser.add_argument(
+        "--attention-backend", default="sdpa", choices=["sdpa", "triton"],
+        help="attention 后端(M3 paged attention;与 bench 同名旗标)",
+    )
+    parser.add_argument(
+        "--fused-ops", action="store_true",
+        help="decode 走 K1/K2 融合算子(M3)",
+    )
+    parser.add_argument(
+        "--cuda-graph", action="store_true",
+        help="decode 走 CUDA graph(M4;须 --attention-backend triton)",
     )
     args = parser.parse_args()
 
