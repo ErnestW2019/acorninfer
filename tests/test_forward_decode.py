@@ -1,7 +1,9 @@
-"""批量 decode 正确性:
+"""批量 decode 正确性(M4.1 起兼承载批量 prefill 对拍):
 - 单序列 forward_decode == 现有 forward 路径(逐位;同形状同内核);
 - 批量 forward_decode 的 token 序列 == 逐序列单独 decode(token 序列是真正的门;
-  logits 允许批处理内核的 ulp 级差异,但 tiny CPU 模型上预期逐位一致)。
+  logits 允许批处理内核的 ulp 级差异,但 tiny CPU 模型上预期逐位一致);
+- 批量 forward_prefill_batch(M4.1)== 逐条 forward:per-row 末位 logits
+  紧容差一致 + KV 写入逐行等长且页表一致。
 """
 
 import pytest
@@ -263,10 +265,12 @@ def test_forward_prefill_batch_matches_sequential(tiny_model, fused):
     # -m pytest tests/test_forward_decode.py -k prefill_batch -v -s` +
     # 探针脚本打印逐元素 slack,实测 max|diff| = 0.0078125(= 2^-7,恰 1 个 bf16 ulp;
     # argmax 处 ref=-1.039,batch=-1.031;407/768 元素有 ulp 级差异 —— 合批 GEMM 与
-    # [1,L] GEMM 选核/归约序差异的固有舍入)。按协议取实测 2-3 倍:atol=6e-3
-    # (≈0.77× 实测 max|diff|,覆盖小 |ref| 元素的 ≥1 ulp)+ rtol=1.6e-2(≈2 bf16
-    # ulp 的相对界,覆盖大 |ref|);对 |ref|<0.67(本 logits 分布均值 0.46)严于
-    # 全局 TOL_BF16(1e-2/1e-2)。最小 slack 0.0025,配置/驱动变化后按协议重标定。
+    # [1,L] GEMM 选核/归约序差异的固有舍入)。按协议取实测 2-3 倍 —— 指最坏
+    # 元素 atol+rtol 合成预算:6e-3 + 1.6e-2×1.039 ≈ 0.0226 ≈ 2.9× 实测
+    # max|diff|;atol=6e-3 单独 govern 小 |ref| 元素(≈0.77× 实测 max|diff|,
+    # 覆盖其 ≥1 ulp),rtol=1.6e-2(≈2 bf16 ulp 的相对界)覆盖大 |ref|;对
+    # |ref|<0.67(本 logits 分布均值 0.46)严于全局 TOL_BF16(1e-2/1e-2)。
+    # 最小 slack 0.0025,配置/驱动变化后按协议重标定。
     tol = dict(rtol=1.6e-2, atol=6e-3)
     torch.testing.assert_close(batch_logits, ref, **tol)
     worst = max_abs_diff(batch_logits, ref)

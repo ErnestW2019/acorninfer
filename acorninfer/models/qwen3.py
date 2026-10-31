@@ -213,6 +213,9 @@ class Qwen3Attention(nn.Module):
         (cache 空,is_causal=(s>1))完全同一语义:update 截断 [:L],pad 永不
         入 KV,逐行 SDPA 天然行间隔离。本方法不接 fused_ops /
         attention_backend 选择器:prefill 批量化与 decode 后端开关解耦。
+
+        警告:rope 公式与 forward(_apply_rope)/forward_decode 各有一份内联
+        拷贝(形状约定不同)—— 改公式需三处同步;golden 门是安全网。
         """
         N, Lmax, _ = hidden.shape
         q = self.q_proj(hidden).view(N, Lmax, self.num_heads, self.head_dim).transpose(1, 2)
@@ -442,13 +445,21 @@ class Qwen3ForCausalLM(nn.Module):
         [:L])= 单序列 forward 的 prefill 分支同一语义;末层只对各行
         real_lens[i]-1 位置过 lm_head。与 fused_ops/attention_backend 解耦
         (prefill 分支现状即不接后端选择器)。
+        契约:views[i] 与 input_ids 第 i 行一一对应(real_lens[i] 同行);
+        KV 写入经各自 views[i],行间零串扰。
         """
         N, Lmax = input_ids.shape
         if len(views) != N or len(real_lens) != N:
-            raise ValueError("views/real_lens 必须与 batch 维一一对应")
+            raise ValueError(
+                f"views/real_lens 必须与 batch 维一一对应: got N={N}, "
+                f"len(views)={len(views)}, len(real_lens)={len(real_lens)}"
+            )
         if min(real_lens) < 1 or max(real_lens) > Lmax:
             # L==0 无末位可取;L>Lmax 会静默越界/截断错误
-            raise ValueError("real_lens 必须落在 [1, Lmax] 内")
+            raise ValueError(
+                f"real_lens 必须落在 [1, Lmax] 内: got "
+                f"min={min(real_lens)}, max={max(real_lens)}, Lmax={Lmax}"
+            )
         device = input_ids.device
         dtype = self.embed_tokens.weight.dtype
         # 逐行位置(pad 位 0);展平为一次 rope 调用
