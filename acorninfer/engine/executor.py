@@ -34,6 +34,30 @@ class Executor:
         logits = self.model.forward_prefill_batch(ids, views, real_lens=lens)
         return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
 
+    def extend(self, seqs: list[Sequence], views,
+               chunks: list[tuple[Sequence, int, int]]) -> list[int | None]:
+        """chunk 续读(M5):chunks = [(seq, start, length)] 与 seqs/views 同序
+        对齐。ids [N, Lc_max] 右 padding(real_lens=chunk_lens)→
+        forward_extend;仅 prompt 完成(start+length == len(all_ids))的行
+        _sample(与 prefill_batch 同语义);未完成行返回 None —— 中间块不发
+        token,部分 prompt 条件下的采样是垃圾,绝不外泄。"""
+        starts = [start for _, start, _ in chunks]
+        lens = [length for _, _, length in chunks]
+        Lc = max(lens)
+        ids = torch.zeros(len(seqs), Lc, dtype=torch.long, device=self.device)
+        for i, (s, start, length) in enumerate(chunks):
+            ids[i, :length] = torch.tensor(
+                s.all_ids[start: start + length], dtype=torch.long,
+                device=self.device,
+            )
+        logits = self.model.forward_extend(ids, views, starts=starts,
+                                           chunk_lens=lens)
+        return [
+            self._sample(s, logits[i])
+            if start + length == len(s.all_ids) else None
+            for i, (s, start, length) in enumerate(chunks)
+        ]
+
     def decode_batch(self, seqs: list[Sequence], views) -> list[int]:
         # 全批 greedy 谓词只求值一次:runner 派发与 eager 合批共用同一局部值
         greedy = all(s.sampling.temperature == 0 for s in seqs)

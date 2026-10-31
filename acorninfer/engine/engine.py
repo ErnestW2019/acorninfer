@@ -36,6 +36,7 @@ class Engine:
         page_size: int = 16,
         max_running: int = 8,
         watermark_blocks: int = 8,
+        chunked_budget: int | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -52,7 +53,8 @@ class Engine:
             device,
             dtype,
         )
-        self.scheduler = Scheduler(self.allocator, page_size, max_running, watermark_blocks)
+        self.scheduler = Scheduler(self.allocator, page_size, max_running,
+                                   watermark_blocks, chunked_budget)
         if watermark_blocks >= num_blocks:
             raise ValueError(
                 f"watermark_blocks ({watermark_blocks}) must be < num_blocks ({num_blocks})"
@@ -120,20 +122,37 @@ class Engine:
 
     @torch.inference_mode()
     def step(self) -> list[TokenOutput]:
-        prefills, decodes = self.scheduler.schedule()
+        chunks, decodes = self.scheduler.schedule()
         outputs: list[TokenOutput] = []
         try:
+            # 按 start 分流(M5):start==0 且全量 → 既有 prefill 路径
+            # (byte-identical,零回归面);start==0 截断 → forward_prefill_batch
+            # (更短的 prefill,数值同源);start>0 → forward_extend 续读。
             built = []
-            for seq in prefills:
-                # 块表共享同一 list 对象:调度器 _release 清空它即同时清空视图
-                view = PagedCacheView(self.cache, seq.block_table)
-                self._views[seq.seq_id] = view
-                built.append((seq, view))
+            part: list[tuple[Sequence, PagedCacheView, int, int]] = []
+            ext: list[tuple[Sequence, PagedCacheView, int, int]] = []
+            for chunk in chunks:
+                seq, start, length = chunk
+                if start == 0:
+                    # prefill (重)起点:M4.1 同款无条件新建视图 —— 被抢占者的
+                    # 旧视图 _lens 残留(_release 只清共享块表),复用会脏写
+                    view = PagedCacheView(self.cache, seq.block_table)
+                    self._views[seq.seq_id] = view
+                else:
+                    # 续读(cursor>0):视图由首块建立;KeyError 即不变式破坏,宁可响
+                    view = self._views[seq.seq_id]
+                if start == 0 and length == len(seq.all_ids):
+                    built.append((seq, view))
+                elif start == 0:
+                    part.append((seq, view, start, length))
+                else:
+                    ext.append((seq, view, start, length))
             if len(built) == 1:
                 # N=1 原路径:byte-identical(零回归面)
                 seq, view = built[0]
                 token = self.executor.prefill(seq, view)
                 seq.num_pages = len(view.table)
+                seq.prefill_cursor = len(seq.all_ids)
                 self._record(seq, token, outputs)
             elif built:
                 # M4.1:同批多序列一次批量 prefill(调度器本就一步全准入)
@@ -141,7 +160,36 @@ class Engine:
                     [s for s, _ in built], [v for _, v in built])
                 for (seq, view), token in zip(built, tokens):
                     seq.num_pages = len(view.table)
+                    seq.prefill_cursor = len(seq.all_ids)
                     self._record(seq, token, outputs)
+            if part:
+                # 预算截断的首块(cursor==0):走批量 prefill,实长=length;
+                # 截断块必不完成(start+length < len(all_ids)),不发 token
+                lens = [ln for (_, _, _, ln) in part]
+                ids = torch.zeros(len(part), max(lens), dtype=torch.long,
+                                  device=self.executor.device)
+                views = []
+                for i, (seq, view, _, ln) in enumerate(part):
+                    ids[i, :ln] = torch.tensor(seq.prompt_ids[:ln],
+                                               dtype=torch.long,
+                                               device=ids.device)
+                    views.append(view)
+                self.model.forward_prefill_batch(ids, views, real_lens=lens)
+                for seq, view, start, ln in part:
+                    seq.num_pages = len(view.table)
+                    seq.prefill_cursor = start + ln
+            if ext:
+                # 续读块(cursor>0):仅 prompt 完成的行发 token(extend 内判定)
+                tokens = self.executor.extend(
+                    [s for s, _, _, _ in ext],
+                    [v for _, v, _, _ in ext],
+                    [(s, st, ln) for s, _, st, ln in ext],
+                )
+                for (seq, view, start, ln), token in zip(ext, tokens):
+                    seq.num_pages = len(view.table)
+                    seq.prefill_cursor = start + ln
+                    if token is not None:
+                        self._record(seq, token, outputs)
             if decodes:
                 views = [self._views[s.seq_id] for s in decodes]
                 tokens = self.executor.decode_batch(decodes, views)

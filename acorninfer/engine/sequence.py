@@ -30,6 +30,7 @@ class Sequence:
     created_at: float = field(default_factory=time.perf_counter)
     first_token_at: float | None = None
     last_token_at: float | None = None
+    prefill_cursor: int = 0  # 已完成的 prefill token 数(M5);引擎每次 chunk 前向后同步
 
     @property
     def num_tokens(self) -> int:

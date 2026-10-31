@@ -457,3 +457,91 @@ def test_executor_prefill_batch_mixed_temperature_per_row_sampling():
         # per-layer dict,对照法同 Task 4 的 prefill_batch 测试)
         assert views[0]._lens == {0: 7, 1: 7}
         assert views[1]._lens == {0: 4, 1: 4}
+
+
+# ---- M5 Task 1:chunked prefill 端到端 ----
+
+
+def _mk_engine(tiny_model, budget):
+    return Engine(
+        tiny_model,
+        tokenizer=None,
+        num_blocks=64,
+        page_size=4,
+        max_running=4,
+        watermark_blocks=0,
+        chunked_budget=budget,
+    )
+
+
+def test_engine_chunked_matches_unchunked(tiny_model):
+    """budget 强制切块 vs None:同 seed 同 prompts,token 流逐位一致(贪心
+    确定性;数值同源 = prefill_batch + forward_extend 对拍,TOL 门在
+    test_forward_extend_chunked_matches_full_prefill)。"""
+    prompts = [_ids(9, 0), _ids(5, 1), _ids(13, 2)]
+    streams = {}
+    for budget in (None, 2):
+        eng = _mk_engine(tiny_model, budget)
+        with torch.inference_mode():
+            refs = [generate_cached(eng.model, p, max_new_tokens=6)[0]
+                    for p in prompts]
+        sids = [eng.submit(p, SamplingParams(temperature=0.0), max_tokens=6)
+                for p in prompts]
+        while eng.has_pending():
+            eng.step()
+        streams[budget] = {sid: eng.seqs[sid].all_ids for sid in sids}
+        for sid, ref in zip(sids, refs):  # 两腿各自都对 generate_cached 参照
+            assert eng.seqs[sid].all_ids == ref
+        eng.assert_balanced()
+    assert streams[None] == streams[2]
+
+
+def test_engine_mixed_step_chunk_and_decode(tiny_model):
+    """混合步:2 条 decode 中 + 1 条长 prompt chunking,两类同一步推进
+    (与 prefill+decode 混合步同构:chunk 前向 + decode 同步内并存)。"""
+    eng = _mk_engine(tiny_model, 6)
+    p1, p2, p3 = _ids(3, 3), _ids(3, 4), _ids(8, 5)
+    with torch.inference_mode():
+        ref1, _ = generate_cached(eng.model, p1, max_new_tokens=4)
+        ref2, _ = generate_cached(eng.model, p2, max_new_tokens=4)
+        ref3, _ = generate_cached(eng.model, p3, max_new_tokens=3)
+    s1 = eng.submit(p1, SamplingParams(temperature=0.0), max_tokens=4)
+    s2 = eng.submit(p2, SamplingParams(temperature=0.0), max_tokens=4)
+    eng.step()  # 两条短 prompt 全量 prefill(budget 6 = 3+3 恰好)
+    s3 = eng.submit(p3, SamplingParams(temperature=0.0), max_tokens=3)
+    outs = eng.step()  # 混合步:s3 首块 (0,6) 截断 + s1/s2 decode
+    assert [o.seq_id for o in outs] == [s1, s2]  # s3 中间块不发 token
+    assert eng.seqs[s3].prefill_cursor == 6
+    assert eng.seqs[s3].first_token_at is None
+    outs2 = eng.step()  # 混合步:s3 尾块 (6,2) 完成 + s1/s2 decode
+    got = {o.seq_id for o in outs2}
+    assert got == {s1, s2, s3}  # 两类同步推进
+    while eng.has_pending():
+        eng.step()
+    assert eng.seqs[s1].all_ids == ref1
+    assert eng.seqs[s2].all_ids == ref2
+    assert eng.seqs[s3].all_ids == ref3
+    eng.assert_balanced()
+
+
+def test_engine_midchunk_emits_nothing(tiny_model):
+    """中间块不发 token:输出与 TTFT 时间戳都只在完成块出现。"""
+    eng = _mk_engine(tiny_model, 2)
+    p = _ids(6, 6)
+    with torch.inference_mode():
+        ref, _ = generate_cached(eng.model, p, max_new_tokens=3)
+    s = eng.submit(p, SamplingParams(temperature=0.0), max_tokens=3)
+    o1 = eng.step()  # (0,2) 中间块
+    assert o1 == []
+    assert eng.seqs[s].prefill_cursor == 2
+    assert eng.seqs[s].first_token_at is None
+    o2 = eng.step()  # (2,2) 中间块
+    assert o2 == []
+    assert eng.seqs[s].first_token_at is None
+    o3 = eng.step()  # (4,2) 完成块 → 恰 1 token,TTFT 在此
+    assert [o.seq_id for o in o3] == [s]
+    assert eng.seqs[s].first_token_at is not None
+    while eng.has_pending():
+        eng.step()
+    assert eng.seqs[s].all_ids == ref
+    eng.assert_balanced()

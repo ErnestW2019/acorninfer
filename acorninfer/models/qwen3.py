@@ -248,6 +248,54 @@ class Qwen3Attention(nn.Module):
         out = outs.transpose(1, 2).reshape(N, Lmax, -1)
         return self.o_proj(out)
 
+    def forward_extend(self, hidden, cos, sin, views, layer_idx, *,
+                       starts, chunk_lens):
+        """chunk 续读(M5):cursor>0 的追加前向。hidden [N, Lc_max, D](右
+        padding),starts[b] = 该行已完成 token 数(past),chunk_lens[b] = 本
+        块真实长度。
+
+        逐行 update + SDPA 与 prefill 分支同一结构,差异仅三点:
+        - KV 追加的是 chunk(k/v 截断 [:L]),update 返回追加后的全量
+          k_full/v_full( past+L );
+        - 位置从 starts[b] 起(cos/sin 由上层按行 arange(start, start+L) 算好);
+        - 掩码显式右下对齐 bottom-right causal(past>0 时 is_causal 语义错误):
+          query i(全局位 past+i)可见 key 0..past+i,即 tril(diagonal=past)。
+        SDPA 用默认 scale(head_dim ** -0.5),与全部既有路径一致。
+
+        警告:rope 公式与 forward(_apply_rope)/forward_decode/
+        forward_prefill_batch 各有一份内联拷贝(这是第 4 份,形状约定不同)
+        —— 改公式需四处同步;golden 门是安全网。
+        """
+        N, Lc_max, _ = hidden.shape
+        q = self.q_proj(hidden).view(N, Lc_max, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        rep = self.num_heads // self.num_kv_heads
+        outs = torch.zeros(N, self.num_heads, Lc_max, self.head_dim,
+                           dtype=hidden.dtype, device=hidden.device)
+        for b, view in enumerate(views):
+            L = chunk_lens[b]
+            past = starts[b]
+            k_full, v_full = view.update(layer_idx, k[b : b + 1, :, :L],
+                                         v[b : b + 1, :, :L])
+            k_full = _repeat_kv(k_full, rep)
+            v_full = _repeat_kv(v_full, rep)
+            mask = torch.ones(L, past + L, dtype=torch.bool,
+                              device=hidden.device).tril(diagonal=past)[None, None]
+            outs[b, :, :L] = F.scaled_dot_product_attention(
+                q[b : b + 1, :, :L], k_full, v_full, attn_mask=mask)[0]
+        out = outs.transpose(1, 2).reshape(N, Lc_max, -1)
+        return self.o_proj(out)
+
 
 class Qwen3MLP(nn.Module):
     def __init__(self, cfg: Qwen3Config):
@@ -310,6 +358,18 @@ class Qwen3Block(nn.Module):
         hidden = hidden + self.self_attn.forward_prefill_batch(
             self.input_layernorm(hidden), cos, sin, views, layer_idx,
             real_lens=real_lens,
+        )
+        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        return hidden
+
+    def forward_extend(self, hidden, cos, sin, views, layer_idx, *,
+                       starts, chunk_lens):
+        """chunk 续读(M5):RMSNorm 逐 token,天然支持 [N, Lc_max] 合批;
+        残差结构与 prefill 分支一致(torch 路径,无 fused 分支 —— 与
+        fused_ops/attention_backend 解耦,同 prefill 现状)。"""
+        hidden = hidden + self.self_attn.forward_extend(
+            self.input_layernorm(hidden), cos, sin, views, layer_idx,
+            starts=starts, chunk_lens=chunk_lens,
         )
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
@@ -475,6 +535,53 @@ class Qwen3ForCausalLM(nn.Module):
                                                  real_lens=real_lens)
         hidden = self.norm(hidden)
         last = torch.tensor([L - 1 for L in real_lens], device=device)
+        hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
+        return self.lm_head(hidden).float()
+
+    def forward_extend(self, input_ids: torch.Tensor, views, *,
+                       starts: list[int], chunk_lens: list[int]) -> torch.Tensor:
+        """chunk 续读前向(M5):input_ids [N, Lc_max](右 padding,pad 位值
+        任意)+ starts[i](该行已完成 token 数 = view 当前 KV 长度)+
+        chunk_lens[i](本块真实长度)-> 各行本块末位(start+len-1)logits
+        [N, vocab](float32)。
+
+        大 GEMM 合批 embed/RMSNorm/qkv/o/MLP 与 prefill_batch 同款(pad 行
+        垃圾值只在其行内传播);KV 追加与 attention 逐行(views[i].update 截断
+        [:len_i])—— 追加后 view KV 长度 = starts[i]+len_i;末层只对各行
+        start+len-1 位置过 lm_head。与 fused_ops/attention_backend 解耦。
+        契约:views[i]/starts[i]/chunk_lens[i] 与 input_ids 第 i 行一一对应;
+        views[i] 的 KV 长度必须恰为 starts[i](引擎 cursor 同步不变式)。
+        """
+        N, Lc_max = input_ids.shape
+        if len(views) != N or len(starts) != N or len(chunk_lens) != N:
+            raise ValueError(
+                f"views/starts/chunk_lens 必须与 batch 维一一对应: got N={N}, "
+                f"len(views)={len(views)}, len(starts)={len(starts)}, "
+                f"len(chunk_lens)={len(chunk_lens)}"
+            )
+        if min(chunk_lens) < 1 or max(chunk_lens) > Lc_max or min(starts) < 0:
+            # L==0 无末位可取;L>Lc_max / start<0 会静默越界
+            raise ValueError(
+                f"chunk_lens 必须落在 [1, Lc_max] 且 starts 非负: got "
+                f"min(len)={min(chunk_lens)}, max(len)={max(chunk_lens)}, "
+                f"Lc_max={Lc_max}, min(start)={min(starts)}"
+            )
+        device = input_ids.device
+        dtype = self.embed_tokens.weight.dtype
+        # 逐行绝对位置 pad 位 0;展平为一次 rope 调用
+        pos = torch.zeros(N * Lc_max, dtype=torch.long, device=device)
+        for i, (s, L) in enumerate(zip(starts, chunk_lens)):
+            pos[i * Lc_max: i * Lc_max + L] = torch.arange(s, s + L, device=device)
+        cos, sin = self.rope(pos, dtype, device)      # [N*Lc_max, head_dim]
+        cos = cos.view(N, Lc_max, -1)
+        sin = sin.view(N, Lc_max, -1)
+        hidden = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.forward_extend(hidden, cos, sin, views, i,
+                                          starts=starts, chunk_lens=chunk_lens)
+        hidden = self.norm(hidden)
+        # 末位 token = 绝对位 start+len-1,在 pad 张量中位于第 len-1 列(局部坐标)
+        last = torch.tensor([L - 1 for L in chunk_lens], device=device)
         hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
         return self.lm_head(hidden).float()
 

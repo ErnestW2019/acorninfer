@@ -286,3 +286,98 @@ def test_forward_prefill_batch_matches_sequential(tiny_model, fused):
             alloc2.free(blk)
     alloc.assert_balanced()
     alloc2.assert_balanced()
+
+
+def test_forward_extend_chunked_matches_full_prefill(env):
+    """分块 prefill(M5)vs 整条 prefill_batch:两段式(先 prefill 前 5/前 3,
+    再 forward_extend 续读后 7/后 9)末位 logits 紧容差一致 + argmax 同 token;
+    两腿 KV(_lens/页表)逐位一致(追加写位点 = cursor);N=2 变长 chunk
+    行间零串扰(row0=5+7,row1=3+9,Lc_max=9 右 padding)。
+
+    参考腿独立 allocator/cache(同构,LIFO 分配序一致 → 页表可逐位对拍)。
+    """
+    model, _, _ = env
+    torch.manual_seed(3)
+    gen = torch.Generator().manual_seed(11)
+    splits = [(5, 7), (3, 9)]  # (首块, 续读块);prompt 总长均 12
+    prompts = [torch.randint(0, 256, (1, 12), generator=gen) for _ in range(2)]
+
+    def fresh_cache():
+        alloc = BlockAllocator(32)
+        cache = PagedKVCache(
+            model.cfg.num_hidden_layers,
+            model.cfg.num_key_value_heads,
+            model.cfg.head_dim,
+            4,
+            alloc,
+            "cpu",
+            torch.bfloat16,
+        )
+        return alloc, cache
+
+    # 分块腿:首块 prefill_batch(变长右 padding)→ 续读 forward_extend
+    alloc, cache = fresh_cache()
+    views = [PagedCacheView(cache) for _ in range(2)]
+    first_lens = [s[0] for s in splits]
+    cont_lens = [s[1] for s in splits]
+    starts = first_lens
+    with torch.inference_mode():
+        ids1 = torch.zeros(2, max(first_lens), dtype=torch.long)
+        for i, p in enumerate(prompts):
+            ids1[i, : first_lens[i]] = p[:, : first_lens[i]]
+        model.forward_prefill_batch(ids1, views, real_lens=first_lens)
+        assert [v.seq_len for v in views] == first_lens  # 首块落点 = cursor
+        Lc = max(cont_lens)
+        ids2 = torch.zeros(2, Lc, dtype=torch.long)
+        for i, p in enumerate(prompts):
+            ids2[i, : cont_lens[i]] = p[:, first_lens[i]:]
+        chunked = model.forward_extend(
+            ids2, views, starts=starts, chunk_lens=cont_lens
+        )
+    # 参考腿:整条 12 一次 prefill_batch
+    alloc2, cache2 = fresh_cache()
+    ref_views = [PagedCacheView(cache2) for _ in range(2)]
+    with torch.inference_mode():
+        ids_full = torch.zeros(2, 12, dtype=torch.long)
+        for i, p in enumerate(prompts):
+            ids_full[i] = p
+        full = model.forward_prefill_batch(ids_full, ref_views, real_lens=[12, 12])
+    assert chunked.shape == full.shape == (2, 256)
+    # 容差标定(TOL 协议):两段式把 [1,12] GEMM 拆成 [1,5]+[1,7],选核/归约序
+    # 差异与 M4.1 prefill_batch 对拍同源;标定命令与日期见下方 print 后注释。
+    torch.testing.assert_close(chunked, full, **TOL_BF16)
+    for i in range(2):  # argmax 同 token(token 流才是引擎的门)
+        assert int(chunked[i].argmax()) == int(full[i].argmax())
+    worst = max_abs_diff(chunked, full)
+    print(f"\n[forward_extend chunked vs full prefill max|diff| = {worst:.6f}]")
+    # 标定(TOL 协议):2026-10-31 CPU tiny bf16,命令 `CUDA_VISIBLE_DEVICES=1
+    # .venv/bin/python -m pytest tests/test_forward_decode.py -k forward_extend -v -s`。
+    # 实测 logits 与 KV max|diff| = 0.0(CPU tiny 两腿逐位一致);TOL_BF16 为
+    # INIT 值,GPU 合批路径落地后按协议重标定、再收紧。
+    for i in range(2):
+        assert views[i]._lens == ref_views[i]._lens   # 逐层 KV 长度一致(cursor 写位点)
+        assert len(views[i].table) == len(ref_views[i].table)  # 页数一致(12 token = 3 页)
+        # 两遍分配(5+7)与一遍分配(12)的 LIFO 页号不同 —— 物理页表不可逐位
+        # 对拍;改为 gather 后 KV 内容逐层容差一致(等价状态的真判据)
+        for layer in range(model.cfg.num_hidden_layers):
+            k_a = views[i]._gather(layer, cache.k_pages)
+            k_b = ref_views[i]._gather(layer, cache2.k_pages)
+            v_a = views[i]._gather(layer, cache.v_pages)
+            v_b = ref_views[i]._gather(layer, cache2.v_pages)
+            assert k_a.shape == k_b.shape and v_a.shape == v_b.shape
+            torch.testing.assert_close(k_a.float(), k_b.float(), **TOL_BF16)
+            torch.testing.assert_close(v_a.float(), v_b.float(), **TOL_BF16)
+    kv_worst = max(
+        max_abs_diff(views[i]._gather(l, cache.k_pages),
+                     ref_views[i]._gather(l, cache2.k_pages))
+        for i in range(2) for l in range(model.cfg.num_hidden_layers)
+    )
+    print(f"[chunked vs full KV (k) max|diff| = {kv_worst:.6f}]")
+    for v in views:
+        for blk in v.table:
+            alloc.free(blk)
+    for v in ref_views:
+        for blk in v.table:
+            alloc2.free(blk)
+    alloc.assert_balanced()
+    alloc2.assert_balanced()
