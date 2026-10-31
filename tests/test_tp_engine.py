@@ -267,12 +267,8 @@ def _spmd_rank1_worker(init_file, ckpt_dir, out_json, budget):
         elif cmd == "step":
             eng.step()
             snapshots.append(_snap(eng))
-        elif cmd == "pending":
-            eng.has_pending()
         elif cmd == "drop":
             eng.drop(payload)
-        elif cmd == "balanced":
-            eng.assert_balanced()
         elif cmd == "fini":
             break
         else:

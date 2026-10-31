@@ -521,7 +521,15 @@ def _build_engine(args, link: TPLink | None = None):
         max_running=args.max_running,
         watermark_blocks=args.watermark_blocks,
     )
-    model = _build_tp_model(args.model_dir, link.rank, tp, cfg.device, cfg.dtype)
+    # 设备放置(根因修复,M5T4 审查 Blocker):TP 下每 rank 必须用
+    # f"cuda:{rank}"(CUDA_VISIBLE_DEVICES 序数映射,与全部测试/worker 同一口径)。
+    # 曾用 cfg.device(--device,TP=1 语义)给两 rank —— rank1 的模型/激活
+    # 落 GPU0 而 NCCL comm 绑 GPU1(set_device(rank)),comm/张量跨卡脑裂:
+    # 首次 prefill 的 allreduce 永不配对,rank0 宿主线程楔死在 libcuda
+    # (cuLibraryGetGlobal);nvidia-smi 见 rank1 双卡占显存、NCCL INFO 见
+    # rank0 comm cudaDev0/rank1 comm cudaDev1。--device 在 --tp>=2 下不生效。
+    model = _build_tp_model(args.model_dir, link.rank, tp,
+                            f"cuda:{link.rank}", cfg.dtype)
     model.attention_backend = cfg.attention_backend
     model.fused_ops = cfg.fused_ops
     model.decode_graph = cfg.decode_graph

@@ -62,8 +62,9 @@ class FakeEngine:
 
 
 def test_tp_engine_command_wire():
-    """TPEngine 命令线:每个公开入口先广播 (cmd, payload) 再本地执行;
-    wire 与 tp_rank1_loop 的消费端一一对应(两端合同钉死)。"""
+    """TPEngine 命令线:**只载变更类命令**(submit/step/drop/fini);
+    pending/balanced 查询 rank0 本地作答不上广播线(wire 收窄,M5T4 审查);
+    每个变更命令 = 一次广播 + 一次本地调用,返回值透传。"""
     eng = FakeEngine()
     link = FakeLink()
     shell = TPEngine(eng, link)
@@ -81,17 +82,60 @@ def test_tp_engine_command_wire():
     assert link.commands[-1] == ("drop", 42)
     assert eng.calls[-1] == ("drop", 42)
 
+    # 查询:本地作答,零广播(wire 收窄)
     assert shell.has_pending() is False
-    assert link.commands[-1] == ("pending", None)
-
+    assert eng.calls[-1] == ("pending",)
     shell.assert_balanced()
-    assert link.commands[-1] == ("balanced", None)
+    assert eng.calls[-1] == ("balanced",)
+    assert [c[0] for c in link.commands] == ["submit", "step", "drop"]  # 无 pending/balanced
 
     shell.shutdown()
     assert link.commands[-1] == ("fini", None)
 
     assert shell.tokenizer == "TOK"  # server 依赖的属性直通
     assert shell.seqs == {"s": "SEQ"}
+
+
+def test_tp_engine_single_flight_serializes():
+    """单飞锁:并发线程进壳,集合操作 issue 顺序 = 程序序(不依赖调用方
+    纪律)。假 engine 记录 (进入, 退出) 事件,断言任意时刻至多一个调用在飞。"""
+    import threading
+    import time as _time
+
+    class SlowEngine(FakeEngine):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def _fly(self, tag):
+            self.events.append(("enter", tag))
+            _time.sleep(0.02)
+            self.events.append(("exit", tag))
+
+        def submit(self, prompt_ids, sampling, *, max_tokens, eos_ids=None):
+            self._fly("submit")
+            return 1
+
+        def step(self):
+            self._fly("step")
+            return []
+
+    eng = SlowEngine()
+    shell = TPEngine(eng, FakeLink())
+
+    def worker(fn):
+        for _ in range(4):
+            fn()
+
+    t1 = threading.Thread(target=worker, args=(shell.step,))
+    t2 = threading.Thread(target=worker, args=(shell.step,))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert len(eng.events) == 16
+    for i in range(0, 16, 2):
+        assert eng.events[i][0] == "enter" and eng.events[i + 1][0] == "exit", (
+            f"调用在飞行中被交叠:{eng.events[i:i + 2]}"
+        )
 
 
 def test_build_engine_tp2_uses_sharded_tp_model(monkeypatch):
@@ -248,3 +292,157 @@ def test_tp_parent_guard_kills_orphan(tmp_path):
     assert state in ("GONE", "Z"), (
         f"孤儿未被 guard 杀死(/proc/{c_pid} state={state!r})"
     )
+
+
+# ---------- 真 server e2e(双卡;M5T4 审查补课)----------
+
+
+def _make_serve_ckpt(ckpt_dir) -> None:
+    """tiny ckpt:config.json + model.safetensors + tokenizer.json(拷 8B,
+    e2e 用 token-ids prompt 不触发 encode;decode 对任意 id 合法)。"""
+    import json as _json
+    import shutil
+
+    import torch as _torch
+    from safetensors.torch import save_file
+
+    from acorninfer.config import Qwen3Config as _Cfg
+    from acorninfer.models.qwen3 import Qwen3ForCausalLM as _Full
+
+    cfg = _Cfg.tiny()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "config.json").write_text(_json.dumps(dict(
+        num_hidden_layers=cfg.num_hidden_layers,
+        hidden_size=cfg.hidden_size,
+        num_attention_heads=cfg.num_attention_heads,
+        num_key_value_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        intermediate_size=cfg.intermediate_size,
+        rms_norm_eps=cfg.rms_norm_eps,
+        rope_theta=cfg.rope_theta,
+        vocab_size=cfg.vocab_size,
+        tie_word_embeddings=cfg.tie_word_embeddings,
+        bos_token_id=cfg.bos_token_id,
+        eos_token_id=list(cfg.eos_token_id),
+    )))
+    _torch.manual_seed(0)
+    full = _Full(cfg)
+    sd = {k: v.contiguous() for k, v in full.state_dict().items()}
+    save_file(sd, str(ckpt_dir / "model.safetensors"))
+    shutil.copy("/home/ernest/model-weight/Qwen3-8B/tokenizer.json",
+                ckpt_dir / "tokenizer.json")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="TP=2 需要 2 张卡")
+def test_tp2_server_e2e_http(tmp_path):
+    """真 uvicorn --tp 2 起服 + 真 HTTP 首条 /v1/completions(M5T4 审查
+    Blocker 的结构性漏洞:此前无任何测试覆盖真 server 双卡路径——Blocker
+    (rank1 模型被 cfg.device 放上 GPU0,comm/张量跨卡脑裂死锁)正是漏网)。
+
+    断言面:health 就绪 → 首条 completions 200 + token 合理 → 复发请求
+    仍 200 → 收服干净(T6 纪律:定向 kill、端口闭、双卡回落)。
+    """
+    import httpx
+    import socket as _socket
+    import subprocess as _subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    ckpt = tmp_path / "serve_ckpt"
+    _make_serve_ckpt(ckpt)
+
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "0,1"}
+    log0 = (tmp_path / "rank0.log").open("w")   # rank1 继承同 stdio
+    proc = _subprocess.Popen(
+        [_sys.executable, "-m", "acorninfer.server",
+         "--model-dir", str(ckpt), "--tp", "2", "--port", str(port)],
+        cwd=str(root), env=env, stdout=log0, stderr=log0,
+    )
+    rank1_pid = None
+    try:
+        # health 轮询(就绪语境 = Blocker 复现条件的一部分)
+        deadline = time.time() + 90
+        ready = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(f"server 提前退出 rc={proc.returncode}")
+            try:
+                r = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except (httpx.HTTPError, OSError):
+                pass
+            time.sleep(0.3)
+        assert ready, "server 90s 未就绪"
+
+        # 找 rank1(spawn 子进程)供收服断言
+        out = _subprocess.run(["ps", "--ppid", str(proc.pid), "-o", "pid="],
+                              capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            cmd = _subprocess.run(
+                ["ps", "-p", line.strip(), "-o", "cmd="],
+                capture_output=True, text=True).stdout
+            if "spawn_main" in cmd:
+                rank1_pid = int(line.strip())
+        assert rank1_pid is not None, "未找到 rank1 子进程"
+
+        # 首条 completions(Blocker 场景)
+        r = httpx.post(
+            f"http://127.0.0.1:{port}/v1/completions",
+            json={"model": "tiny", "prompt": [7, 11, 13, 200, 45],
+                  "max_tokens": 4, "temperature": 0},
+            timeout=60,
+        )
+        assert r.status_code == 200, r.text[:400]
+        body = r.json()
+        choice = body["choices"][0]
+        assert choice["finish_reason"] == "length"
+        assert body["usage"]["completion_tokens"] == 4
+        assert body["usage"]["prompt_tokens"] == 5
+
+        # 复发请求(非仅首条)
+        r2 = httpx.post(
+            f"http://127.0.0.1:{port}/v1/completions",
+            json={"model": "tiny", "prompt": [123, 5, 77, 9, 21],
+                  "max_tokens": 3, "temperature": 0},
+            timeout=60,
+        )
+        assert r2.status_code == 200, r2.text[:400]
+        assert r2.json()["usage"]["completion_tokens"] == 3
+    finally:
+        # T6 收服纪律:SIGTERM → 限期 → SIGKILL 定向;禁 pkill -f
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except _subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        if rank1_pid is not None:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if not _Path(f"/proc/{rank1_pid}").exists():
+                    break
+                time.sleep(0.2)
+            else:
+                os.kill(rank1_pid, 9)  # PDEATHSIG 失守 → 定向硬杀
+        log0.close()
+
+    # 端口闭 + 双卡回落(compute-apps 按 pid 断言,不受同机他人进程干扰)
+    try:
+        _socket.create_connection(("127.0.0.1", port), timeout=1)
+        raise AssertionError(f"端口 {port} 在收服后仍开放")
+    except OSError:
+        pass
+    out = _subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        capture_output=True, text=True).stdout
+    live = {int(x) for x in out.split() if x.isdigit()}
+    assert proc.pid not in live, "rank0 仍占 GPU"
+    assert rank1_pid not in live, "rank1 仍占 GPU"

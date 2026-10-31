@@ -69,42 +69,61 @@ class TPLink:
 
 
 class TPEngine:
-    """rank0 命令壳:每个公开入口先广播 (cmd, payload) 再本地执行。
+    """rank0 命令壳:submit/step/drop 先广播 (cmd, payload) 再本地执行。
 
-    wire 与 tp_rank1_loop 一一对应(submit/step/drop/pending/balanced/fini);
-    server 所需属性(tokenizer/seqs)直通。
+    wire 只载**变更类**命令(submit/step/drop/fini)——pending/balanced 等
+    查询 rank0 本地作答,不上广播线(SPMD 两 rank 状态同构,rank1 不需要
+    知道查询结果;查询上线只会增加集合操作数,配对面毫无收益)。
+
+    单飞锁(self._flight):任一时刻至多一个壳方法在飞行。server 的
+    asyncio.Lock 已把 submit/step/drop 串行(锁跨 to_thread(step) 持有),
+    但那是调用方纪律——壳自己保证集合操作 issue 顺序 = 程序序,不依赖
+    任何调用方;否则两个线程并发进壳(如未来的健康检查直呼 has_pending)
+    会让 rank0 的广播发射序不确定,而 rank1 单线程按己序消费,集合配对
+    错位 → 死锁。
+
+    已知项(M5T4 审查 Minor-1,本任务不改):rank1 对端死亡时 rank0 无快
+    失败——卡在下一集合调用直到 NCCL watchdog(~600s)超时。有界可忍
+    (正确性哨兵 check_views 的硬退路径不受影响;生产由 T6 PID kill 纪律
+    兜底)。
     """
 
     def __init__(self, engine, link: TPLink):
         assert link.rank == 0, "TPEngine 壳只装在 rank0"
         self.engine = engine
         self.link = link
+        self._flight = threading.Lock()
 
     def submit(self, prompt_ids, sampling, *, max_tokens, eos_ids=None):
-        self.link.command(
-            ("submit", (list(prompt_ids), sampling, max_tokens, eos_ids)))
-        return self.engine.submit(prompt_ids, sampling, max_tokens=max_tokens,
-                                  eos_ids=eos_ids)
+        with self._flight:
+            self.link.command(
+                ("submit", (list(prompt_ids), sampling, max_tokens, eos_ids)))
+            return self.engine.submit(prompt_ids, sampling,
+                                      max_tokens=max_tokens, eos_ids=eos_ids)
 
     def step(self):
-        self.link.command(("step", None))
-        return self.engine.step()
+        with self._flight:
+            self.link.command(("step", None))
+            return self.engine.step()
 
     def drop(self, seq_id):
-        self.link.command(("drop", seq_id))
-        return self.engine.drop(seq_id)
+        with self._flight:
+            self.link.command(("drop", seq_id))
+            return self.engine.drop(seq_id)
 
     def has_pending(self):
-        self.link.command(("pending", None))
-        return self.engine.has_pending()
+        # 查询本地作答:不上广播线(见类 docstring wire 收窄)
+        with self._flight:
+            return self.engine.has_pending()
 
     def assert_balanced(self):
-        self.link.command(("balanced", None))
-        self.engine.assert_balanced()
+        with self._flight:
+            self.engine.assert_balanced()
 
     def shutdown(self):
         """FINI:广播 rank1 优雅收尾(rank0 侧退出路径调用)。"""
-        self.link.command(("fini", None))
+        with self._flight:
+            self.link.command(("fini", None))
 
     @property
     def tokenizer(self):
@@ -116,7 +135,8 @@ class TPEngine:
 
 
 def tp_rank1_loop(engine, link: TPLink) -> None:
-    """rank1 命令循环(消费端):对称执行到 fini。"""
+    """rank1 命令循环(消费端):对称执行到 fini。wire 与 TPEngine 一一对应
+    (仅变更类命令;查询不上线)。"""
     while True:
         cmd, payload = link.command(None)
         if cmd == "submit":
@@ -127,10 +147,6 @@ def tp_rank1_loop(engine, link: TPLink) -> None:
             engine.step()
         elif cmd == "drop":
             engine.drop(payload)
-        elif cmd == "pending":
-            engine.has_pending()
-        elif cmd == "balanced":
-            engine.assert_balanced()
         elif cmd == "fini":
             return
         else:
