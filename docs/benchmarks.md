@@ -378,6 +378,30 @@ GPU 自用时间拆账(op 聚合,Self CUDA = 各自 kernel,行间不双计;10 �
 4. 旁证:str-prompt smoke(1 条,`"The capital of France is"`,max_tokens=4,stream)流式正常产出(`Paris`/`.`/` The`/` capital`)→ server 本体可用,不匹配纯在客户端协议。二次定向 kill 实际 serve 进程(nohup 包装 PID 失效,M4.1 节口径注记 3 同情形)后 GPU 1 回落 4 MiB、`nvidia-smi --query-compute-apps` 为空。
 5. 后果:HTTP vs in-process 的 TTFT/tok/s 方法学差当日**无实测数字**;M4.1 遗留的 C=8 TTFT 0.1454 s vs vLLM 0.0809 s 重新归因无从量化,维持 M4.1 节记录原状。修复需动 server(补 token-id 输入契约)或 bench_remote(换文本协议)——均在本任务文件范围(2 脚本 + docs)之外,留裁决。
 
+### HTTP 方法学对齐腿补账(token-id 契约落地后,2026-10-31,`scripts/bench_remote.py` → 本引擎 server,真机输出)
+
+上节第 5 点的「留裁决」已过期:server token-id prompt 契约当日落地(commit 67a6224,`prompt: str | list[int]`——token-id 数组直进引擎不重分词 + 流式 include_usage 尾包补齐,`bench_remote` 零改动直投),该腿全档出数,补档如下。
+
+命令(与上节计划命令逐字一致):服务 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.server --port 8200`(全默认;EngineConfig 默认 sdpa、无 fused、无 graph),压测 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:8200 --concurrency 1 4 8`。
+
+RESULT 行逐字(stdout;`RESULT-VLLM` 前缀为 `bench_remote` 固定标签,此处指向本引擎 server):
+
+- `RESULT-VLLM C=1 ttft_p50=0.0380s ttft_mean=0.0380s tpot_mean=27.99ms tok_s=35.33`
+- `RESULT-VLLM C=4 ttft_p50=0.1244s ttft_mean=0.1024s tpot_mean=43.86ms tok_s=86.92`
+- `RESULT-VLLM C=8 ttft_p50=0.1947s ttft_mean=0.1755s tpot_mean=60.83ms tok_s=109.83`
+
+HTTP 腿(本引擎,eager,8200 端口)与 in-process eager 腿(M4.1 段二节当日归档引用)对照——只并列陈述(比值列为算术),归因判读留控制器:
+
+| 并发 | HTTP tok/s | in-process eager tok/s | in-process ÷ HTTP | HTTP TTFT p50 | in-process TTFT p50 | HTTP TPOT mean | in-process TPOT mean |
+|---|---|---|---|---|---|---|---|
+| 1 | 35.33 | 50.84 | 1.4× | 0.0380 s | 0.0347 s | 27.99 ms | 19.18 ms |
+| 4 | 86.92 | 176.38 | 2.0× | 0.1244 s | 0.0766 s | 43.86 ms | 20.94 ms |
+| 8 | 109.83 | 283.16 | **2.6×** | 0.1947 s | 0.1440 s | 60.83 ms | 21.12 ms |
+
+口径注记(照 M4.1 节同款):同日同机(物理 GPU 1,RTX 4090);HTTP 腿 TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径,产品真实路径);prompt 为同一批随机 token ids(`_prompts` 同 seed=20261027,token-id 数组直投、两端零分词差);temperature=0、max_tokens=32,计时前 1 条 warmup 不计入。
+
+复测稳定性:审查复跑三档 tok_s 34.58 / 87.83 / 114.44,对主跑 35.33 / 86.92 / 109.83 差 −2.1% / +1.0% / +4.2%(**审查复跑 ±4.2% 带内**)。
+
 ### 段 0 补充:半宽 GEMM 核选矩阵(2026-10-31,`scripts/phase0_spike.py --gemm-variants`,真机输出)
 
 动机:上节 decode RATIO 0.373 未分离「切半固有损失 vs cuBLAS 对该形状选核差」——decode M=7 GEMM 是权重流搬(内存受限),Task 0 实测全宽 33.5 MB / 20.8 µs ≈ 1.6 TB/s、半宽 16.8 MB / 27.4 µs ≈ 0.61 TB/s,纯权重流模型下两者带宽应相同、时间应随 N 减半。本矩阵对每格取四个核选变体的时间最好者,给「核选可修」留实证空间。
