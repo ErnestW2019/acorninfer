@@ -33,6 +33,18 @@
   effbw = 权重字节(N×K×2B)/时间;M≥256 档为算术+访存混合,带宽仅供参考。
   末尾汇总表 + `RATIO' half/full=M=7 最好变体口径`(0.5×us_full/us_half,
   与 Task 0 TFLOPS 口径同构可比)+ prefill 全宽对照 TFLOPS 行。
+- --gemm-cold 单卡模式(不需 torchrun;argv 分流,既有两模式零改动):
+  CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/phase0_spike.py --gemm-cold
+  冷权重裁决口径:decode 真实四类 GEMM(qkv/o/gate_up/down,N/K 切半同引擎
+  TP 切法)每类 36 套独立权重轮转(>72MB L2,强制 HBM),F.linear bf16,
+  M=7,warmup 一整轮 + 计 30 轮 ÷(30×36);同格输出单套复用 hot 对照列
+  (复现旧微基准的 L2 伪象——热复用 ≤72MB 权重根本不走 HBM,Task 0 的
+  RATIO 0.373 即此伪象,作废)。输出行
+  `GEMMCOLD <class> full=<us> hot_full=<us> half=<us> hot_half=<us> ratio=<t_half/t_full>`
+  + 每步 GEMM 总账(36 层)+ TP=2 投影行(假设注明:非 GEMM 不变、
+  allreduce 73×17.84µs 串行、锚 M4.1 单卡 graph GPU 19.81 ms/步)。
+  模式收编自控制器裁决测量脚本 /tmp/opencode/gemm_cold.py(逻辑照搬,
+  输出行格式向本脚本既有风格对齐)。
 
 实测注记(首跑发现,脚本按此绕行):CUDAGraph 捕获 NCCL allreduce 后,
 进程组的收尾路径(barrier/destroy_process_group/解释器退出时 graph 析构)
@@ -56,6 +68,17 @@ GEMM_SHAPES = [(7, 4096, 2048), (7, 4096, 3072), (7, 4096, 4096), (1024, 4096, 2
 GEMMV_MS = [7, 8, 16, 64, 256, 1024]
 GEMMV_NS = [2048, 3072, 4096]
 GEMMV_K = 4096
+
+# 冷权重裁决口径:引擎真实四类 GEMM 形状,(类名, N_full, K_full, N_half, K_half)
+# —— F.linear(x[M,K], W[N,K]);qkv/gate_up 输出列切(N 半),o/down 行并行输入切(K 半)
+GEMMCOLD_CLASSES = [
+    ("qkv", 6144, 4096, 3072, 4096),
+    ("o", 4096, 4096, 4096, 2048),
+    ("gate_up", 24576, 4096, 12288, 4096),
+    ("down", 4096, 12288, 4096, 6144),
+]
+GEMMCOLD_LAYERS = 36   # 36 套独立权重轮转 = 36 层,任何一套本轮内不重访
+GEMMCOLD_REPS = 30     # 计时 30 轮 × 36 次,总时 ÷ (30×36)
 
 
 def gemm_variants_main() -> None:
@@ -124,9 +147,81 @@ def gemm_variants_main() -> None:
           flush=True)
 
 
+def gemm_cold_main() -> None:
+    """--gemm-cold 单卡模式:冷权重(36 套轮转,>72MB L2)半宽 vs 全宽 GEMM。
+
+    解 --gemm-variants/双卡 GEMM 段的热 L2 伪象:微基准热复用单套权重,
+    ≤72MB 根本没走 HBM,带宽虚高、半宽塌方被夸大(Task 0 RATIO 0.373 即
+    此伪象,作废)。收编自控制器裁决测量脚本 /tmp/opencode/gemm_cold.py
+    (逻辑照搬):每类形状预分配 36 套独立权重轮流使用(本轮内不重访),
+    F.linear(引擎真实路径)bf16,M=7,warmup 一整轮 + torch.cuda.Event
+    计 30 轮 ÷ (30×36);hot 对照 = 同形状单套复用。TP 投影假设:非 GEMM
+    GPU 时间不变、allreduce 73×17.84µs 串行(--gemm-variants 轮 57KiB graph
+    档)、锚 M4.1 段一 profiler 单卡 graph GPU 19.81 ms/步。"""
+    dev = "cuda:0"  # CUDA_VISIBLE_DEVICES=1 下即物理 GPU 1
+    torch.manual_seed(0)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def bench_linear(x, ws):
+        """ws 轮流 F.linear:warmup 一整轮(也把 L2 置成"刚用过最后一张"
+        状态)+ 计 GEMMCOLD_REPS 轮,返回 µs/次(总时 ÷ (reps×len(ws)))。"""
+        for w in ws:
+            F.linear(x, w)
+        torch.cuda.synchronize()
+        start.record()
+        for _ in range(GEMMCOLD_REPS):
+            for w in ws:
+                F.linear(x, w)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) * 1000.0 / (GEMMCOLD_REPS * len(ws))
+
+    m = 7
+    print(f"GEMMCOLD M={m} bf16 F.linear; cold={GEMMCOLD_LAYERS} 权重轮转"
+          f"(>72MB L2) hot=单套复用; REPS={GEMMCOLD_REPS}", flush=True)
+    tot = {"full": 0.0, "half": 0.0}
+    bws = []
+    for name, nf, kf, nh, kh in GEMMCOLD_CLASSES:
+        row = {}
+        for tag, n, k in (("full", nf, kf), ("half", nh, kh)):
+            x = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+            ws = [torch.randn(n, k, dtype=torch.bfloat16, device=dev)
+                  for _ in range(GEMMCOLD_LAYERS)]
+            cold = bench_linear(x, ws)
+            hot = bench_linear(x, ws[:1])
+            row[tag] = (cold, hot)
+            tot[tag] += cold
+            bws.append((name, tag, n * k * 2 / (cold * 1e-6) / 1e9))
+            del ws
+            torch.cuda.empty_cache()
+        print(f"GEMMCOLD {name} full={row['full'][0]:.2f} "
+              f"hot_full={row['full'][1]:.2f} half={row['half'][0]:.2f} "
+              f"hot_half={row['half'][1]:.2f} "
+              f"ratio={row['half'][0] / row['full'][0]:.3f}", flush=True)
+    print("GEMMCOLD bw(GB/s,权重字节/冷时间): "
+          + " ".join(f"{name}-{tag}={gb:.0f}" for name, tag, gb in bws), flush=True)
+    full_ms = tot["full"] * GEMMCOLD_LAYERS / 1000
+    half_ms = tot["half"] * GEMMCOLD_LAYERS / 1000
+    print(f"GEMMCOLD per-step total (36 layers): full={full_ms:.2f}ms "
+          f"half={half_ms:.2f}ms ratio={half_ms / full_ms:.3f}", flush=True)
+    single_gpu = 19.81
+    allreduce_ms = 73 * 17.84e-3
+    gemm_share = full_ms / single_gpu
+    non_gemm = single_gpu * (1 - gemm_share)
+    tp_gpu = half_ms + allreduce_ms + non_gemm
+    print(f"GEMMCOLD projection: single_gpu={single_gpu}ms "
+          f"gemm_share~{gemm_share * 100:.0f}% allreduce~{allreduce_ms:.2f}ms "
+          f"-> TP2 decode GPU ~{tp_gpu:.2f}ms/step "
+          f"(speedup ~{single_gpu / tp_gpu:.2f}x on GPU time)", flush=True)
+
+
 def main() -> None:
     if "--gemm-variants" in sys.argv:
         gemm_variants_main()
+        return
+    if "--gemm-cold" in sys.argv:
+        gemm_cold_main()
         return
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])

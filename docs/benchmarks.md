@@ -431,3 +431,37 @@ best 变体逐格(µs | effbw GB/s | 变体;当日第二轮,与前一轮完整�
 2. **但 RATIO' 0.533 仍远离纯权重流理想(该口径下理想 = 1.0)**:半宽时间 18.74 µs 仅比全宽 19.97 µs 省 6%(权重字节省 50%);895 GB/s 仅为同格全宽 1680 GB/s 的 53%。剩余缺口归因 M=7 小 N GEMV 的每调用固定开销/小形状利用率地板(推断,未单独计时)。
 3. M 增大后核选空间兑现:M=64 档半宽 effbw 1290 GB/s(N=2048)/1488 GB/s(N=3072,接近计划背景的 ~1.5 TB/s 参考线),M=7→64 半宽时间 18.74 → 13.00 µs 不升反降;M=7 达标与否(能否经 custom kernel 到 ~1.5 TB/s)留裁决。
 4. prefill 全宽对照(补 Task 0 RATIO 分母):M=1024 N=4096 = 173.88 TFLOPS,与 Task 0 半宽 169.78 TFLOPS 同带 —— prefill 大 M 档切半无塌方(与上节 RATIO 注一致)。
+
+### 段 0 补充二:冷权重 GEMM 裁决口径(L2 伪象排除)(2026-10-31,`scripts/phase0_spike.py --gemm-cold`,真机输出)
+
+**上两节的热口径作废原因(实测伪象)**:微基准热复用单套权重,而 decode 四类 GEMM 单套权重 16.8–201 MB,≤72MB(4090 L2)者根本没走 HBM——带宽虚高、半宽塌方被夸大,Task 0 的 RATIO 0.373 与上节 RATIO' 0.533 均为热 L2 口径。冷口径:每类形状预分配 36 套独立权重轮流使用(= 36 层,本轮内不重访,轮转集 > L2,强制 HBM),F.linear(引擎真实路径)bf16、M=7,warmup 一整轮 + 计 30 轮 ÷(30×36);同格带单套复用 hot 对照。测量由控制器执行并裁决,本节脚本为其测量脚本(`/tmp/opencode/gemm_cold.py`)收编进 `phase0_spike.py --gemm-cold` 的复跑归档(来源透明;收编后复跑与控制器数字同带,见下)。
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/phase0_spike.py --gemm-cold`(单卡,无 torchrun;跑前 GPU 1 = 4 MiB / 0 进程)。四类形状按引擎 TP 切法:qkv/gate_up 输出列切(N 半)、o/down 行并行输入切(K 半)。
+
+冷口径逐类(stdout 行逐字):
+
+- `GEMMCOLD qkv full=56.27 hot_full=22.15 half=31.25 hot_half=19.69 ratio=0.555`
+- `GEMMCOLD o full=38.56 hot_full=18.23 half=20.46 hot_half=10.41 ratio=0.531`
+- `GEMMCOLD gate_up full=216.52 hot_full=216.44 half=117.17 hot_half=116.01 ratio=0.541`
+- `GEMMCOLD down full=123.25 hot_full=124.04 half=57.85 hot_half=26.11 ratio=0.469`
+- `GEMMCOLD bw(GB/s,权重字节/冷时间): qkv-full=895 qkv-half=805 o-full=870 o-half=820 gate_up-full=930 gate_up-half=859 down-full=817 down-half=870`
+
+| 类 | 切法 | full 冷 µs(hot) | half 冷 µs(hot) | ratio t_half/t_full | 冷 GB/s full→half |
+|---|---|---|---|---|---|
+| qkv | N 6144→3072 | 56.27(22.15) | 31.25(19.69) | 0.555 | 895→805 |
+| o | K 4096→2048 | 38.56(18.23) | 20.46(10.41) | 0.531 | 870→820 |
+| gate_up | N 24576→12288 | 216.52(216.44) | 117.17(116.01) | 0.541 | 930→859 |
+| down | K 12288→6144 | 123.25(124.04) | 57.85(26.11) | 0.469 | 817→870 |
+
+内证(hot vs cold 分化精确跟随权重字节 vs 72MB L2,均为实测):gate_up 单套 201 MB、down-full 单套 101 MB **>** L2 → hot ≈ cold(216.44/216.52、124.04/123.25,伪象消失);qkv 50 MB、o 34 MB、down-half 50 MB **<** L2 → hot 快 1.5–2.2×(22.15/56.27、10.41/20.46、26.11/57.85)。Task 0 尖刀两形状([7,4096]×[4096,2048] = 16.8 MB、×4096,4096 = 33.6 MB)均在 L2 内,其 0.373 系伪象。冷口径下半宽/全宽带宽同带(805–870 GB/s 两侧互见),切半时间比 ≈ 字节比——权重流模型在 HBM 口径下成立。
+
+每步 GEMM 总账 + TP=2 投影(stdout 行逐字;投影为算术非实测,假设注明:非 GEMM GPU 时间不变、allreduce 73×17.84 µs 串行、锚 M4.1 段一单卡 graph GPU 19.81 ms/步):
+
+- `GEMMCOLD per-step total (36 layers): full=15.65ms half=8.16ms ratio=0.522`
+- `GEMMCOLD projection: single_gpu=19.81ms gemm_share~79% allreduce~1.30ms -> TP2 decode GPU ~13.63ms/step (speedup ~1.45x on GPU time)`
+
+冷口径 GEMM 占单卡 decode GPU 的 79%(15.65/19.81),与 M4 profiler 账目「GEMM 主导 decode GPU」一致(M4 口径 88.55%,含 profiler 采样差)。
+
+**复跑 vs 控制器测量(收编验证,同带)**:四类 ratio 0.555/0.531/0.541/0.469 对控制器 0.553/0.530/0.541/0.469;总账 15.65/8.16 ms vs 15.64/8.15 ms(ratio 0.522 vs 0.521);投影 13.63 ms / 1.45× vs ~13.6 ms / ~1.45×——比值同位,绝对值差 <0.7%。
+
+**判定数据小结(裁决行,控制器已裁)**:① decode allreduce 57 KiB 图内 17.84 µs,< 50 µs 参考门;② NCCL allreduce CUDA graph 捕获四档全成(零 GRAPH_CAPTURE_FAIL);③ 冷权重半宽/全宽 GEMM ratio 0.522(四类 0.469–0.555)≥ 40% 门。**三线全过,控制器判定:TP=2 GO。**
