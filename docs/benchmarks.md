@@ -377,3 +377,33 @@ GPU 自用时间拆账(op 聚合,Self CUDA = 各自 kernel,行间不双计;10 �
 3. 根因(协议不匹配,非 CLI 参数拼写):`bench_remote` 以 token-id 数组直投 `prompt`(M3 基线节明言「绕开文本分词往返」,vLLM affordance);本引擎 `PromptCompletionRequest.prompt: str` 仅收文本,tokenizer 编码在服务端边界(`server.py` prompt 字段契约)。随机 id 序列经 str 传递再重编码不可保证等值(BPE 边界效应),无诚实绕行。
 4. 旁证:str-prompt smoke(1 条,`"The capital of France is"`,max_tokens=4,stream)流式正常产出(`Paris`/`.`/` The`/` capital`)→ server 本体可用,不匹配纯在客户端协议。二次定向 kill 实际 serve 进程(nohup 包装 PID 失效,M4.1 节口径注记 3 同情形)后 GPU 1 回落 4 MiB、`nvidia-smi --query-compute-apps` 为空。
 5. 后果:HTTP vs in-process 的 TTFT/tok/s 方法学差当日**无实测数字**;M4.1 遗留的 C=8 TTFT 0.1454 s vs vLLM 0.0809 s 重新归因无从量化,维持 M4.1 节记录原状。修复需动 server(补 token-id 输入契约)或 bench_remote(换文本协议)——均在本任务文件范围(2 脚本 + docs)之外,留裁决。
+
+### 段 0 补充:半宽 GEMM 核选矩阵(2026-10-31,`scripts/phase0_spike.py --gemm-variants`,真机输出)
+
+动机:上节 decode RATIO 0.373 未分离「切半固有损失 vs cuBLAS 对该形状选核差」——decode M=7 GEMM 是权重流搬(内存受限),Task 0 实测全宽 33.5 MB / 20.8 µs ≈ 1.6 TB/s、半宽 16.8 MB / 27.4 µs ≈ 0.61 TB/s,纯权重流模型下两者带宽应相同、时间应随 N 减半。本矩阵对每格取四个核选变体的时间最好者,给「核选可修」留实证空间。
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/phase0_spike.py --gemm-variants`(单卡模式,无 torchrun;跑前 GPU 1 = 4 MiB / 0 进程)。形状矩阵 M ∈ {7,8,16,64,256,1024} × N ∈ {2048,3072,4096},K=4096,bf16;每变体 warmup 10 + 计 50(cuda.Event 均值)。
+
+变体定义(脚本按此实现,如实):权重 w 均按模型 nn.Linear 布局连续存 [N,K];`matmul` = `torch.matmul(a, w.t())`(.t() 为 view;规格字面 `a @ w` 在 w [N,K] 下不成形,按模型实际调用路径实现)、`linear` = `F.linear(a, w)`(无 bias)、`pad16` = 仅 M=7,输入零填充到 16 行 matmul 后切片(计 16 行 GEMM 总时)、`transposed` = `w.t().contiguous()` → [K,N](预处理不计入)后 `a @ w_t`。effbw = 权重字节(N×K×2B)/时间;M≥256 档为算术+访存混合,带宽仅供参考。
+
+best 变体逐格(µs | effbw GB/s | 变体;当日第二轮,与前一轮完整跑时间差 <1%):
+
+| M\N | N=2048 | N=3072 | N=4096 |
+|---|---|---|---|
+| 7 | 18.74 / 895 / linear | 19.74 / 1275 / linear | 19.97 / 1680 / linear |
+| 8 | 18.70 / 897 / matmul | 19.80 / 1271 / linear | 20.03 / 1675 / linear |
+| 16 | 19.54 / 858 / linear | 20.66 / 1218 / matmul | 21.38 / 1569 / linear |
+| 64 | 13.00 / 1290 / matmul | 16.92 / 1488 / transposed | 19.54 / 1717 / transposed |
+| 256 | 33.44 / 502* / transposed | 54.78 / 459* / transposed | 56.71 / 592* / transposed |
+| 1024 | 109.34 / 153* / linear | 164.17 / 153* / transposed | 197.61 / 170* / transposed |
+
+\* 混合口径,仅供参考。M=7 档 pad16(填充到 16 行)三档均未胜出。
+
+汇总行逐字(stdout):`RATIO' half/full=0.5*19.97/18.74=0.533(M=7 最好变体,TFLOPS 口径与 Task 0 同构)`;`CONTROL prefill M=1024 half(2048)tflops=157.12 full(4096)tflops=173.88(补 Task 0 prefill 全宽对照)`。
+
+判读(实测数字 + 标注推断):
+
+1. **塌方主体为核选可修:RATIO 0.373 → RATIO' 0.533**(当日两轮 0.537/0.533)。Task 0 GEMM 段的 B 为连续 [K,N] 布局,同卡同形状实测折合 27.4 µs(算术换算自 4.28 TFLOPS);本轮 TN 路径(linear = 权重 [N,K] + .t() 视图,即引擎 F.linear 实际布局)M=7 半宽 18.74 µs / 895 GB/s —— 布局/选核一项 ≈9 µs(−31%)(两数跨脚本对照,判读)。
+2. **但 RATIO' 0.533 仍远离纯权重流理想(该口径下理想 = 1.0)**:半宽时间 18.74 µs 仅比全宽 19.97 µs 省 6%(权重字节省 50%);895 GB/s 仅为同格全宽 1680 GB/s 的 53%。剩余缺口归因 M=7 小 N GEMV 的每调用固定开销/小形状利用率地板(推断,未单独计时)。
+3. M 增大后核选空间兑现:M=64 档半宽 effbw 1290 GB/s(N=2048)/1488 GB/s(N=3072,接近计划背景的 ~1.5 TB/s 参考线),M=7→64 半宽时间 18.74 → 13.00 µs 不升反降;M=7 达标与否(能否经 custom kernel 到 ~1.5 TB/s)留裁决。
+4. prefill 全宽对照(补 Task 0 RATIO 分母):M=1024 N=4096 = 173.88 TFLOPS,与 Task 0 半宽 169.78 TFLOPS 同带 —— prefill 大 M 档切半无塌方(与上节 RATIO 注一致)。

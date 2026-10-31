@@ -18,6 +18,21 @@
   全宽对照 [7,4096]x[4096,4096]、prefill 半宽 [1024,4096]x[4096,2048];
   RATIO half/full 仅 decode 档可比(N=2048 半宽 vs N=4096 全宽)。
 - 两 rank 输出交错,每行带 [rankN] 前缀;入档以 rank0 为准,rank1 顺手对一致。
+- --gemm-variants 单卡模式(不需 torchrun;main 按 argv 分流,双卡路径原样):
+  CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/phase0_spike.py --gemm-variants
+  形状矩阵 M ∈ {7,8,16,64,256,1024} × N ∈ {2048,3072,4096},K=4096,bf16;
+  每格四个核选变体取时间最好者(w 按 nn.Linear 布局 [N,K] 连续存放):
+    matmul     torch.matmul(a, w.t()) —— .t() 是 view;规格字面 `a @ w` 在
+               w [N,K] 下不成形,按模型实际调用路径(.t() 视图,TN 布局)实现
+    linear     F.linear(a, w) —— 无 bias 线性层 dispatcher 路径
+    pad16      仅 M=7:输入零填充到 16 行 matmul(w.t())后切片(计 16 行 GEMM
+               总时;填充缓冲步外预填零,切片为 view 不产 kernel)
+    transposed w.t().contiguous() → [K,N](预处理不计入)后 a @ w_t —— NN 布局
+  每变体 warmup 10 + 计 50(cuda.Event 均值);输出行
+  `GEMMV M=<m> N=<n> best=<variant> us=<v> effbw=<GB/s>`,
+  effbw = 权重字节(N×K×2B)/时间;M≥256 档为算术+访存混合,带宽仅供参考。
+  末尾汇总表 + `RATIO' half/full=M=7 最好变体口径`(0.5×us_full/us_half,
+  与 Task 0 TFLOPS 口径同构可比)+ prefill 全宽对照 TFLOPS 行。
 
 实测注记(首跑发现,脚本按此绕行):CUDAGraph 捕获 NCCL allreduce 后,
 进程组的收尾路径(barrier/destroy_process_group/解释器退出时 graph 析构)
@@ -34,12 +49,85 @@ import sys
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 ALLOT_SIZES_B = [8 * 1024, 57 * 1024, 1024 * 1024, 8 * 1024 * 1024]
 GEMM_SHAPES = [(7, 4096, 2048), (7, 4096, 3072), (7, 4096, 4096), (1024, 4096, 2048)]
+GEMMV_MS = [7, 8, 16, 64, 256, 1024]
+GEMMV_NS = [2048, 3072, 4096]
+GEMMV_K = 4096
+
+
+def gemm_variants_main() -> None:
+    """--gemm-variants 单卡模式:同形状多核选变体取最好(段 0 补充)。
+
+    动机:Task 0 的 decode RATIO 0.373 未分离「切半固有损失 vs cuBLAS
+    对该形状选核差」—— M=7 decode GEMM 是权重流搬(内存受限),变体
+    矩阵给核选留修复空间。变体语义见模块 docstring。"""
+    dev = "cuda:0"  # CUDA_VISIBLE_DEVICES=1 下即物理 GPU 1
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def time_us(fn, warmup=10, iters=50) -> float:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) * 1000 / iters  # µs
+
+    results = {}
+    for m in GEMMV_MS:
+        for n in GEMMV_NS:
+            a = torch.randn(m, GEMMV_K, dtype=torch.bfloat16, device=dev)
+            w = torch.randn(n, GEMMV_K, dtype=torch.bfloat16, device=dev)
+            w_t = w.t().contiguous()  # transposed 变体的预处理,不计入
+            variants = {
+                "matmul": lambda: torch.matmul(a, w.t()),
+                "linear": lambda: F.linear(a, w),
+                "transposed": lambda: torch.matmul(a, w_t),
+            }
+            if m == 7:
+                a_pad = torch.zeros(16, GEMMV_K, dtype=torch.bfloat16, device=dev)
+                a_pad[:m] = a
+                variants["pad16"] = lambda: torch.matmul(a_pad, w.t())[:m]
+            times = {name: time_us(fn) for name, fn in variants.items()}
+            best = min(times, key=times.get)
+            us = times[best]
+            bw = n * GEMMV_K * 2 / (us * 1e-6) / 1e9  # 权重字节口径(us→s)
+            results[(m, n)] = (best, us, bw)
+            print(f"GEMMV M={m} N={n} best={best} us={us:.2f} effbw={bw:.0f}",
+                  flush=True)
+
+    print("\nSUMMARY bf16 best-variant, cell = us | effbw GB/s(权重字节口径;"
+          "M>=256 为算术+访存混合,带宽仅供参考)", flush=True)
+    print("M\\N      " + "".join(f"{'N=%d' % n:>28}" for n in GEMMV_NS), flush=True)
+    for m in GEMMV_MS:
+        cells = []
+        for n in GEMMV_NS:
+            best, us, bw = results[(m, n)]
+            cells.append(f"{us:8.2f}/{bw:6.0f}/{best:<10}")
+        print(f"{m:>5}    " + "".join(f"{c:>28}" for c in cells), flush=True)
+
+    half_us = results[(7, 2048)][1]
+    full_us = results[(7, 4096)][1]
+    print(f"RATIO' half/full=0.5*{full_us:.2f}/{half_us:.2f}="
+          f"{0.5 * full_us / half_us:.3f}(M=7 最好变体,TFLOPS 口径与 Task 0 同构)",
+          flush=True)
+    tf_half = 2.0 * 1024 * GEMMV_K * 2048 / (results[(1024, 2048)][1] * 1e-6) / 1e12
+    tf_full = 2.0 * 1024 * GEMMV_K * 4096 / (results[(1024, 4096)][1] * 1e-6) / 1e12
+    print(f"CONTROL prefill M=1024 half(2048)tflops={tf_half:.2f} "
+          f"full(4096)tflops={tf_full:.2f}(补 Task 0 prefill 全宽对照)",
+          flush=True)
 
 
 def main() -> None:
+    if "--gemm-variants" in sys.argv:
+        gemm_variants_main()
+        return
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
