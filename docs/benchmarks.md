@@ -187,3 +187,66 @@ RESULT 行逐字(stdout):
 3. **GPU 分工与清理**:起服前双卡 ~4 MiB / 0%;vLLM 独占物理 GPU 0、引擎压测独占物理 GPU 1;关服后 GPU 0 回落 4 MiB,`nvidia-smi --query-compute-apps` 为空(无残留计算进程)。
 
 **验收判定(逐档 ≥100% 当日 vLLM 与否,如实):三档均未过——C=1 线的 92.9%、C=4 线的 83.0%、C=8 线的 72.2%。** graph 相对 eager 的当日净增益为 +6.4%/+5.5%/+3.9%,与 T6 账目(回收 75.6% 发射间隙、GPU 侧平价)相互印证;C=8 残余缺口主体仍在 GPU 侧 GEMM 利用率与 prefill 串行化(TTFT 0.1467 vs 0.0817 s)——此句为对实测数字的归因推断。
+
+## M4.1 段一(图外残差)中间账(2026-10-31,`python -m acorninfer.bench` + `scripts/profile_decode.py`,真机输出)
+
+段一改动(HEAD = eb7442b):decode 步 argmax 合批——B 次逐序列 D2H 同步 → 1 次(M4.1 Task 1);步首输入扁平缓冲 + pinned CPU 镜像——每 dtype 单发 H2D,共 2 次 H2D/步(M4.1 Task 2)。本节为两改动落地后的当日复测(物理 GPU 1,RTX 4090;每条命令跑前 `nvidia-smi` 确认无残留进程;seed 与 M2–M4 既有记录同)。
+
+### bench 双跑(graph + eager,C=1 4 8)
+
+命令(照上节 M4 当日配对 A/B 验收配方):
+
+- graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m acorninfer.bench --concurrency 1 4 8 --attention-backend triton --fused-ops --cuda-graph`
+- eager:同上,去掉 `--cuda-graph`
+
+聚合吞吐(tok/s)当日 vs M4 验收当日(2026-10-31 配对)对照:
+
+| 并发 | graph 当日 | graph(10-31 验收) | eager 当日 | eager(10-31 验收) | graph vs eager(当日) |
+|---|---|---|---|---|---|
+| 1 | 54.12 | 53.93 | 50.62 | 50.69 | +6.9% |
+| 4 | 173.60 | 172.77 | 162.54 | 163.79 | +6.8% |
+| 8 | 257.75 | 256.09 | 245.89 | 246.59 | +4.8% |
+
+graph 三档较验收当日 +0.35%/+0.48%/+0.65%;eager 三档 −0.14%/−0.76%/−0.28%,在 M3 节记录的 ±2-3% 机时漂移带内,原样记录不复跑择优。RESULT 行逐字(stdout):
+
+- graph:`RESULT C=1 ttft_p50=0.0349s ttft_mean=0.0349s tpot_mean=17.95ms tok_s=54.12` / `RESULT C=4 ttft_p50=0.0822s ttft_mean=0.0821s tpot_mean=21.13ms tok_s=173.60` / `RESULT C=8 ttft_p50=0.1469s ttft_mean=0.1468s tpot_mean=23.68ms tok_s=257.75`
+- eager:`RESULT C=1 ttft_p50=0.0347s ttft_mean=0.0347s tpot_mean=19.27ms tok_s=50.62` / `RESULT C=4 ttft_p50=0.0827s ttft_mean=0.0830s tpot_mean=22.73ms tok_s=162.54` / `RESULT C=8 ttft_p50=0.1488s ttft_mean=0.1488s tpot_mean=24.88ms tok_s=245.89`
+
+C=8 档两配置 out/token-stats 均 `min=2 max=32 / 32`(总 226/256 token,一条请求第 2 token 命中 EOS),与 M2/M3/M4 侧既有记录逐项一致。
+
+### profiler 双账(同 M4/T6 协议,--steps 20)
+
+命令(照 M4 节/T6 节配方):
+
+- graph:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/profile_decode.py --steps 20 --cuda-graph`
+- eager:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/profile_decode.py --steps 20`
+
+| 指标 | eager(10-30 归档) | eager(当日) | graph(10-31 T6) | graph(当日) |
+|---|---|---|---|---|
+| 每步墙钟 wall/step | 27.37 ms | 26.61 ms | 21.64 ms | 21.50 ms |
+| GPU 端累计(kernel+memcpy)/step | 19.99 ms | 19.97 ms | 19.84 ms | 19.81 ms |
+| 发射间隙 gap/step(wall − GPU 端) | 7.38 ms | 6.64 ms | 1.80 ms | 1.70 ms |
+| kernel 事件次数/step | 1430.0 | 1418.0 | 未归档 | 1418.0 |
+| memcpy 次数/step | 13.00 | 7.00 | 未归档 | 3.00 |
+
+脚本原始输出行(逐字):graph `steps=20 wall/step=21.50ms gpu_kernel+memcpy/step=19.81ms gap/step=1.70ms`;`launches/step=1418.0 memcpy/step=3.00`。eager `steps=20 wall/step=26.61ms gpu_kernel+memcpy/step=19.97ms gap/step=6.64ms`;`launches/step=1418.0 memcpy/step=7.00`。两轮 sanity 行均逐字 `sanity: alive=7/8 generated_per_seq=25 (batch 恒定贯穿计时窗口)`(batch=7 非 8,同 M4 口径注记 2);GPU 忙时合计(20 步,Self CUDA time total)graph 396.130 ms / eager 399.331 ms。launches/memcpy 按 GPU 侧事件计,graph 模式下不反映 CPU 发射数(M4 已知属性)。
+
+段一改动在当日账目上的实测映照(计数对照,均为 GPU 侧事件):
+
+- eager memcpy/step 13.00 → 7.00(−6.00):与 argmax 合批的 D2H 数目变化吻合(B=7 逐序列 D2H → 1 次);
+- eager kernel 事件/step 1430.0 → 1418.0(−12.0):与 argmax 逐序列 → 单次合批的 kernel 次数精简方向一致;
+- graph memcpy/step = 3.00:与段一改造后的每步传输组成(2 H2D + 1 D2H)逐项一致;
+- graph 与 eager 当日 kernel 事件数同为 1418.0:graph 回放的 kernel 集与 eager 发射的相同。
+
+### 残差判定(graph gap)
+
+**gap 实测 1.70 ms/步,段一目标 ≤1 ms 未达**(对照 T6 账 1.80 ms:−0.10 ms;占当日 graph 墙钟的 7.9%(1.70/21.50);当日 graph 相对 eager 回收发射间隙的 74.4%((6.64−1.70)/6.64))。残差构成,实测锚点与推断分别标注:
+
+1. 实测:每步 GPU 侧 memcpy 恰 3 次(2 H2D + 1 D2H);argmax 合批后的 1 次 D2H(`logits.argmax().tolist()`)是 decode_batch 路径内唯一的设备同步点——同步返回后 GPU 队列为空,至下一次 `graph.replay()` 之间的全部图外 CPU 工作直接暴露为 gap;
+2. 实测:同日 eager gap 6.64 ms → graph 1.70 ms,差值 4.94 ms 为逐 kernel CPU 发射路径被 graph 消除的部分(eager 当日账内 cuLaunchKernelEx Self CPU 13.561 ms/20 步 = 0.678 ms/步、216 次/步,为该路径的实测组成之一);
+3. 图外 CPU 每步工作清单(`graph_runner.decode_batch` 代码路径可数,未单独计时):`ensure_append_capacity` 逐 view 循环;CPU 镜像填充(4+1 次 `torch.tensor` 构造 + pinned 切片赋值,`pin_tables.zero_()` + `build_tables` CPU 直填,padding 压回 3 次);`_commit_lens` 逐 view × 逐层 python 循环(B=7 × 36 层 = 252 次赋值/步);调度 python。何者主导为推断。
+
+口径注记(均为实测事实):
+
+1. eager wall/step 含 profiler 逐 kernel 采样开销(M4 口径注记 3 沿用);eager gap 7.38 → 6.64 ms(−0.74 ms)与 argmax 同步减少方向一致,但采样事件数同变(1430.0 → 1418.0),不作精确归因。
+2. graph 模式 wall/step 21.50 ms 与 T6 账 21.64 ms 基本持平,段一两改动(同步 7→1、镜像单发 H2D)在 gap 上的当日净变化为 1.80 → 1.70 ms;bench 侧当日 graph 三档净增益仍为正(见上表)。
