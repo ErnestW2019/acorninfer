@@ -2341,3 +2341,43 @@ W4(同口径):
 
 1. **W8:条款不触发,锚维持,段 A GO。** dev −5.9%/−5.1% 在 ±10% 内;C=8 推算 TPOT ~12.3 ≤ 14.0、C=1 ~9.9 ≤ 10.5(推算口径,终仪式实测为准)。Task 1 定档输入 = `bn64_bk128_w4_s4` 主形态 + down `sk2`;qo 类 autotune 开放 sk 评估(同 down 先例);down 类 TOL 单独标定(勿复用 spike atol=1.0);kv 类引擎内真实成本以 Task 2 A/B 为准(微基准为 launch-bound 下界,如实)。
 2. **W4:条款触发,修正权保留不行使。** 理由:①段 0 数据为探索级,段 B 未探面(宽载 unpack、scale 预广播、双 buffer)与引擎内 L2 环境都可能改变终值;②spec §1/§2 的段 B 资格门(kernel η ≥ 0.80)是先行硬门——资格门过则锚 10.5 在 η≥0.80 口径下自动过(4.03GB@0.80 = 5.04ms GEMM → TPOT ≈ 7.9),资格门不过则 NO-GO 入档(M8 台账),锚从未被测试、无修正必要;③一次修正权留作段 B 硬化 kernel 后的生产级数据裁决(届时若资格门边缘 + 锚物理性不可达同时成立,再行使)。段 B 定档输入 = g0(组对齐 BLOCK_K=128)主形态,gather 出局,unpack 两法皆入 autotune,down sk4。
+
+### 段 A·kernel 定档:W8 dequant-GEMM(2026-11-01,`tests/test_quant_gemm.py` + `acorninfer/ops/quant_gemm.py`,真机输出)
+
+定档实现(段 0 裁决逐条落地):kernel = spike `_w8_kernel` 胜出形态逐字进产线(核内 dequant:int8 load → fp32 ×scale 行广播 → bf16 → tl.dot fp32 累加;BLOCK_M=16,M≤16 pad,M 为 runtime 参数零重编译);split-K 复用 decode_gemm 的 fp32 partials 常驻 workspace + 确定性 second-pass 归约(零 atomic)。**骨架复用 = `acorninfer/ops/decode_gemm.py` 按现状导入(`_bench_rot`/`_cfg_shmem_ok`/`_workspace`/`_splitk_reduce_kernel`),该文件本任务零改动**(增量幅度 = 0 行,既有 bf16 kernel 与 17 测试行为零变化,`tests/test_decode_gemm.py` 复跑 17 passed)。装配面:`quant_gemm(x, q, scale, cls, cfg=None, out=None)` + `configure()` 装载期入口(Engine 构造/graph 捕获前一次;Task 2 接线调用)+ 逐类 cfg 表 + bucket 分派(M≤16 直判;**`_bucket_for` 归桶不适用本模块,如实偏离**:decode_gemm 表按 (cls, bucket) 记 backend,本模块 cfg 按类一档 —— 段 0 实证 config M-不变,M 守门用 M≤16 直判;prefill 大 M(M>16)路径只留接口注记(`NotImplementedError` 显式报错),接线是 Task 2 范围)。生产路径:qwen3 调用点分派未接(Task 2),`--quant none` 缺省逐字节硬门不动。
+
+装载期 autotune(网格 = 段 0 胜出点 ± 邻域小集,非全网格):数值网格 = {(64,128,4,4) 冠军, (64,128,4,3), (64,64,4,4), (128,64,4,4)}(shmem/整除预过滤照 `_cfg_shmem_ok`;warps=4 已被段 0 全网格钉死不入邻域);split 段 = down/qo top-2 × sk2(kv/gate_up/lm_head sk1 定死)。8 套轮转热测(decode_gemm autotune 同款;权重随机 int8+fp16,带宽只看字节流)。命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python /tmp/opencode/m7a/loadtime_w8.py`(stdout 逐字;另跑冷缓存版 `TRITON_CACHE_DIR=/tmp/opencode/m7a/triton_cold` 同命令):
+
+```
+W8 AUTOTUNE_BEST qo cfg=(64, 128, 4, 4, 1) us=21.79 gb=770 skipped=0      (sk2 候选实测 27.70/27.70µs 全败 → sk1,同段 0)
+W8 AUTOTUNE_BEST kv cfg=(64, 128, 4, 3, 1) us=17.15 gb=245 skipped=0      (s4 17.20µs,差 0.3% 噪声级;装载期实测定)
+W8 AUTOTUNE_BEST gate_up cfg=(64, 128, 4, 4, 1) us=58.06 gb=867 skipped=0
+W8 AUTOTUNE_BEST down cfg=(64, 128, 4, 4, 2) us=59.21 gb=850 skipped=0    (sk2 59.21 < sk1 60.29 ✓ 段 0 先例复现)
+W8 AUTOTUNE_BEST lm_head cfg=(64, 128, 4, 4, 1) us=682.14 gb=913 skipped=0
+W8 CONFIGURE total_s=1.59 warm_s=0.218 (warm 预算 <1s;autotune 含 JIT 编译,装载期一次) cfgs={...五档如上...}
+冷缓存注记:TRITON_CACHE_DIR 全新目录(6 个编译变体全 JIT)同轮 total_s=2.70 / warm_s=0.459 —— warm <1s 预算两口径均过;autotune 总耗时为装载期一次成本,捕获/推理路径零编译。
+```
+
+capture 证据(T5 协议,调优后配置全五档;含 down sk2 split-K 双发射;`set_sync_debug_mode(2)` launch 零 host 同步):
+
+```
+W8_CAP class=down M=8 cfg=(64, 128, 4, 4, 2) capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok
+W8_CAP class=gate_up M=8 cfg=(64, 128, 4, 4, 1) capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok
+W8_CAP class=kv M=8 cfg=(64, 128, 4, 3, 1) capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok
+W8_CAP class=lm_head M=8 cfg=(64, 128, 4, 4, 1) capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok
+W8_CAP class=qo M=8 cfg=(64, 128, 4, 4, 1) capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok
+```
+
+TOL 逐类标定(协议:真实分布权重 randn→quantize_w8,五档 × M∈{1,7,8,16} × 胜出 cfg,`dequant_w8` 后 fp32 matmul 为锚;命令 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python /tmp/opencode/m7a/calib_tol_w8.py`,2026-11-01,选值紧比 ≤0.38 = 绑定元素 ≥2.6× 余量,写死 `tests/test_quant_gemm.py::TOL_W8`;rtol=2e-2 全类统一,误差机制同源 = 核内 dequant bf16 舍入 × K 点积累计):
+
+| cls | K | maxrel(\|ref\|>1) | maxabs(\|ref\|≤1) | maxrel(\|ref\|>10) | maxdiff@\|ref\| | 选值 (rtol, atol) | 紧比 | atol/maxabs |
+|---|---|---|---|---|---|---|---|---|
+| qo | 4096 | 0.263 | 0.468 | 0.038 | 1.024@271 | (2e-2, 1.5) | 0.322 | 3.21× |
+| kv | 4096 | 0.237 | 0.315 | 0.033 | 0.917@138 | (2e-2, 1.5) | 0.232 | 4.76× |
+| gate_up | 4096 | 0.317 | 0.468 | 0.044 | 1.024@271 | (2e-2, 1.5) | 0.322 | 3.21× |
+| down | 12288 | 0.488 | 0.714 | 0.067 | 1.641@312 | (2e-2, **2.0**) | 0.380 | 2.80× |
+| lm_head | 4096 | 0.354 | 0.496 | 0.045 | 1.308@259 | (2e-2, 1.5) | 0.368 | 3.02× |
+
+紧比 = max\|diff\|/(atol+rtol·\|ref\|)(assert_close 判据全分布复算,余量的精确口径);maxrel(>1) 大值是 \|ref\|≈1 处 atol 覆盖区的相对误差尾,不单独选 rtol。**down K=12288 单独标定(段 0 警示证实)**:spike 级 (2e-2, 1.0) 紧比 0.711(余量仅 1.4×)→ 写死 (2e-2, 2.0);误差随 K 增长(√K 累计)五档可见(down maxabs 0.714 vs kv 0.315)。真错(索引/mask)差 O(10) 起,不可漏网。
+
+测试账(TDD 红绿):红 = `ImportError: cannot import name 'quant_gemm'`(实现前);绿 = 26 passed(对拍 5×4=20 + splitk 确定性 1 + capture 重放逐位 2(down sk2 双发射 / qo sk1)+ dispatch 零 host 同步 1 + CPU 契约 2)。全套件:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **185 passed, 6 skipped, 17 deselected**(基线 159 + 新增 26,零换金;decode_gemm 17 passed 零变化硬门成立)。对 plan 草稿偏离逐条:①文件落位 `acorninfer/ops/quant_gemm.py`(plan 写 `ops/…` 为包内简写,ops 无独立顶层目录);②`_bucket_for` 未复用(见上,归桶无消费者);③TOL 校准中发现 M=16 曾被 `_bucket_for(M) is None` 守门误拒(bucket 上限 8)——改为 M≤16 直判后红转绿,归桶偏离由此一并定案;④autotune 权重轮转用随机 int8+fp16 直构(免 spike 的 bf16→quantize 瞬态;带宽口径字节流等价,数值对拍由测试真实 quantize 链路覆盖)。kv autotune 择 (64,128,4,**3**,1) 与主形态 s4 差 0.3%(噪声级,装载期实测定,两轮复现一致)。证据归档 `/tmp/opencode/m7a/`(calib_tol_w8.log / calib_tol_w8_final.log / loadtime_w8.log / pytest_full.log)。本节树 = d83b3bc + 本 commit。不打 tag、不 push(留用户)。
