@@ -842,3 +842,16 @@ C=1 eager 劣化拆账(`/tmp/opencode/m6t1b/dispatch_overhead.py`,10k 次/形态
 数值等价账(标定命令 `/tmp/opencode/m6t1b/probe_tiny_candA.py`,2026-11-01):tiny 形状 M=1 径逐位(8 seeds max|diff|=0.0)、M≥2 径 max|diff|=0.0039(TOL_BF16 内);8B 实形状 M=1 max|diff|=0.0156、M∈{2,7,8} ≤0.0625(「M=1 逐位」预期在 8B 规模不成立,TOL 协议覆盖;tiny 引擎级双 bucket parity 在任务期单测全绿,随 revert 一并撤下)。
 
 账目修正:RECOVER 清单 `layout_down_nn_hybrid` 的「M 条件分派两头通吃」候选**证伪入档**——C=8 侧 −0.28~−0.35 真实且无需分派(无条件 down_t 已复现),C=1 侧的救活以「TN 原径可达」为前提,而该前提被存储物理证伪([K,N] 单存储不可达 gemvx);除非接受双存储(零双存储红线,禁)或 M=1 侧改非 cuBLAS 径(段 2 triton 范围),该面在 cuBLAS 布局维度已收干。
+
+### 段 1·开销账:步开销面收尾(mirror 批量 + commit_lens + H2D/D2H)—— 施工面全在禁改文件、解禁面捕获期影子,no-op 收尾(2026-11-01,M6 Task 2-4 合并执行,真机输出)
+
+T0 合并裁决(RECOVER 三面):overhead_step_prep 0.10ms(M)+ commit_lens_write 0.005ms(H)+ H2D/D2H 未上榜,合计 ~0.105ms 低于原单任务门 0.2ms → 合并一个任务,门降为 **wall-step ≥ 0.05ms(C=8 graph,n=3 交错)**;并预设观察:「host 侧改善不进 step 时间(graph 模式 host 隐于 GPU 影内)→ 如实 no-op 收尾(也算完成)」。本节逐子项交代(禁改条款:graph_runner.py 自 M5 起禁改;pager.py 本任务有限解禁——仅 `_commit_lens` 相关批量提交,签名与语义不变):
+
+- **镜像/padding/tables 扁平构建**(`graph_runner.py:149-168`,RECOVER 实测面 28.1+45.3+8.8µs):施工面全部位于禁改文件 → **no-op**(裁决条款明示「若施工需触碰 graph_runner,该子项直接 no-op」;build_tables 的 pin_tables 直填路径同此)。
+- **`_commit_lens` 批量提交**(RECOVER 实测 5.3µs;调用 `graph_runner.py:172`、**函数体 :179-184 在禁改文件内**):按裁决条款「函数体在哪个文件以现状为准——若在 graph_runner 内则同样禁改 → no-op」→ **no-op**(T0 已注「压缩价值趋零,不值得做」;252 次 dict 赋值/步的批量改法无可改落点,executor.py:87 仅薄分派,调用链整体在禁改方法体内,harness 式 monkey-patch 属规则规避非施工,不做)。
+- **H2D/D2H 清账**(RECOVER 榜未上榜,如实复核):CPU 侧 copy_ 面属 overhead_step_prep 同文件(:170-171,禁改);传输本体 GPU 侧仅 **3.4µs**(Memcpy HtoD Pinned→Device,count 2)+ **1.0µs**(DtoH,count 1)——本日腿 4 复跑 profiler 设备事件实测,「未上榜」获实证,无回收面 → **no-op**。
+- **pager `scatter_decode` 逐 view 提交**(`pager.py:112-113`,解禁条款内):graph_runner docstring :6-8 契约——图内 python(含 scatter_decode 的 `_lens` 提交)**只在捕获期执行一次,重放不执行**,per-step 提交由 runner `_commit_lens` 代行 → graph 主口径(门口径)下该面零 per-step 存在,批量重构不可能进 wall-step → **不上手**(施工必然不达门 → revert,纯 churn;签名/语义不变条款下亦无收益形态)。
+
+当日实测锚(证据在档):腿 4 复跑(`m6_spike.py overhead`,与 T0 同带)——step_wall 19956.8µs、mirror 29.9 / tables 49.8 / pad 10.8 / h2d 20.6 / commit_lens 5.7 / d2h_sync 19738.8(T0:19926.1 / 28.1 / 45.3 / 8.8 / 19.6 / 5.3 / 19736.6),真实 CPU 侧 218.0µs/步(插桩税内,T0 带 172–190),其余 19.74ms 全为 graph 等待;`m6_ab.py --label ohead_batch_pre{,2}` 基线双样本 **C=8 graph 19.91 / 19.92**(T0 带 19.89–19.93 内)、C=1 graph 17.95/17.92、C=8 eager 21.13/21.23。
+
+判定(如实,no-op):**施工面为空集** —— 三面 + 未上榜面共四个子项,三个在禁改文件内、唯一解禁面(pager)在门口径下捕获期影子化;零施工 → 改后 ≡ 改前(A/B 退化为 A/A),门 wall-step ≥ 0.05ms 不可能被任何合规改动满足 → 按裁决「不达 → revert + no-op」收尾。无 revert 面(生产零改动);等价钉测试(批量 vs 逐赋值 `_lens` 全等)因无施工落点不落(零语义面可钉,避免无生产缝的自指测试);全套件零改动复核通过(fast **138 passed, 6 skipped, 17 deselected** / slow **17 passed**,byte-identical 硬门自然成立:token 流逐位、`_lens` 逐 dict 现状保持)。开销面在当前禁改边界内已收干;若后续解禁 graph_runner.py,候选形态照 T0(RECOVER `overhead_step_prep`:mirror 批量构建 + padding 压回合并,估 0.09–0.10ms)直接立项,无需重拆账。
