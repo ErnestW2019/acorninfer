@@ -2336,3 +2336,8 @@ W4(同口径):
 ### 口径注记
 
 同日同机(RTX 4090;物理 GPU 1,`CUDA_VISIBLE_DEVICES=1`;每腿跑前 `nvidia-smi` 验净 4MiB;前台 timeout 3500s);torch 2.13.0+cu130 / triton 3.7.1;轮转 36 套(lm_head 8 套,22.4GB 超显存的如实偏离,单套 > L2 70× 充分冷);轮转套由 randn 过**真实 quantize 函数**构建(dequant 值 ~N(0,1) 逼真分布,capture fp32 参考对拍 atol 口径才成立;字节随机性对带宽无差);QSPIKE stdout 逐字进本节(上两个 code block);证据归档 `/tmp/opencode/m7/`(spike_w8.log / spike_w4.log 全文);调试用 `--classes kv` 冒烟两轮(W8 一轮 + W4 一轮,后者暴露 unpack_w4 设备 bug)不计入账;quantize 单测重跑复绿(`4 passed`);本节树 = 694b4dc + 本 commit。M7 段 0 不打 tag、不 push(留用户)。
+
+### 段 0 控制器裁决(2026-11-01,裁决行)
+
+1. **W8:条款不触发,锚维持,段 A GO。** dev −5.9%/−5.1% 在 ±10% 内;C=8 推算 TPOT ~12.3 ≤ 14.0、C=1 ~9.9 ≤ 10.5(推算口径,终仪式实测为准)。Task 1 定档输入 = `bn64_bk128_w4_s4` 主形态 + down `sk2`;qo 类 autotune 开放 sk 评估(同 down 先例);down 类 TOL 单独标定(勿复用 spike atol=1.0);kv 类引擎内真实成本以 Task 2 A/B 为准(微基准为 launch-bound 下界,如实)。
+2. **W4:条款触发,修正权保留不行使。** 理由:①段 0 数据为探索级,段 B 未探面(宽载 unpack、scale 预广播、双 buffer)与引擎内 L2 环境都可能改变终值;②spec §1/§2 的段 B 资格门(kernel η ≥ 0.80)是先行硬门——资格门过则锚 10.5 在 η≥0.80 口径下自动过(4.03GB@0.80 = 5.04ms GEMM → TPOT ≈ 7.9),资格门不过则 NO-GO 入档(M8 台账),锚从未被测试、无修正必要;③一次修正权留作段 B 硬化 kernel 后的生产级数据裁决(届时若资格门边缘 + 锚物理性不可达同时成立,再行使)。段 B 定档输入 = g0(组对齐 BLOCK_K=128)主形态,gather 出局,unpack 两法皆入 autotune,down sk4。
