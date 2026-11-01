@@ -855,3 +855,50 @@ T0 合并裁决(RECOVER 三面):overhead_step_prep 0.10ms(M)+ commit_lens_write 
 当日实测锚(证据在档):腿 4 复跑(`m6_spike.py overhead`,与 T0 同带)——step_wall 19956.8µs、mirror 29.9 / tables 49.8 / pad 10.8 / h2d 20.6 / commit_lens 5.7 / d2h_sync 19738.8(T0:19926.1 / 28.1 / 45.3 / 8.8 / 19.6 / 5.3 / 19736.6),真实 CPU 侧 218.0µs/步(插桩税内,T0 带 172–190),其余 19.74ms 全为 graph 等待;`m6_ab.py --label ohead_batch_pre{,2}` 基线双样本 **C=8 graph 19.91 / 19.92**(T0 带 19.89–19.93 内)、C=1 graph 17.95/17.92、C=8 eager 21.13/21.23。
 
 判定(如实,no-op):**施工面为空集** —— 三面 + 未上榜面共四个子项,三个在禁改文件内、唯一解禁面(pager)在门口径下捕获期影子化;零施工 → 改后 ≡ 改前(A/B 退化为 A/A),门 wall-step ≥ 0.05ms 不可能被任何合规改动满足 → 按裁决「不达 → revert + no-op」收尾。无 revert 面(生产零改动);等价钉测试(批量 vs 逐赋值 `_lens` 全等)因无施工落点不落(零语义面可钉,避免无生产缝的自指测试);全套件零改动复核通过(fast **138 passed, 6 skipped, 17 deselected** / slow **17 passed**,byte-identical 硬门自然成立:token 流逐位、`_lens` 逐 dict 现状保持)。开销面在当前禁改边界内已收干;若后续解禁 graph_runner.py,候选形态照 T0(RECOVER `overhead_step_prep`:mirror 批量构建 + padding 压回合并,估 0.09–0.10ms)直接立项,无需重拆账。
+
+### 段 2·布局账:decode GEMM triton kernel(条件立项,限范围)—— 两类均未过 ≥5% 接入阀,no-op 收尾(2026-11-01,`acorninfer/ops/decode_gemm.py` 装载期 `configure()` 实测 + 六轮探针迭代,真机输出)
+
+范围(限范围裁决):仅两类 —— **gate_up**(引擎真实 per-call 形状 N=12288, K=4096;gate_proj / up_proj 各一次,段 0 spike 的 N=24576 为融合口径)与 **down**(N=4096, K=12288);qkv/o 段 0 冷口径已 88–92% roofline、lm_head 93.5% 峰值,均不接。**偏差注记(预注册)**:接线形态取 per-call 逐调用分派(每层 2× [12288,4096])而非融合 [24576,4096] 单 GEMM —— 零权重存储变更(段 1 T1b 双存储红线延续),qwen3 MLP 结构不动(分派仅换单算子),阀逐调用生产形状评估;融合口径仅作探针参照(见下物理上限账)。接入阀(spec §6 R5 延续):某类 triton 冷口径须超该类 cuBLAS 最优变体(tn / nn / pad16 取最小)≥5% 才接入,逐类独立、允许部分接入;全部未过 → 诚实 no-op 收尾(本节即此结局)。
+
+**kernel 设计要点**(`acorninfer/ops/decode_gemm.py`,新文件,全量单测):①BLOCK_M=16 张量核路径,M∈(1,16] pad 到 16(`tl.dot` 下限);W 侧零存储变换(nn.Linear [N,K] 行主,行内 K 连续 → 瓦片流式纯权重读,免 mask),M 侧 mask(瓦片 [BN,BK]×stages 共享内存预滤 ≤96KB)。②split-K(down:naive grid 仅 64 programs vs 128 SM)= **fp32 partial buffer + 确定性 second-pass 归约**(非 atomic_add):逐位确定性(graph 重放与独立 launch 输出逐位同,parity margin 稳定)、无 atomic 争用、reduce 读 SPLIT_K×16×N fp32(~1MB)≈1–2µs 可忽略;workspace 装载期预分配常驻(地址冻结,重放安全)。③CUDA-graph 兼容硬约束:launch 路径零 host 同步(无 .item()/synchronize,grid 全 host 侧 int;单测以 `set_sync_debug_mode` 钉),autotune/表实测全部装载期(Engine 构造 = 捕获前),**graph 捕获内含 triton launch(split-K=4)捕获成功 + 重放确定性(torch.equal)单测在档**。④dispatch 表逐 (类, M-bucket) 装载期实测,M buckets = graph_runner.BUCKETS(禁改,(1,2,4,8),测试钉住一致);layout="none"(缺省)直通 F.linear 逐字节硬门。
+
+**探针迭代账(六轮;证据 `/tmp/opencode/m6t5/iter{3,4,5,6}_probe*.log`,冷口径 8 套轮转)**:iter1 初版网格(BN{64,128,256}×BK{64,128}×warps{4,8}×stages{2,3,4}+split)即 +1.1~+2.6% 两类未过;iter2 扩网格(BK 256、warps 2、两类开放 split、TRANS_B 直载 / CACHE .cg+evict_first 访存变体)→ 变体全部噪声级(±0.5%)且 warm 装载涨到 3.22s 超预算 → 按探针证据回削;iter3 判别探针:**同瓦片纯读上限 gate_up 919–920GB/s = GEMM 920–923 本身**(kernel 已在该访存模式天花板),torch `w.sum()` 归约读 909(低于本 kernel),PAD_X 免 mask、stages 5/6 深流水、BK=64 全更差;down split=1 纯读仅 752–754(64 CTA 半 GPU 空转)→ **CTA 并行度 = down 主瓶颈**;iter4/5:BN=32(384 CTA)纯读 934 / GEMM 926(gate_up 新高),down split {3,4,6}(128→384 CTA)实测 859–907 全不敌 split2(902;reduce 流量随 SPLIT_K 涨吞掉并行收益),gate_up split ≤907 全败;iter6 SWAP 操作数序(W 进 A 操作数免 trans)925–927 / 894–906 噪声级(正确性 maxabs=0.0)。**融合口径物理上限参照**:triton 在 fused 24576×4096(768 CTA)纯读 944 / GEMM 937(cuBLAS fused 段 0 实测 947)—— 即便并行度翻倍,triton 渐近线 ~944 仍低于 per-call 阀线(下表),**阀不可达为形状物理,非工程欠账**。
+
+装载期 autotune(终版网格;iter2 宽网格证据保留不入网格):段1 BN{64,128,256}×BK{64,128,256}×warps{4,8}×stages{2,3,4}(shmem 预滤,24 活配置)+ 段2 top-2×SPLIT_K{2,4}(整除滤);**wall:cold 6.06s(含编译)/ warm 1.16s(<2s 目标达成;iter1 5.26/1.12、iter2 10.94/3.22 演进如实入档)**。胜出 config:gate_up `(BLOCK_N=64, BLOCK_K=128, warps=8, stages=2, split=1)`(192 programs)、down `(64, 128, 4, 4, 2)`(128 programs = 整 1 波)。逐字 stdout(终版 canonical,`configure_final.log`):
+
+```
+T5 AUTOTUNE_BEST gate_up cfg=(64, 128, 8, 2, 1) us=110.23 gb=913 skipped=0
+T5 AUTOTUNE_BEST down cfg=(64, 128, 4, 4, 2) us=112.97 gb=891 skipped=0
+T5 CONFIGURE cold wall_s=6.06
+T5 CONFIGURE warm wall_s=1.16
+```
+
+**冷口径对照表(36 套轮转 >72MB L2 强制 HBM;两类单套权重 100.66MB 本就超 L2,hot≈cold 双重成立;吞吐按 N·K·2B=100.66MB 计)**:
+
+| 类 | M | triton µs (GB/s) | tn µs | nn µs | pad16 µs | best cuBLAS | win vs best | 阀(≤0.95×best) | 判定 |
+|---|---|---|---|---|---|---|---|---|---|
+| gate_up | 1 | 108.38 (929) | 107.76 | 109.03 | 118.62 | 107.76 | −0.6% | 102.37 | ✗ |
+| gate_up | 2 | 108.40 (929) | 111.84 | 111.10 | 118.70 | 111.10 | +2.5% | 105.55 | ✗ |
+| gate_up | 4 | 108.62 (927) | 115.27 | 111.00 | 116.72 | 111.00 | +2.2% | 105.45 | ✗ |
+| gate_up | 8 | 108.78 (925) | 115.71 | 111.16 | 116.61 | 111.16 | +2.2% | 105.60 | ✗ |
+| down | 1 | 110.46 (911) | 109.91 | 116.07 | 123.89 | 109.91 | −0.5% | 104.41 | ✗ |
+| down | 2 | 110.74 (909) | 122.78 | 112.13 | 124.02 | 112.13 | +1.3% | 106.52 | ✗ |
+| down | 4 | 111.16 (906) | 122.98 | 112.43 | 123.94 | 112.43 | +1.1% | 106.81 | ✗ |
+| down | 8 | 111.63 (902) | 123.34 | 113.84 | 124.01 | 113.84 | +2.0% | 108.15 | ✗ |
+
+```
+T5 VALVE gate_up adopted=False active=[]
+T5 VALVE down adopted=False active=[]
+```
+
+**判定(如实,no-op):两类均未过 ≥5% 阀 —— triton 不接入生产,cuBLAS TN 继续站岗。**三层证据:①逐桶最优 +2.2~+2.5%(gate_up)/ +1.1~+2.0%(down),距 5% 差 2–3 个百分点;M=1 桶两类皆负(gemvx TN 107.76 / 109.91µs ≈ 934/915GB/s,BLOCK_M=16 张量核路径对 M=1 无算力优势,预期内);②**统计学注记**:cuBLAS nn 变体逐轮漂移 ±5%(gate_up nn m=2 同脚本两遍 111.10 → 113.92 → 110.87;down nn m=1 116.07/115.46/118.45),+2% 级边缘优势在 cuBLAS 自身方差内,阀值 5% 正是对此类收益的过滤——按 +2% 接入属统计上不可靠决策;③**物理上限**:同瓦片纯读天花板(gate_up 920–934、down ≤904)、triton 融合口径渐近线 937–944(cuBLAS 融合 947)均低于阀线对应吞吐(gate_up ≥953、down ≥944),kernel 已在其访存模式的 99–100%(GEMM 923 ≈ 纯读 920)。段 0 R5「须先打赢 cuBLAS 冷口径」的立项读法就此证伪入档:triton 能赢 tn 变体(gate_up m≥2 +3.8~+6.3%)但赢不了最优变体 5%。
+
+TOL 标定账(`tests/test_decode_gemm.py` 模块头,协议 `tests/triton_utils.py` 只用不改):`TOL_BF16_GEMM = dict(rtol=2e-2, atol=1e-2)` 写死(2026-11-01,标定命令 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python /tmp/opencode/m6t5/calib_tol.py`,gate_up/down × M∈{1,7,8,16} × tuned cfg,seed=11):实测 maxrel(|ref|>1) = 7.752e-3(≈2 bf16 ulp)、maxabs(|ref|≤1) = 0.0039、max|diff| = 2.0(|ref|≈258)——大 K 归约序漂移在 bf16 输出上为绝对差随幅值走,故 rtol+atol 组合(纯绝对差口径在此不适用,如实注记);(1e-2,1e-2) 下最紧比 0.758(余量 1.3×)→ 2.6× 余量取 (2e-2,1e-2),复算最紧比 ≈0.39;真错 O(10) 起,不可漏网。
+
+测试账(`tests/test_decode_gemm.py`,17 项全绿;fast 合计 **155 passed, 6 skipped, 17 deselected** = 基线 138 + 新 17 / slow **17 passed**):两类正确性对拍 F.linear × M{1,7,8,16}(标定 TOL)、split-K 强制 SPLIT_K=4(含 M=1)、逐位确定性(两次独立 launch torch.equal)、bucket 归桶 + 与 graph_runner.BUCKETS 一致性钉、dispatch 路由 mock(none 硬门 / 桶级分派)、阀逻辑 mock ×2(过阀接入 / 全败不接)、零 host 同步(set_sync_mode)、**graph 捕获含 triton launch + 重放逐位**、cuBLAS 回退桶。EngineConfig gemm_layout 校验测试随字段回退一并撤下(偏差注记见下)。
+
+生产接线判定:**零接线** —— qwen3.py / server.py / m6_ab.py 全未触碰,`EngineConfig.gemm_layout` 字段已回退(config.py 还原至 240f0cc;无消费者不设死旋钮),`linear_dispatch` 无生产调用点,生产行为与改前逐字节同(硬门自然成立)。模块 + 测试保留存档(kernel / 实测仪 / 阀机制全绿可复跑,后续若融合存储(T1b 前提)或存储布局变更重开此面,`configure()` 直接可用)。RECOVER 清单更新:`layout_down_nn_hybrid`(段 1 证伪)与本次 triton 面合并结论 —— **GEMM 布局/实现面在 cuBLAS+triton 双支柱下已收干,段 0 可回收面仅剩 knobs(证伪)与 overhead(禁改影子)均 no-op,缺口须由段 3+ 其它面承担**。
+
+偏差清单(如实):①gate_up 按 per-call [12288,4096]×2 接线评估(预注册决策;融合口径仅作探针参照,理由零存储变更);②iter2 曾加宽 autotune 网格致 warm 3.22s 超 <2s 目标 → 按探针证据回削至终版(warm 1.16s 达标),宽网格数据留档不入产;③TRANS_B/CACHE 访存变体、PAD_X、SWAP、split>2、stages 5/6、BN=32 七类变体探针证伪(噪声级或更差),kernel 内仅保留 TRANS_B/CACHE constexpr(缺省 (0,0) 与初版逐位同,变体账在 docstring);④EngineConfig.gemm_layout 字段施工后回退 + 对应测试撤下(17 项而非 18);⑤iter4 探针脚本曾绕过整除断言触发 illegal access(gate_up split3/6 非整除),为探针脚本缺陷非 kernel 缺陷(`_launch` 断言在档),已在新进程修复复测。
+
+口径注记(照前节同款):同日同机(物理 GPU 1,RTX 4090,24GB;每轮跑前 nvidia-smi 验净 4 MiB / 0 进程,前台 timeout ≥1800s);冷口径协议 = 段 0 `--gemm-cold` 同款(36 套独立权重轮转,warmup 一整轮 + 计 5 轮 ÷ 轮×36,CUDA event 计时;nn 变体 8 套轮转);autotune 仪 = 8 套轮转同协议;证据归档 `/tmp/opencode/m6t5/`(cold_cublas.py、calib_tol.py、run_configure.py、iter3/4/5/6 探针脚本 + 全部 stdout log、configure_cold.log / configure_iter2.log / configure_final.log)。
