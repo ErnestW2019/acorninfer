@@ -820,3 +820,25 @@ M=1 归因微测(补 T0 腿 3 盲区「M=1 gemvx 面 NN 未做孤立打分」;`/
 判定(双 C 门,如实):C=8 graph 收益 −0.27~−0.34 ≥ 0.2ms ✓、C=8 eager −0.18~−0.30 ✓;但 **C=1 graph 三样本 +0.06~+0.08 全出带(基线带极差 0.04,历史带顶 17.96)且 C=1 eager 三样本全劣于同日基线(+0.17~+0.51)→ no-regression 门 FAIL → 按派单停手:生产接线(qwen3 调用点分派 / EngineConfig / server CLI)不落地,本任务如实 no-op 收尾**。无 revert 面(生产零改动;fast 138 passed, 6 skipped, 17 deselected / slow 17 passed 全套件零改动复核通过)。T0 腿 3 的「孤立赢、引擎内输 = R2 实录」在 down-only 形态上兑现:RECOVER 清单 `layout_down_nn_hybrid ms_c8=0.40` 按引擎内实测修正为 **ms_c8=0.27~0.34 且 C=1 侧 −0.05ms 反向账,门未过不上线**。
 
 候选留存(裁决留控制器,本任务不越权落地):M 条件分派(如 batch≥2 才对 down 走 NN,M=1 维持 TN)两头可通吃——M=8 NN 胜 −11.2µs/层、M=1 TN 胜 +1.3µs/层,均为冷口径实测;但形态变更(布局选择器进 dispatch 面)超出本次裁决的「down-only NN hybrid」,需新裁决与同款双 C 门复测。
+
+### 段 1·布局账 T1b:M 条件分派 down_t_m2(单存储 + 按批 M)—— C=1 门仍未过,revert + no-op 收尾(2026-11-01,生产接线 TDD 全程 + `scripts/m6_ab.py --layout down_t_m2`,真机输出)
+
+上段候选留存按新裁决落地复测:down_proj 权重存 NN 连续 [K,N](`.t().contiguous()` 换 `weight.data`,原 [N,K] 存储随赋值释放——**单存储、稳态零额外显存**;变换期瞬时峰值 = 单层一份权重的 2×,36 层串行即时回收),`linear_dispatch` 按展平行数 M 分派:M≥2 → `torch.mm(x2d, w)`(NN 快径),M<2 → 经 `w.t()` 非连续 view 的 mm;生产接线(qwen3 四类投影 + lm_head 调用点、`EngineConfig.gemm_layout` ∈ {none, down_t_m2}、from_config/_build_engine 装载后 apply、server `--gemm-layout` 透传)TDD 全程,none 硬门经全套件零改动复核(fast **144 passed, 6 skipped, 17 deselected** = 138 基线 + 新增 6 / slow **17 passed**)。
+
+**形态探针(先于实现,/tmp/opencode/m6t1b/,8B down [N=4096, K=12288] bf16)**:派单字面「M<2 走 `mm(x, w.t())`」在 [K,N] 单存储下维度不可行([M,K]@[N,K]);gemvx TN 核仅能由 [N,K] 行主存储到达(F.linear 与 `mv(W, x0)` 均 hit gemvx 且逐位同),单存储 [K,N] 的全部 M=1 形态(`mm(x,w)` / `mm(w.t(),x.t()).t()` / `mv(w.t(),x)` / `F.linear(x,w.t())`)均落 cutlass NN 核(109.9~110.9µs hot)。即 **TN 原径自单存储不可达,获批分派的 C=1 救活机制(M<2 → TN)在存储物理上不可实现**;落地取「走 w.t() view 的 mm」最近合法实现,A/B 按预注册双 C 门裁决。
+
+A/B(交错执行 B/T/B/T/B/T 控漂移;每跑前 nvidia-smi 验净 4 MiB;warmup 10 + 计 30;down_t_m2 腿 = 生产同构,harness 零 forward patch):
+
+| step_ms | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| baseline ×3 | 17.94 / 17.96 / 17.93 | 19.89 / 19.90 / 19.89 | (21.98 冷启动弃样)/ 19.16 / 19.14 | 21.19 / 21.14 / 21.19 |
+| down_t_m2 ×3 | 17.97 / 17.96 / 17.96 | 19.61 / 19.55 / 19.56 | 19.27 / 19.27 / 19.76 | 20.84 / 20.85 / 20.84 |
+| Δ(配对) | +0.00 ~ +0.03 | **−0.28 ~ −0.35** | **+0.11 ~ +0.13(2/3;s3 +0.62 更差)** | −0.29 ~ −0.35 |
+
+判定(双 C 门,如实):C=8 收益 −0.28~−0.35 ✓(复现 T1 的 −0.27~−0.34,NN 快径收益与分派结构解耦成立);**但 C=1 eager +0.11~+0.13(2/3 系统性,T1b 双样本 19.27 齐落 T1 基线带顶 19.18 之上)→ no-regression 门 FAIL → 按预注册协议 revert:生产接线(gemm_dispatch / qwen3 调用点 / EngineConfig / server CLI / m6_ab 腿)全部回退,本任务 docs no-op 收尾**。C=1 graph +0.00~+0.03(带顶持平)不构成独立通过项(双 mode 条件按「任一」计)。
+
+C=1 eager 劣化拆账(`/tmp/opencode/m6t1b/dispatch_overhead.py`,10k 次/形态 per-call wall):dispatch M<2 分支较 module 调用 **+1.39µs/调用 × 36 层 ≈ +0.050ms/步**(python 分派面:分支多 reshape/t/t/view 四个 view 算子),叠加 cutlass-NN-vs-gemvx 核面差(T1 冷口径 +1.3µs/层 ≈ +0.047ms)≈ +0.10ms,与实测 +0.11~+0.13 定量吻合;none 分派面 −0.09µs/调用(≈0,硬门零损)。
+
+数值等价账(标定命令 `/tmp/opencode/m6t1b/probe_tiny_candA.py`,2026-11-01):tiny 形状 M=1 径逐位(8 seeds max|diff|=0.0)、M≥2 径 max|diff|=0.0039(TOL_BF16 内);8B 实形状 M=1 max|diff|=0.0156、M∈{2,7,8} ≤0.0625(「M=1 逐位」预期在 8B 规模不成立,TOL 协议覆盖;tiny 引擎级双 bucket parity 在任务期单测全绿,随 revert 一并撤下)。
+
+账目修正:RECOVER 清单 `layout_down_nn_hybrid` 的「M 条件分派两头通吃」候选**证伪入档**——C=8 侧 −0.28~−0.35 真实且无需分派(无条件 down_t 已复现),C=1 侧的救活以「TN 原径可达」为前提,而该前提被存储物理证伪([K,N] 单存储不可达 gemvx);除非接受双存储(零双存储红线,禁)或 M=1 侧改非 cuBLAS 径(段 2 triton 范围),该面在 cuBLAS 布局维度已收干。
