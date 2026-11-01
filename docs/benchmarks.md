@@ -1029,3 +1029,1310 @@ RESULT 行逐字(stdout 原样归档 `/tmp/opencode/m6t6/leg{A..E}_*.log`;`RESUL
 ### 终账·口径注记(照前节同款)
 
 同日同机(RTX 4090 ×2;in-process 终bench 物理 GPU 1、轨 1 仪式全腿物理 GPU 0;每腿跑前 `nvidia-smi` 验净 4 MiB / 0 进程,前台 timeout ≥1800s);全部腿 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);仪式四腿 + 终bench 三样本同窗口串行,腿间以双卡 4 MiB 验净为界;vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;13.9GB/步 = 段 0 腿 1 CHECK 口径(四类投影 + lm_head,含 lm_head 略偏高);证据归档 `/tmp/opencode/m6t6/`(m6_final 三样本 stdout、五腿 bench/server stdout 全文);本节树 = a13fa46 + 本 commit(docs)。M6 不打 tag、不 push(留用户)。
+
+## M7 段 0:RTN 数学(TDD)+ W8/W4 dequant-GEMM 微基准(2026-11-01,`tests/test_quantize.py` + `scripts/m7_spike.py`,真机输出)
+
+背景:M6 终账定性差距根源 = 每步必须搬运的字节数(bf16 权重流 15.13GB/步)。M7 把权重压到 W8(int8,7.57GB)/ W4(uint4 打包,4.02GB)、dequant 融入 GEMM。本节 = **段 0**:`acorninfer/quant/quantize.py` RTN 数学(TDD,纯 CPU)+ 探索级 dequant-GEMM 变体孤立微基准(η 表 → 锚修正条款复核;**判定留控制器,本节只交数据**)。生产源码零触碰;探索 kernel 全在 spike 脚本内,`ops/decode_gemm.py` 导入复用(`_bench_rot` 冷口径轮转计时 / `_ROT_SETS=36` / `_cfg_shmem_ok` shmem≤96KB 预过滤 / `_workspace` fp32 partials 常驻 / `_splitk_reduce_kernel` 确定性归约,该文件本任务零改动)。
+
+口径(与锚推导同轴,勿用 M6 聚合口径):投影为**独立模块**五档类 —— qo (4096,4096)×2 调用/层、kv (1024,4096)×2、gate_up (12288,4096)×2、down (4096,12288)、lm_head (151936,4096)×1/步(每步调用数 72/72/72/36/1)。gb = **量化权重字节(含元数据)/µs**:W8 = N·K+2N(int8 + fp16 scale)→ 每步 7.571GB;W4 = N·K/2 + 4·N·(K/128)(打包 + g128 scale/zp)→ 每步 4.021GB。roofline = 4090 峰值 1.008TB/s,η = gb/1008。冷口径:`_bench_rot` 36 套轮转(>72MB L2 强制 HBM;warmup 一整轮 + 计 5 轮);lm_head 单套 622MB/311MB,36 套 = 22.4GB 超显存 → **8 套轮转**(5GB,单套 > L2 70×,充分冷,如实注记的口径偏离)。BLOCK_M=16(M≤16 pad;M∈{1,8} 两档);SPLIT_K 仅 kv/down 两 N-不足类照 decode_gemm 先例评估(top-2 × sk{2,4[,8]},fp32 partials + 确定性 second-pass,atomic 零使用)。
+
+### quantize.py 红绿记录(TDD,纯 CPU)
+
+格式契约(spec §2 定案,测试钉死):W8 per-channel 对称(q int8 [N,K] ∈[−127,127],scale fp16 [N]);W4 g128 非对称(q uint8 [N,K] ∈[0,15],scale/zp fp16 [N,K/128]);打包 byte = q_even | q_odd<<4(**低 nibble = 偶数列**,unpack 同约定);形状守门 K/N 非 128 倍数 → ValueError(零特例口径);`dequant_w8/dequant_w4` 为 fp32 参考实现(Task 1 TOL 对拍锚)。
+
+- 红:`.venv/bin/python -m pytest tests/test_quantize.py` → `ModuleNotFoundError: No module named 'acorninfer.quant'`(实现前)。
+- 绿:实现后 4 passed(实测输出 `4 passed in 0.14s`):
+  - `test_w8_roundtrip_within_theoretical_bound` / `test_w4_roundtrip_within_theoretical_bound`(逐元素 ≤ scale/2 + 表示误差项 + eps)/ `test_pack_w4_roundtrip`(nibble 顺序钉死:byte 0x21 = 列0=1(低 nibble)| 列1=2<<4)/ `test_shape_guards`。
+- 对 plan 草稿的两处偏离(逐条记录):①理论界比草稿「scale/2+eps」精确——dequant 吃的是**存储后的 fp16 scale**,界补表示误差项 `127·s·2⁻¹¹`(W8)/`15·s·2⁻¹¹ + |zp|·2⁻¹¹`(W4),草稿界在 fp16 scale 舍入下可被真实超越;②**实测发现 fp16 不可表示 ε=1e-8**(half 最小次正规 ≈5.96e-8)→ 全零行 scale 存储后为 0.0(无损:该行 q≡0,dequant 精确为 0;spec ε 的职责在 fp32 数学域防除零,已成立)。守门额外统一到 quantize_w8(N%128 同守;生产五档全满足,零行为差异)。
+
+### 变体面(实测网格)
+
+- W8:`BLOCK_N{64,128,256} × BLOCK_K{64,128} × warps{4,8} × stages{2,3,4}`(shmem 预过滤 + lm_head N%BN 整除过滤 → 17 活配置);核内 dequant:int8 load → fp32 ×scale(行广播,循环不变提出)→ bf16 → tl.dot fp32 累加。
+- W4:同网格 × unpack 两法(**u0** = 位运算移位掩码:偶/奇 nibble 拆半 dequant、x 偶/奇列跨步加载、两次半-K tl.dot,零 shuffle;**u1** = `tl.interleave` 织回 [BN,BK] 单 dot)× 组 scale 两形态(**g0** = 组对齐:k0 整 128,块内组号标量、scale 行广播;**g1** = gather 索引 (k0+i)//128 逐元素)→ 68 活配置。
+- SPLIT_K:段2 top-2 × sk{2,4}(kv 加 sk8)整除过滤;g0 附加 K_CHUNK 整 128 过滤。
+- 数值门:每 kernel 形态 kv 类对拍 fp32 dequant 参考(spike 级 `rtol=2e-2, atol=1.0`;atol 口径:核内 dequant 后 round bf16 ~2⁻⁹ 相对 × √K 点积 ≈ 0.13σ,见 QSPIKE_CHECK 行;**正式 TOL 留 Task 1 标定写死**)。
+
+### W8 腿(stdout 逐字,2026-11-01)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m7_spike.py w8`(前台,跑前 GPU 1 验净 4MiB;236 逐变体行 + CHECK/CAP/BEST/SUMMARY 全文):
+
+```
+QSPIKE_HEADER leg=w8 date=2026-11-01 torch=2.13.0+cu130 triton=3.7.1 dev=NVIDIA GeForce RTX 4090 rot_sets=36(lm_head=8) block_m=16 ms=(1, 8) roofline_gbps=1008 classes=kv,qo,gate_up,down,lm_head
+QSPIKE_CHECK fmt=w8 form=bn128_bk128_w4_s3_sk1 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w8 form=bn128_bk64_w4_s3_sk4 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w8 form=bn128_bk64_w4_s3_sk8 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u0_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u0_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u0_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u0_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u1_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u1_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g0_sk2 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE w8 bn64_bk64_w4_s2_sk1 kv M=1 us=34.98 gb=120.0
+QSPIKE w8 bn64_bk64_w4_s3_sk1 kv M=1 us=19.98 gb=210.0
+QSPIKE w8 bn64_bk64_w4_s4_sk1 kv M=1 us=18.43 gb=227.7
+QSPIKE w8 bn64_bk64_w8_s2_sk1 kv M=1 us=34.36 gb=122.1
+QSPIKE w8 bn64_bk64_w8_s3_sk1 kv M=1 us=21.23 gb=197.7
+QSPIKE w8 bn64_bk64_w8_s4_sk1 kv M=1 us=18.36 gb=228.5
+QSPIKE w8 bn64_bk128_w4_s2_sk1 kv M=1 us=24.43 gb=171.8
+QSPIKE w8 bn64_bk128_w4_s3_sk1 kv M=1 us=15.13 gb=277.4
+QSPIKE w8 bn64_bk128_w4_s4_sk1 kv M=1 us=14.96 gb=280.5
+QSPIKE w8 bn64_bk128_w8_s2_sk1 kv M=1 us=23.93 gb=175.3
+QSPIKE w8 bn64_bk128_w8_s3_sk1 kv M=1 us=15.73 gb=266.8
+QSPIKE w8 bn64_bk128_w8_s4_sk1 kv M=1 us=15.74 gb=266.7
+QSPIKE w8 bn128_bk64_w4_s2_sk1 kv M=1 us=45.96 gb=91.3
+QSPIKE w8 bn128_bk64_w4_s3_sk1 kv M=1 us=27.48 gb=152.7
+QSPIKE w8 bn128_bk64_w4_s4_sk1 kv M=1 us=27.07 gb=155.0
+QSPIKE w8 bn128_bk64_w8_s2_sk1 kv M=1 us=43.60 gb=96.2
+QSPIKE w8 bn128_bk64_w8_s3_sk1 kv M=1 us=27.21 gb=154.2
+QSPIKE w8 bn128_bk64_w8_s4_sk1 kv M=1 us=27.18 gb=154.4
+QSPIKE w8 bn128_bk128_w4_s2_sk1 kv M=1 us=35.41 gb=118.5
+QSPIKE w8 bn128_bk128_w8_s2_sk1 kv M=1 us=32.27 gb=130.0
+QSPIKE w8 bn256_bk64_w4_s2_sk1 kv M=1 us=66.24 gb=63.3
+QSPIKE w8 bn256_bk64_w8_s2_sk1 kv M=1 us=60.25 gb=69.6
+QSPIKE w8 bn64_bk128_w4_s4_sk2 kv M=1 us=19.22 gb=218.3
+QSPIKE w8 bn64_bk128_w4_s4_sk4 kv M=1 us=19.43 gb=215.9
+QSPIKE w8 bn64_bk128_w4_s4_sk8 kv M=1 us=20.36 gb=206.1
+QSPIKE w8 bn64_bk128_w4_s3_sk2 kv M=1 us=20.64 gb=203.3
+QSPIKE w8 bn64_bk128_w4_s3_sk4 kv M=1 us=21.07 gb=199.1
+QSPIKE w8 bn64_bk128_w4_s3_sk8 kv M=1 us=20.45 gb=205.2
+QSPIKE_BEST fmt=w8 class=kv M=1 us=14.96 gb=280.5 eta=0.278 variant=bn64_bk128_w4_s4_sk1 skipped=0
+/home/userlist/zxs/python_venv/lib/python3.12/site-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+QSPIKE_CAP fmt=w8 class=kv M=1 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.5916)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 kv M=8 us=32.93 gb=127.4
+QSPIKE w8 bn64_bk64_w4_s3_sk1 kv M=8 us=18.78 gb=223.4
+QSPIKE w8 bn64_bk64_w4_s4_sk1 kv M=8 us=16.80 gb=249.8
+QSPIKE w8 bn64_bk64_w8_s2_sk1 kv M=8 us=32.64 gb=128.5
+QSPIKE w8 bn64_bk64_w8_s3_sk1 kv M=8 us=19.95 gb=210.4
+QSPIKE w8 bn64_bk64_w8_s4_sk1 kv M=8 us=16.65 gb=252.1
+QSPIKE w8 bn64_bk128_w4_s2_sk1 kv M=8 us=22.58 gb=185.8
+QSPIKE w8 bn64_bk128_w4_s3_sk1 kv M=8 us=13.88 gb=302.3
+QSPIKE w8 bn64_bk128_w4_s4_sk1 kv M=8 us=13.58 gb=309.0
+QSPIKE w8 bn64_bk128_w8_s2_sk1 kv M=8 us=22.10 gb=189.9
+QSPIKE w8 bn64_bk128_w8_s3_sk1 kv M=8 us=18.76 gb=223.7
+QSPIKE w8 bn64_bk128_w8_s4_sk1 kv M=8 us=14.25 gb=294.5
+QSPIKE w8 bn128_bk64_w4_s2_sk1 kv M=8 us=42.54 gb=98.7
+QSPIKE w8 bn128_bk64_w4_s3_sk1 kv M=8 us=25.06 gb=167.4
+QSPIKE w8 bn128_bk64_w4_s4_sk1 kv M=8 us=24.43 gb=171.8
+QSPIKE w8 bn128_bk64_w8_s2_sk1 kv M=8 us=40.93 gb=102.5
+QSPIKE w8 bn128_bk64_w8_s3_sk1 kv M=8 us=24.46 gb=171.6
+QSPIKE w8 bn128_bk64_w8_s4_sk1 kv M=8 us=24.38 gb=172.1
+QSPIKE w8 bn128_bk128_w4_s2_sk1 kv M=8 us=32.20 gb=130.3
+QSPIKE w8 bn128_bk128_w8_s2_sk1 kv M=8 us=30.67 gb=136.8
+QSPIKE w8 bn256_bk64_w4_s2_sk1 kv M=8 us=66.09 gb=63.5
+QSPIKE w8 bn256_bk64_w8_s2_sk1 kv M=8 us=59.59 gb=70.4
+QSPIKE w8 bn64_bk128_w4_s4_sk2 kv M=8 us=20.66 gb=203.1
+QSPIKE w8 bn64_bk128_w4_s4_sk4 kv M=8 us=20.56 gb=204.2
+QSPIKE w8 bn64_bk128_w4_s4_sk8 kv M=8 us=21.00 gb=199.8
+QSPIKE w8 bn64_bk128_w4_s3_sk2 kv M=8 us=21.61 gb=194.2
+QSPIKE w8 bn64_bk128_w4_s3_sk4 kv M=8 us=21.11 gb=198.8
+QSPIKE w8 bn64_bk128_w4_s3_sk8 kv M=8 us=21.44 gb=195.8
+QSPIKE_BEST fmt=w8 class=kv M=8 us=13.58 gb=309.0 eta=0.307 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=kv M=8 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7262)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 qo M=1 us=46.58 gb=360.4
+QSPIKE w8 bn64_bk64_w4_s3_sk1 qo M=1 us=29.92 gb=561.0
+QSPIKE w8 bn64_bk64_w4_s4_sk1 qo M=1 us=27.24 gb=616.1
+QSPIKE w8 bn64_bk64_w8_s2_sk1 qo M=1 us=46.48 gb=361.1
+QSPIKE w8 bn64_bk64_w8_s3_sk1 qo M=1 us=30.89 gb=543.4
+QSPIKE w8 bn64_bk64_w8_s4_sk1 qo M=1 us=27.61 gb=607.9
+QSPIKE w8 bn64_bk128_w4_s2_sk1 qo M=1 us=26.33 gb=637.4
+QSPIKE w8 bn64_bk128_w4_s3_sk1 qo M=1 us=21.11 gb=795.3
+QSPIKE w8 bn64_bk128_w4_s4_sk1 qo M=1 us=20.41 gb=822.3
+QSPIKE w8 bn64_bk128_w8_s2_sk1 qo M=1 us=26.35 gb=637.1
+QSPIKE w8 bn64_bk128_w8_s3_sk1 qo M=1 us=20.90 gb=803.3
+QSPIKE w8 bn64_bk128_w8_s4_sk1 qo M=1 us=20.56 gb=816.4
+QSPIKE w8 bn128_bk64_w4_s2_sk1 qo M=1 us=49.37 gb=340.0
+QSPIKE w8 bn128_bk64_w4_s3_sk1 qo M=1 us=37.27 gb=450.3
+QSPIKE w8 bn128_bk64_w4_s4_sk1 qo M=1 us=32.65 gb=514.1
+QSPIKE w8 bn128_bk64_w8_s2_sk1 qo M=1 us=48.32 gb=347.4
+QSPIKE w8 bn128_bk64_w8_s3_sk1 qo M=1 us=35.69 gb=470.4
+QSPIKE w8 bn128_bk64_w8_s4_sk1 qo M=1 us=32.23 gb=520.8
+QSPIKE w8 bn128_bk128_w4_s2_sk1 qo M=1 us=33.49 gb=501.2
+QSPIKE w8 bn128_bk128_w8_s2_sk1 qo M=1 us=32.42 gb=517.8
+QSPIKE w8 bn256_bk64_w4_s2_sk1 qo M=1 us=68.55 gb=244.9
+QSPIKE w8 bn256_bk64_w8_s2_sk1 qo M=1 us=62.95 gb=266.6
+QSPIKE_BEST fmt=w8 class=qo M=1 us=20.41 gb=822.3 eta=0.816 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=qo M=1 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.6749)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 qo M=8 us=46.49 gb=361.1
+QSPIKE w8 bn64_bk64_w4_s3_sk1 qo M=8 us=29.95 gb=560.5
+QSPIKE w8 bn64_bk64_w4_s4_sk1 qo M=8 us=27.23 gb=616.4
+QSPIKE w8 bn64_bk64_w8_s2_sk1 qo M=8 us=46.52 gb=360.8
+QSPIKE w8 bn64_bk64_w8_s3_sk1 qo M=8 us=30.74 gb=546.1
+QSPIKE w8 bn64_bk64_w8_s4_sk1 qo M=8 us=27.49 gb=610.6
+QSPIKE w8 bn64_bk128_w4_s2_sk1 qo M=8 us=26.70 gb=628.7
+QSPIKE w8 bn64_bk128_w4_s3_sk1 qo M=8 us=21.28 gb=788.9
+QSPIKE w8 bn64_bk128_w4_s4_sk1 qo M=8 us=20.42 gb=821.9
+QSPIKE w8 bn64_bk128_w8_s2_sk1 qo M=8 us=26.39 gb=636.2
+QSPIKE w8 bn64_bk128_w8_s3_sk1 qo M=8 us=21.03 gb=798.3
+QSPIKE w8 bn64_bk128_w8_s4_sk1 qo M=8 us=20.57 gb=816.0
+QSPIKE w8 bn128_bk64_w4_s2_sk1 qo M=8 us=49.24 gb=340.9
+QSPIKE w8 bn128_bk64_w4_s3_sk1 qo M=8 us=37.24 gb=450.7
+QSPIKE w8 bn128_bk64_w4_s4_sk1 qo M=8 us=32.71 gb=513.2
+QSPIKE w8 bn128_bk64_w8_s2_sk1 qo M=8 us=48.38 gb=347.0
+QSPIKE w8 bn128_bk64_w8_s3_sk1 qo M=8 us=35.62 gb=471.2
+QSPIKE w8 bn128_bk64_w8_s4_sk1 qo M=8 us=32.22 gb=521.0
+QSPIKE w8 bn128_bk128_w4_s2_sk1 qo M=8 us=33.72 gb=497.8
+QSPIKE w8 bn128_bk128_w8_s2_sk1 qo M=8 us=32.52 gb=516.1
+QSPIKE w8 bn256_bk64_w4_s2_sk1 qo M=8 us=68.94 gb=243.5
+QSPIKE w8 bn256_bk64_w8_s2_sk1 qo M=8 us=63.19 gb=265.6
+QSPIKE_BEST fmt=w8 class=qo M=8 us=20.42 gb=821.9 eta=0.815 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=qo M=8 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.9726)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 gate_up M=1 us=113.00 gb=445.6
+QSPIKE w8 bn64_bk64_w4_s3_sk1 gate_up M=1 us=98.46 gb=511.4
+QSPIKE w8 bn64_bk64_w4_s4_sk1 gate_up M=1 us=95.95 gb=524.8
+QSPIKE w8 bn64_bk64_w8_s2_sk1 gate_up M=1 us=112.61 gb=447.2
+QSPIKE w8 bn64_bk64_w8_s3_sk1 gate_up M=1 us=96.80 gb=520.2
+QSPIKE w8 bn64_bk64_w8_s4_sk1 gate_up M=1 us=92.64 gb=543.5
+QSPIKE w8 bn64_bk128_w4_s2_sk1 gate_up M=1 us=59.71 gb=843.3
+QSPIKE w8 bn64_bk128_w4_s3_sk1 gate_up M=1 us=57.32 gb=878.6
+QSPIKE w8 bn64_bk128_w4_s4_sk1 gate_up M=1 us=56.94 gb=884.4
+QSPIKE w8 bn64_bk128_w8_s2_sk1 gate_up M=1 us=59.59 gb=845.1
+QSPIKE w8 bn64_bk128_w8_s3_sk1 gate_up M=1 us=57.16 gb=881.0
+QSPIKE w8 bn64_bk128_w8_s4_sk1 gate_up M=1 us=57.08 gb=882.3
+QSPIKE w8 bn128_bk64_w4_s2_sk1 gate_up M=1 us=113.59 gb=443.3
+QSPIKE w8 bn128_bk64_w4_s3_sk1 gate_up M=1 us=102.00 gb=493.7
+QSPIKE w8 bn128_bk64_w4_s4_sk1 gate_up M=1 us=99.48 gb=506.2
+QSPIKE w8 bn128_bk64_w8_s2_sk1 gate_up M=1 us=112.87 gb=446.1
+QSPIKE w8 bn128_bk64_w8_s3_sk1 gate_up M=1 us=101.67 gb=495.3
+QSPIKE w8 bn128_bk64_w8_s4_sk1 gate_up M=1 us=99.19 gb=507.7
+QSPIKE w8 bn128_bk128_w4_s2_sk1 gate_up M=1 us=60.88 gb=827.1
+QSPIKE w8 bn128_bk128_w8_s2_sk1 gate_up M=1 us=60.76 gb=828.8
+QSPIKE w8 bn256_bk64_w4_s2_sk1 gate_up M=1 us=113.37 gb=444.2
+QSPIKE w8 bn256_bk64_w8_s2_sk1 gate_up M=1 us=112.83 gb=446.3
+QSPIKE_BEST fmt=w8 class=gate_up M=1 us=56.94 gb=884.4 eta=0.877 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=gate_up M=1 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7974)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 gate_up M=8 us=112.79 gb=446.4
+QSPIKE w8 bn64_bk64_w4_s3_sk1 gate_up M=8 us=98.45 gb=511.5
+QSPIKE w8 bn64_bk64_w4_s4_sk1 gate_up M=8 us=95.58 gb=526.9
+QSPIKE w8 bn64_bk64_w8_s2_sk1 gate_up M=8 us=112.77 gb=446.5
+QSPIKE w8 bn64_bk64_w8_s3_sk1 gate_up M=8 us=96.80 gb=520.2
+QSPIKE w8 bn64_bk64_w8_s4_sk1 gate_up M=8 us=93.35 gb=539.4
+QSPIKE w8 bn64_bk128_w4_s2_sk1 gate_up M=8 us=59.76 gb=842.6
+QSPIKE w8 bn64_bk128_w4_s3_sk1 gate_up M=8 us=57.29 gb=879.0
+QSPIKE w8 bn64_bk128_w4_s4_sk1 gate_up M=8 us=57.04 gb=882.9
+QSPIKE w8 bn64_bk128_w8_s2_sk1 gate_up M=8 us=59.65 gb=844.2
+QSPIKE w8 bn64_bk128_w8_s3_sk1 gate_up M=8 us=57.20 gb=880.4
+QSPIKE w8 bn64_bk128_w8_s4_sk1 gate_up M=8 us=57.20 gb=880.3
+QSPIKE w8 bn128_bk64_w4_s2_sk1 gate_up M=8 us=113.53 gb=443.5
+QSPIKE w8 bn128_bk64_w4_s3_sk1 gate_up M=8 us=102.03 gb=493.5
+QSPIKE w8 bn128_bk64_w4_s4_sk1 gate_up M=8 us=99.55 gb=505.8
+QSPIKE w8 bn128_bk64_w8_s2_sk1 gate_up M=8 us=112.93 gb=445.9
+QSPIKE w8 bn128_bk64_w8_s3_sk1 gate_up M=8 us=101.62 gb=495.5
+QSPIKE w8 bn128_bk64_w8_s4_sk1 gate_up M=8 us=99.15 gb=507.9
+QSPIKE w8 bn128_bk128_w4_s2_sk1 gate_up M=8 us=60.94 gb=826.3
+QSPIKE w8 bn128_bk128_w8_s2_sk1 gate_up M=8 us=60.77 gb=828.7
+QSPIKE w8 bn256_bk64_w4_s2_sk1 gate_up M=8 us=113.49 gb=443.7
+QSPIKE w8 bn256_bk64_w8_s2_sk1 gate_up M=8 us=113.00 gb=445.6
+QSPIKE_BEST fmt=w8 class=gate_up M=8 us=57.04 gb=882.9 eta=0.876 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=gate_up M=8 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.8608)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 down M=1 us=143.76 gb=350.2
+QSPIKE w8 bn64_bk64_w4_s3_sk1 down M=1 us=95.36 gb=527.9
+QSPIKE w8 bn64_bk64_w4_s4_sk1 down M=1 us=86.32 gb=583.2
+QSPIKE w8 bn64_bk64_w8_s2_sk1 down M=1 us=142.73 gb=352.7
+QSPIKE w8 bn64_bk64_w8_s3_sk1 down M=1 us=98.08 gb=513.2
+QSPIKE w8 bn64_bk64_w8_s4_sk1 down M=1 us=86.73 gb=580.5
+QSPIKE w8 bn64_bk128_w4_s2_sk1 down M=1 us=79.27 gb=635.1
+QSPIKE w8 bn64_bk128_w4_s3_sk1 down M=1 us=61.80 gb=814.6
+QSPIKE w8 bn64_bk128_w4_s4_sk1 down M=1 us=58.68 gb=857.9
+QSPIKE w8 bn64_bk128_w8_s2_sk1 down M=1 us=78.90 gb=638.0
+QSPIKE w8 bn64_bk128_w8_s3_sk1 down M=1 us=61.37 gb=820.2
+QSPIKE w8 bn64_bk128_w8_s4_sk1 down M=1 us=58.79 gb=856.3
+QSPIKE w8 bn128_bk64_w4_s2_sk1 down M=1 us=159.18 gb=316.2
+QSPIKE w8 bn128_bk64_w4_s3_sk1 down M=1 us=117.73 gb=427.6
+QSPIKE w8 bn128_bk64_w4_s4_sk1 down M=1 us=101.09 gb=498.0
+QSPIKE w8 bn128_bk64_w8_s2_sk1 down M=1 us=156.84 gb=321.0
+QSPIKE w8 bn128_bk64_w8_s3_sk1 down M=1 us=114.31 gb=440.4
+QSPIKE w8 bn128_bk64_w8_s4_sk1 down M=1 us=99.61 gb=505.4
+QSPIKE w8 bn128_bk128_w4_s2_sk1 down M=1 us=99.12 gb=507.9
+QSPIKE w8 bn128_bk128_w8_s2_sk1 down M=1 us=97.05 gb=518.7
+QSPIKE w8 bn256_bk64_w4_s2_sk1 down M=1 us=209.89 gb=239.8
+QSPIKE w8 bn256_bk64_w8_s2_sk1 down M=1 us=193.64 gb=260.0
+QSPIKE w8 bn64_bk128_w4_s4_sk2 down M=1 us=57.87 gb=869.8
+QSPIKE w8 bn64_bk128_w4_s4_sk4 down M=1 us=58.27 gb=863.9
+QSPIKE w8 bn64_bk128_w8_s4_sk2 down M=1 us=57.95 gb=868.6
+QSPIKE w8 bn64_bk128_w8_s4_sk4 down M=1 us=58.44 gb=861.4
+QSPIKE_BEST fmt=w8 class=down M=1 us=57.87 gb=869.8 eta=0.863 variant=bn64_bk128_w4_s4_sk2 skipped=0
+QSPIKE_CAP fmt=w8 class=down M=1 variant=bn64_bk128_w4_s4_sk2 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=1.1186)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 down M=8 us=143.61 gb=350.5
+QSPIKE w8 bn64_bk64_w4_s3_sk1 down M=8 us=95.19 gb=528.8
+QSPIKE w8 bn64_bk64_w4_s4_sk1 down M=8 us=86.25 gb=583.7
+QSPIKE w8 bn64_bk64_w8_s2_sk1 down M=8 us=142.64 gb=352.9
+QSPIKE w8 bn64_bk64_w8_s3_sk1 down M=8 us=97.69 gb=515.3
+QSPIKE w8 bn64_bk64_w8_s4_sk1 down M=8 us=86.32 gb=583.2
+QSPIKE w8 bn64_bk128_w4_s2_sk1 down M=8 us=80.29 gb=627.0
+QSPIKE w8 bn64_bk128_w4_s3_sk1 down M=8 us=62.24 gb=808.8
+QSPIKE w8 bn64_bk128_w4_s4_sk1 down M=8 us=58.68 gb=857.9
+QSPIKE w8 bn64_bk128_w8_s2_sk1 down M=8 us=78.93 gb=637.8
+QSPIKE w8 bn64_bk128_w8_s3_sk1 down M=8 us=61.25 gb=821.8
+QSPIKE w8 bn64_bk128_w8_s4_sk1 down M=8 us=58.81 gb=855.9
+QSPIKE w8 bn128_bk64_w4_s2_sk1 down M=8 us=159.65 gb=315.3
+QSPIKE w8 bn128_bk64_w4_s3_sk1 down M=8 us=117.48 gb=428.5
+QSPIKE w8 bn128_bk64_w4_s4_sk1 down M=8 us=101.02 gb=498.3
+QSPIKE w8 bn128_bk64_w8_s2_sk1 down M=8 us=156.55 gb=321.6
+QSPIKE w8 bn128_bk64_w8_s3_sk1 down M=8 us=114.04 gb=441.4
+QSPIKE w8 bn128_bk64_w8_s4_sk1 down M=8 us=99.42 gb=506.3
+QSPIKE w8 bn128_bk128_w4_s2_sk1 down M=8 us=98.76 gb=509.7
+QSPIKE w8 bn128_bk128_w8_s2_sk1 down M=8 us=97.10 gb=518.5
+QSPIKE w8 bn256_bk64_w4_s2_sk1 down M=8 us=210.04 gb=239.7
+QSPIKE w8 bn256_bk64_w8_s2_sk1 down M=8 us=193.75 gb=259.8
+QSPIKE w8 bn64_bk128_w4_s4_sk2 down M=8 us=57.83 gb=870.4
+QSPIKE w8 bn64_bk128_w4_s4_sk4 down M=8 us=58.27 gb=863.9
+QSPIKE w8 bn64_bk128_w8_s4_sk2 down M=8 us=57.96 gb=868.5
+QSPIKE w8 bn64_bk128_w8_s4_sk4 down M=8 us=58.44 gb=861.4
+QSPIKE_BEST fmt=w8 class=down M=8 us=57.83 gb=870.4 eta=0.864 variant=bn64_bk128_w4_s4_sk2 skipped=0
+QSPIKE_CAP fmt=w8 class=down M=8 variant=bn64_bk128_w4_s4_sk2 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=1.5089)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 lm_head M=1 us=1259.60 gb=494.3
+QSPIKE w8 bn64_bk64_w4_s3_sk1 lm_head M=1 us=1241.68 gb=501.4
+QSPIKE w8 bn64_bk64_w4_s4_sk1 lm_head M=1 us=1244.09 gb=500.5
+QSPIKE w8 bn64_bk64_w8_s2_sk1 lm_head M=1 us=1253.66 gb=496.7
+QSPIKE w8 bn64_bk64_w8_s3_sk1 lm_head M=1 us=1207.93 gb=515.5
+QSPIKE w8 bn64_bk64_w8_s4_sk1 lm_head M=1 us=1245.11 gb=500.1
+QSPIKE w8 bn64_bk128_w4_s2_sk1 lm_head M=1 us=680.80 gb=914.6
+QSPIKE w8 bn64_bk128_w4_s3_sk1 lm_head M=1 us=672.22 gb=926.2
+QSPIKE w8 bn64_bk128_w4_s4_sk1 lm_head M=1 us=661.37 gb=941.4
+QSPIKE w8 bn64_bk128_w8_s2_sk1 lm_head M=1 us=681.60 gb=913.5
+QSPIKE w8 bn64_bk128_w8_s3_sk1 lm_head M=1 us=672.31 gb=926.1
+QSPIKE w8 bn64_bk128_w8_s4_sk1 lm_head M=1 us=662.07 gb=940.4
+QSPIKE w8 bn128_bk64_w4_s2_sk1 lm_head M=1 us=1245.69 gb=499.8
+QSPIKE w8 bn128_bk64_w4_s3_sk1 lm_head M=1 us=1242.60 gb=501.1
+QSPIKE w8 bn128_bk64_w4_s4_sk1 lm_head M=1 us=1250.36 gb=498.0
+QSPIKE w8 bn128_bk64_w8_s2_sk1 lm_head M=1 us=1249.20 gb=498.4
+QSPIKE w8 bn128_bk64_w8_s3_sk1 lm_head M=1 us=1245.80 gb=499.8
+QSPIKE w8 bn128_bk64_w8_s4_sk1 lm_head M=1 us=1253.12 gb=496.9
+QSPIKE w8 bn128_bk128_w4_s2_sk1 lm_head M=1 us=681.24 gb=914.0
+QSPIKE w8 bn128_bk128_w8_s2_sk1 lm_head M=1 us=680.90 gb=914.4
+QSPIKE_BEST fmt=w8 class=lm_head M=1 us=661.37 gb=941.4 eta=0.934 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=lm_head M=1 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=skip(lm_head fp32 参考省略,bitwise 钉 + kv CHECK 已覆盖)
+QSPIKE w8 bn64_bk64_w4_s2_sk1 lm_head M=8 us=1360.79 gb=457.6
+QSPIKE w8 bn64_bk64_w4_s3_sk1 lm_head M=8 us=1348.17 gb=461.8
+QSPIKE w8 bn64_bk64_w4_s4_sk1 lm_head M=8 us=1260.85 gb=493.8
+QSPIKE w8 bn64_bk64_w8_s2_sk1 lm_head M=8 us=1265.41 gb=492.0
+QSPIKE w8 bn64_bk64_w8_s3_sk1 lm_head M=8 us=1224.93 gb=508.3
+QSPIKE w8 bn64_bk64_w8_s4_sk1 lm_head M=8 us=1262.28 gb=493.3
+QSPIKE w8 bn64_bk128_w4_s2_sk1 lm_head M=8 us=689.20 gb=903.4
+QSPIKE w8 bn64_bk128_w4_s3_sk1 lm_head M=8 us=684.42 gb=909.7
+QSPIKE w8 bn64_bk128_w4_s4_sk1 lm_head M=8 us=673.84 gb=924.0
+QSPIKE w8 bn64_bk128_w8_s2_sk1 lm_head M=8 us=690.74 gb=901.4
+QSPIKE w8 bn64_bk128_w8_s3_sk1 lm_head M=8 us=685.03 gb=908.9
+QSPIKE w8 bn64_bk128_w8_s4_sk1 lm_head M=8 us=674.30 gb=923.4
+QSPIKE w8 bn128_bk64_w4_s2_sk1 lm_head M=8 us=1253.07 gb=496.9
+QSPIKE w8 bn128_bk64_w4_s3_sk1 lm_head M=8 us=1253.32 gb=496.8
+QSPIKE w8 bn128_bk64_w4_s4_sk1 lm_head M=8 us=1263.38 gb=492.8
+QSPIKE w8 bn128_bk64_w8_s2_sk1 lm_head M=8 us=1257.93 gb=495.0
+QSPIKE w8 bn128_bk64_w8_s3_sk1 lm_head M=8 us=1256.29 gb=495.6
+QSPIKE w8 bn128_bk64_w8_s4_sk1 lm_head M=8 us=1266.48 gb=491.6
+QSPIKE w8 bn128_bk128_w4_s2_sk1 lm_head M=8 us=688.18 gb=904.8
+QSPIKE w8 bn128_bk128_w8_s2_sk1 lm_head M=8 us=688.94 gb=903.8
+QSPIKE_BEST fmt=w8 class=lm_head M=8 us=673.84 gb=924.0 eta=0.917 variant=bn64_bk128_w4_s4_sk1 skipped=0
+QSPIKE_CAP fmt=w8 class=lm_head M=8 variant=bn64_bk128_w4_s4_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=skip(lm_head fp32 参考省略,bitwise 钉 + kv CHECK 已覆盖)
+QSPIKE_SUMMARY fmt=w8 class=kv M=1 us=14.96 gb=280.5 eta=0.278 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=qo M=1 us=20.41 gb=822.3 eta=0.816 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=gate_up M=1 us=56.94 gb=884.4 eta=0.877 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=down M=1 us=57.87 gb=869.8 eta=0.863 variant=bn64_bk128_w4_s4_sk2
+QSPIKE_SUMMARY fmt=w8 class=lm_head M=1 us=661.37 gb=941.4 eta=0.934 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_ETA fmt=w8 M=1 weighted_eta=0.800 weighted_gbps=806.2 assume=0.85 dev_pct=-5.9 step_bytes_gb=7.571 step_time_ms=9.391 (roofline=1008GB/s 权重字节口径)
+QSPIKE_SUMMARY fmt=w8 class=kv M=8 us=13.58 gb=309.0 eta=0.307 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=qo M=8 us=20.42 gb=821.9 eta=0.815 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=gate_up M=8 us=57.04 gb=882.9 eta=0.876 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_SUMMARY fmt=w8 class=down M=8 us=57.83 gb=870.4 eta=0.864 variant=bn64_bk128_w4_s4_sk2
+QSPIKE_SUMMARY fmt=w8 class=lm_head M=8 us=673.84 gb=924.0 eta=0.917 variant=bn64_bk128_w4_s4_sk1
+QSPIKE_ETA fmt=w8 M=8 weighted_eta=0.807 weighted_gbps=813.2 assume=0.85 dev_pct=-5.1 step_bytes_gb=7.571 step_time_ms=9.311 (roofline=1008GB/s 权重字节口径)
+QSPIKE_ANCHOR fmt=w8 dev_pct=-5.9..-5.1 assume=0.85 threshold=±10% (>10% → 锚修正条款一次;判定留控制器)
+```
+
+### W4 腿(stdout 逐字,2026-11-01)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m7_spike.py w4`(884 逐变体行;首跑在 kv capture 处因 `unpack_w4` 未随输入设备分配输出而中断,修复(`torch.empty(..., device=p.device)`,单测复绿)后**整腿重跑**,本日志为准):
+
+```
+QSPIKE_HEADER leg=w4 date=2026-11-01 torch=2.13.0+cu130 triton=3.7.1 dev=NVIDIA GeForce RTX 4090 rot_sets=36(lm_head=8) block_m=16 ms=(1, 8) roofline_gbps=1008 classes=kv,qo,gate_up,down,lm_head
+QSPIKE_CHECK fmt=w8 form=bn128_bk128_w4_s3_sk1 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w8 form=bn128_bk64_w4_s3_sk4 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w8 form=bn128_bk64_w4_s3_sk8 ok=True maxabs=0.9038 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u0_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u0_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u0_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u0_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u1_g0_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk128_w4_s3_u1_g1_sk1 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE_CHECK fmt=w4 form=bn128_bk64_w4_s3_u1_g0_sk2 ok=True maxabs=0.6410 tol={'rtol': 0.02, 'atol': 1.0}
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 kv M=1 us=40.94 gb=54.4
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 kv M=1 us=81.78 gb=27.2
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 kv M=1 us=42.95 gb=51.9
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 kv M=1 us=75.38 gb=29.6
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 kv M=1 us=34.28 gb=65.0
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 kv M=1 us=60.56 gb=36.8
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 kv M=1 us=23.49 gb=94.9
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 kv M=1 us=58.79 gb=37.9
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 kv M=1 us=34.24 gb=65.1
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 kv M=1 us=60.52 gb=36.8
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 kv M=1 us=29.02 gb=76.8
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 kv M=1 us=58.73 gb=37.9
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 kv M=1 us=41.24 gb=54.0
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 kv M=1 us=65.66 gb=33.9
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 kv M=1 us=39.40 gb=56.6
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 kv M=1 us=68.02 gb=32.8
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 kv M=1 us=31.71 gb=70.3
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 kv M=1 us=48.22 gb=46.2
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 kv M=1 us=22.46 gb=99.2
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 kv M=1 us=51.07 gb=43.6
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 kv M=1 us=31.56 gb=70.6
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 kv M=1 us=48.13 gb=46.3
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 kv M=1 us=21.42 gb=104.0
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 kv M=1 us=51.24 gb=43.5
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 kv M=1 us=26.65 gb=83.6
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 kv M=1 us=68.02 gb=32.8
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 kv M=1 us=25.87 gb=86.1
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 kv M=1 us=87.10 gb=25.6
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 kv M=1 us=22.11 gb=100.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 kv M=1 us=55.60 gb=40.1
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 kv M=1 us=20.08 gb=111.0
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 kv M=1 us=87.81 gb=25.4
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 kv M=1 us=21.98 gb=101.4
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 kv M=1 us=55.49 gb=40.2
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 kv M=1 us=19.70 gb=113.1
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 kv M=1 us=96.69 gb=23.0
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 kv M=1 us=26.18 gb=85.1
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 kv M=1 us=45.47 gb=49.0
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 kv M=1 us=23.34 gb=95.5
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 kv M=1 us=63.34 gb=35.2
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 kv M=1 us=19.78 gb=112.6
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 kv M=1 us=35.49 gb=62.8
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 kv M=1 us=19.19 gb=116.1
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 kv M=1 us=55.59 gb=40.1
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 kv M=1 us=19.72 gb=113.0
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 kv M=1 us=37.72 gb=59.1
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 kv M=1 us=18.89 gb=117.9
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 kv M=1 us=55.77 gb=40.0
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 kv M=1 us=56.64 gb=39.3
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 kv M=1 us=101.25 gb=22.0
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 kv M=1 us=51.38 gb=43.4
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 kv M=1 us=161.66 gb=13.8
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 kv M=1 us=42.91 gb=51.9
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 kv M=1 us=85.96 gb=25.9
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 kv M=1 us=62.79 gb=35.5
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 kv M=1 us=169.44 gb=13.2
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 kv M=1 us=59.04 gb=37.7
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 kv M=1 us=86.00 gb=25.9
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 kv M=1 us=62.44 gb=35.7
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 kv M=1 us=175.32 gb=12.7
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 kv M=1 us=49.55 gb=45.0
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 kv M=1 us=92.08 gb=24.2
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 kv M=1 us=49.27 gb=45.2
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 kv M=1 us=103.86 gb=21.5
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 kv M=1 us=37.92 gb=58.8
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 kv M=1 us=81.99 gb=27.2
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 kv M=1 us=33.20 gb=67.1
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 kv M=1 us=86.39 gb=25.8
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 kv M=1 us=37.79 gb=59.0
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 kv M=1 us=82.01 gb=27.2
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 kv M=1 us=33.23 gb=67.1
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 kv M=1 us=88.47 gb=25.2
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 kv M=1 us=39.39 gb=56.6
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 kv M=1 us=114.63 gb=19.4
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 kv M=1 us=39.75 gb=56.1
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 kv M=1 us=187.36 gb=11.9
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 kv M=1 us=34.47 gb=64.6
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 kv M=1 us=75.37 gb=29.6
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 kv M=1 us=34.67 gb=64.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 kv M=1 us=142.67 gb=15.6
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 kv M=1 us=90.13 gb=24.7
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 kv M=1 us=178.41 gb=12.5
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 kv M=1 us=96.80 gb=23.0
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 kv M=1 us=370.27 gb=6.0
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 kv M=1 us=85.73 gb=26.0
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 kv M=1 us=152.67 gb=14.6
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 kv M=1 us=75.50 gb=29.5
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 kv M=1 us=259.18 gb=8.6
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk2 kv M=1 us=20.15 gb=110.6
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk4 kv M=1 us=19.69 gb=113.1
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk8 kv M=1 us=19.65 gb=113.4
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk2 kv M=1 us=19.87 gb=112.2
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk4 kv M=1 us=19.72 gb=113.0
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk8 kv M=1 us=19.69 gb=113.2
+QSPIKE_BEST fmt=w4 class=kv M=1 us=18.89 gb=117.9 eta=0.117 variant=bn64_bk128_w8_s4_u1_g0_sk1 skipped=0
+/home/userlist/zxs/python_venv/lib/python3.12/site-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+QSPIKE_CAP fmt=w4 class=kv M=1 variant=bn64_bk128_w8_s4_u1_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.6199)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 kv M=8 us=44.95 gb=49.6
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 kv M=8 us=77.10 gb=28.9
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 kv M=8 us=40.44 gb=55.1
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 kv M=8 us=69.89 gb=31.9
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 kv M=8 us=36.88 gb=60.4
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 kv M=8 us=65.72 gb=33.9
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 kv M=8 us=22.03 gb=101.2
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 kv M=8 us=52.71 gb=42.3
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 kv M=8 us=36.79 gb=60.6
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 kv M=8 us=72.46 gb=30.8
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 kv M=8 us=29.04 gb=76.7
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 kv M=8 us=58.33 gb=38.2
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 kv M=8 us=42.58 gb=52.3
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 kv M=8 us=65.08 gb=34.2
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 kv M=8 us=40.29 gb=55.3
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 kv M=8 us=73.69 gb=30.2
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 kv M=8 us=34.01 gb=65.5
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 kv M=8 us=54.18 gb=41.1
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 kv M=8 us=24.51 gb=90.9
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 kv M=8 us=56.11 gb=39.7
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 kv M=8 us=33.83 gb=65.9
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 kv M=8 us=54.15 gb=41.2
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 kv M=8 us=23.96 gb=93.0
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 kv M=8 us=56.30 gb=39.6
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 kv M=8 us=28.14 gb=79.2
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 kv M=8 us=62.55 gb=35.6
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 kv M=8 us=28.41 gb=78.4
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 kv M=8 us=97.80 gb=22.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 kv M=8 us=24.43 gb=91.2
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 kv M=8 us=53.20 gb=41.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 kv M=8 us=21.59 gb=103.2
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 kv M=8 us=94.75 gb=23.5
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 kv M=8 us=24.22 gb=92.0
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 kv M=8 us=56.01 gb=39.8
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 kv M=8 us=21.29 gb=104.7
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 kv M=8 us=103.46 gb=21.5
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 kv M=8 us=28.23 gb=78.9
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 kv M=8 us=52.72 gb=42.3
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 kv M=8 us=25.63 gb=86.9
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 kv M=8 us=69.62 gb=32.0
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 kv M=8 us=22.11 gb=100.8
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 kv M=8 us=45.22 gb=49.3
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 kv M=8 us=20.87 gb=106.8
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 kv M=8 us=61.19 gb=36.4
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 kv M=8 us=22.13 gb=100.7
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 kv M=8 us=49.61 gb=44.9
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 kv M=8 us=20.55 gb=108.4
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 kv M=8 us=61.37 gb=36.3
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 kv M=8 us=62.85 gb=35.5
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 kv M=8 us=116.29 gb=19.2
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 kv M=8 us=53.83 gb=41.4
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 kv M=8 us=178.06 gb=12.5
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 kv M=8 us=53.91 gb=41.3
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 kv M=8 us=99.58 gb=22.4
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 kv M=8 us=68.27 gb=32.6
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 kv M=8 us=187.47 gb=11.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 kv M=8 us=63.81 gb=34.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 kv M=8 us=90.38 gb=24.7
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 kv M=8 us=62.41 gb=35.7
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 kv M=8 us=175.32 gb=12.7
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 kv M=8 us=52.16 gb=42.7
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 kv M=8 us=95.68 gb=23.3
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 kv M=8 us=49.17 gb=45.3
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 kv M=8 us=112.15 gb=19.9
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 kv M=8 us=43.68 gb=51.0
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 kv M=8 us=92.85 gb=24.0
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 kv M=8 us=37.34 gb=59.7
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 kv M=8 us=97.42 gb=22.9
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 kv M=8 us=43.61 gb=51.1
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 kv M=8 us=92.80 gb=24.0
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 kv M=8 us=37.42 gb=59.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 kv M=8 us=97.71 gb=22.8
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 kv M=8 us=49.06 gb=45.4
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 kv M=8 us=95.78 gb=23.3
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 kv M=8 us=43.43 gb=51.3
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 kv M=8 us=211.50 gb=10.5
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 kv M=8 us=44.40 gb=50.2
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 kv M=8 us=73.12 gb=30.5
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 kv M=8 us=37.70 gb=59.1
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 kv M=8 us=157.96 gb=14.1
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 kv M=8 us=101.06 gb=22.0
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 kv M=8 us=210.78 gb=10.6
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 kv M=8 us=104.76 gb=21.3
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 kv M=8 us=410.08 gb=5.4
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 kv M=8 us=88.05 gb=25.3
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 kv M=8 us=155.58 gb=14.3
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 kv M=8 us=75.26 gb=29.6
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 kv M=8 us=258.33 gb=8.6
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk2 kv M=8 us=21.73 gb=102.5
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk4 kv M=8 us=20.75 gb=107.4
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk8 kv M=8 us=25.90 gb=86.0
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk2 kv M=8 us=23.32 gb=95.6
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk4 kv M=8 us=23.59 gb=94.4
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk8 kv M=8 us=24.56 gb=90.7
+QSPIKE_BEST fmt=w4 class=kv M=8 us=20.55 gb=108.4 eta=0.108 variant=bn64_bk128_w8_s4_u1_g0_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=kv M=8 variant=bn64_bk128_w8_s4_u1_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7157)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 qo M=1 us=44.34 gb=201.0
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 qo M=1 us=83.78 gb=106.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 qo M=1 us=46.88 gb=190.1
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 qo M=1 us=78.46 gb=113.6
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 qo M=1 us=38.76 gb=229.9
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 qo M=1 us=60.94 gb=146.3
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 qo M=1 us=30.47 gb=292.5
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 qo M=1 us=59.22 gb=150.5
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 qo M=1 us=38.63 gb=230.7
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 qo M=1 us=60.98 gb=146.2
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 qo M=1 us=34.70 gb=256.9
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 qo M=1 us=53.74 gb=165.9
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 qo M=1 us=42.25 gb=211.0
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 qo M=1 us=62.86 gb=141.8
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 qo M=1 us=42.02 gb=212.1
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 qo M=1 us=70.58 gb=126.3
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 qo M=1 us=35.40 gb=251.8
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 qo M=1 us=48.87 gb=182.4
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 qo M=1 us=29.37 gb=303.5
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 qo M=1 us=51.48 gb=173.1
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 qo M=1 us=35.32 gb=252.3
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 qo M=1 us=48.79 gb=182.7
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 qo M=1 us=23.64 gb=377.1
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 qo M=1 us=51.69 gb=172.4
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 qo M=1 us=27.85 gb=320.1
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 qo M=1 us=69.48 gb=128.3
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 qo M=1 us=27.56 gb=323.4
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 qo M=1 us=90.16 gb=98.9
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 qo M=1 us=24.78 gb=359.7
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 qo M=1 us=57.17 gb=155.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 qo M=1 us=22.81 gb=390.7
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 qo M=1 us=90.87 gb=98.1
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 qo M=1 us=24.95 gb=357.2
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 qo M=1 us=57.34 gb=155.4
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 qo M=1 us=22.72 gb=392.4
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 qo M=1 us=99.08 gb=90.0
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 qo M=1 us=27.75 gb=321.2
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 qo M=1 us=47.33 gb=188.3
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 qo M=1 us=25.78 gb=345.7
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 qo M=1 us=64.97 gb=137.2
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 qo M=1 us=22.41 gb=397.7
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 qo M=1 us=36.06 gb=247.2
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 qo M=1 us=21.66 gb=411.5
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 qo M=1 us=56.38 gb=158.1
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 qo M=1 us=22.49 gb=396.2
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 qo M=1 us=39.35 gb=226.5
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 qo M=1 us=21.59 gb=412.9
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 qo M=1 us=56.72 gb=157.1
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 qo M=1 us=60.09 gb=148.3
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 qo M=1 us=103.27 gb=86.3
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 qo M=1 us=54.48 gb=163.6
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 qo M=1 us=164.77 gb=54.1
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 qo M=1 us=48.30 gb=184.5
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 qo M=1 us=85.87 gb=103.8
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 qo M=1 us=65.76 gb=135.5
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 qo M=1 us=170.96 gb=52.1
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 qo M=1 us=62.31 gb=143.0
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 qo M=1 us=85.96 gb=103.7
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 qo M=1 us=65.65 gb=135.8
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 qo M=1 us=177.06 gb=50.3
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 qo M=1 us=52.92 gb=168.4
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 qo M=1 us=95.18 gb=93.6
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 qo M=1 us=52.88 gb=168.5
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 qo M=1 us=106.75 gb=83.5
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 qo M=1 us=42.22 gb=211.1
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 qo M=1 us=82.61 gb=107.9
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 qo M=1 us=36.08 gb=247.0
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 qo M=1 us=87.38 gb=102.0
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 qo M=1 us=42.32 gb=210.6
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 qo M=1 us=82.68 gb=107.8
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 qo M=1 us=35.85 gb=248.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 qo M=1 us=89.77 gb=99.3
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 qo M=1 us=41.71 gb=213.7
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 qo M=1 us=116.91 gb=76.2
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 qo M=1 us=41.79 gb=213.3
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 qo M=1 us=190.19 gb=46.9
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 qo M=1 us=37.81 gb=235.7
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 qo M=1 us=78.01 gb=114.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 qo M=1 us=36.73 gb=242.7
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 qo M=1 us=148.76 gb=59.9
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 qo M=1 us=93.82 gb=95.0
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 qo M=1 us=179.51 gb=49.7
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 qo M=1 us=101.90 gb=87.5
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 qo M=1 us=377.14 gb=23.6
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 qo M=1 us=89.51 gb=99.6
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 qo M=1 us=154.70 gb=57.6
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 qo M=1 us=80.52 gb=110.7
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 qo M=1 us=277.01 gb=32.2
+QSPIKE_BEST fmt=w4 class=qo M=1 us=21.59 gb=412.9 eta=0.410 variant=bn64_bk128_w8_s4_u1_g0_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=qo M=1 variant=bn64_bk128_w8_s4_u1_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.6005)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 qo M=8 us=49.13 gb=181.4
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 qo M=8 us=79.17 gb=112.6
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 qo M=8 us=44.01 gb=202.5
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 qo M=8 us=71.93 gb=123.9
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 qo M=8 us=40.64 gb=219.3
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 qo M=8 us=66.37 gb=134.3
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 qo M=8 us=29.37 gb=303.5
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 qo M=8 us=53.31 gb=167.2
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 qo M=8 us=40.70 gb=219.0
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 qo M=8 us=66.33 gb=134.4
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 qo M=8 us=34.36 gb=259.4
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 qo M=8 us=53.44 gb=166.8
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 qo M=8 us=43.87 gb=203.2
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 qo M=8 us=62.23 gb=143.2
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 qo M=8 us=41.20 gb=216.3
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 qo M=8 us=70.37 gb=126.7
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 qo M=8 us=36.37 gb=245.0
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 qo M=8 us=49.45 gb=180.2
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 qo M=8 us=29.53 gb=301.8
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 qo M=8 us=51.02 gb=174.7
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 qo M=8 us=36.33 gb=245.3
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 qo M=8 us=49.41 gb=180.4
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 qo M=8 us=24.38 gb=365.6
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 qo M=8 us=51.23 gb=174.0
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 qo M=8 us=28.30 gb=315.0
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 qo M=8 us=58.34 gb=152.8
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 qo M=8 us=28.40 gb=313.8
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 qo M=8 us=92.05 gb=96.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 qo M=8 us=22.91 gb=389.1
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 qo M=8 us=49.10 gb=181.5
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 qo M=8 us=28.23 gb=315.7
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 qo M=8 us=88.81 gb=100.4
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 qo M=8 us=23.02 gb=387.1
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 qo M=8 us=53.08 gb=167.9
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 qo M=8 us=22.72 gb=392.3
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 qo M=8 us=97.50 gb=91.4
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 qo M=8 us=28.43 gb=313.5
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 qo M=8 us=50.65 gb=176.0
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 qo M=8 us=25.89 gb=344.3
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 qo M=8 us=65.35 gb=136.4
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 qo M=8 us=23.26 gb=383.2
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 qo M=8 us=41.81 gb=213.2
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 qo M=8 us=21.69 gb=411.0
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 qo M=8 us=56.28 gb=158.4
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 qo M=8 us=23.44 gb=380.2
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 qo M=8 us=46.87 gb=190.2
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 qo M=8 us=21.57 gb=413.2
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 qo M=8 us=56.70 gb=157.2
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 qo M=8 us=61.57 gb=144.8
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 qo M=8 us=108.53 gb=82.1
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 qo M=8 us=54.39 gb=163.9
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 qo M=8 us=164.79 gb=54.1
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 qo M=8 us=54.28 gb=164.2
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 qo M=8 us=91.56 gb=97.3
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 qo M=8 us=65.63 gb=135.8
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 qo M=8 us=171.58 gb=51.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 qo M=8 us=67.04 gb=132.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 qo M=8 us=91.69 gb=97.2
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 qo M=8 us=65.58 gb=135.9
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 qo M=8 us=177.46 gb=50.2
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 qo M=8 us=56.30 gb=158.3
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 qo M=8 us=98.91 gb=90.1
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 qo M=8 us=52.82 gb=168.7
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 qo M=8 us=104.84 gb=85.0
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 qo M=8 us=45.92 gb=194.1
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 qo M=8 us=85.06 gb=104.8
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 qo M=8 us=36.90 gb=241.5
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 qo M=8 us=89.38 gb=99.7
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 qo M=8 us=45.74 gb=194.9
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 qo M=8 us=85.13 gb=104.7
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 qo M=8 us=36.72 gb=242.8
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 qo M=8 us=90.09 gb=98.9
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 qo M=8 us=47.05 gb=189.4
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 qo M=8 us=88.39 gb=100.8
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 qo M=8 us=42.25 gb=210.9
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 qo M=8 us=194.18 gb=45.9
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 qo M=8 us=42.52 gb=209.6
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 qo M=8 us=68.61 gb=129.9
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 qo M=8 us=36.72 gb=242.7
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 qo M=8 us=150.43 gb=59.3
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 qo M=8 us=95.91 gb=92.9
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 qo M=8 us=194.21 gb=45.9
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 qo M=8 us=101.79 gb=87.6
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 qo M=8 us=379.71 gb=23.5
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 qo M=8 us=91.52 gb=97.4
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 qo M=8 us=159.47 gb=55.9
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 qo M=8 us=80.25 gb=111.1
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 qo M=8 us=275.12 gb=32.4
+QSPIKE_BEST fmt=w4 class=qo M=8 us=21.57 gb=413.2 eta=0.410 variant=bn64_bk128_w8_s4_u1_g0_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=qo M=8 variant=bn64_bk128_w8_s4_u1_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7213)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 gate_up M=1 us=82.91 gb=322.5
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 gate_up M=1 us=97.80 gb=273.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 gate_up M=1 us=83.08 gb=321.8
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 gate_up M=1 us=96.64 gb=276.7
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 gate_up M=1 us=80.78 gb=331.0
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 gate_up M=1 us=87.17 gb=306.7
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 gate_up M=1 us=75.92 gb=352.2
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 gate_up M=1 us=92.68 gb=288.5
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 gate_up M=1 us=79.36 gb=336.9
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 gate_up M=1 us=88.17 gb=303.3
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 gate_up M=1 us=78.40 gb=341.1
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 gate_up M=1 us=97.64 gb=273.9
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 gate_up M=1 us=82.64 gb=323.6
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 gate_up M=1 us=90.02 gb=297.0
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 gate_up M=1 us=82.71 gb=323.3
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 gate_up M=1 us=141.06 gb=189.6
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 gate_up M=1 us=81.30 gb=328.9
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 gate_up M=1 us=88.62 gb=301.7
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 gate_up M=1 us=77.40 gb=345.5
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 gate_up M=1 us=104.80 gb=255.1
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 gate_up M=1 us=80.46 gb=332.3
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 gate_up M=1 us=90.79 gb=294.5
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 gate_up M=1 us=75.50 gb=354.2
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 gate_up M=1 us=104.60 gb=255.6
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 gate_up M=1 us=43.74 gb=611.3
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 gate_up M=1 us=90.22 gb=296.4
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 gate_up M=1 us=43.70 gb=611.9
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 gate_up M=1 us=144.95 gb=184.5
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 gate_up M=1 us=43.90 gb=609.1
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 gate_up M=1 us=83.26 gb=321.1
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 gate_up M=1 us=42.84 gb=624.2
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 gate_up M=1 us=142.85 gb=187.2
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 gate_up M=1 us=44.54 gb=600.3
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 gate_up M=1 us=84.03 gb=318.2
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 gate_up M=1 us=43.42 gb=615.8
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 gate_up M=1 us=141.99 gb=188.3
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 gate_up M=1 us=43.75 gb=611.2
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 gate_up M=1 us=64.03 gb=417.6
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 gate_up M=1 us=43.54 gb=614.2
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 gate_up M=1 us=128.53 gb=208.0
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 gate_up M=1 us=44.40 gb=602.3
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 gate_up M=1 us=58.91 gb=453.9
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 gate_up M=1 us=43.06 gb=621.0
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 gate_up M=1 us=112.57 gb=237.5
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 gate_up M=1 us=44.93 gb=595.1
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 gate_up M=1 us=65.10 gb=410.7
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 gate_up M=1 us=43.67 gb=612.3
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 gate_up M=1 us=113.74 gb=235.1
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 gate_up M=1 us=83.67 gb=319.6
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 gate_up M=1 us=108.58 gb=246.2
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 gate_up M=1 us=83.27 gb=321.1
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 gate_up M=1 us=185.27 gb=144.3
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 gate_up M=1 us=84.00 gb=318.3
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 gate_up M=1 us=90.42 gb=295.7
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 gate_up M=1 us=84.81 gb=315.3
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 gate_up M=1 us=192.85 gb=138.6
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 gate_up M=1 us=85.19 gb=313.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 gate_up M=1 us=91.61 gb=291.9
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 gate_up M=1 us=85.60 gb=312.4
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 gate_up M=1 us=194.62 gb=137.4
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 gate_up M=1 us=82.88 gb=322.6
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 gate_up M=1 us=101.51 gb=263.4
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 gate_up M=1 us=82.98 gb=322.2
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 gate_up M=1 us=112.12 gb=238.5
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 gate_up M=1 us=83.89 gb=318.7
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 gate_up M=1 us=86.52 gb=309.1
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 gate_up M=1 us=79.68 gb=335.6
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 gate_up M=1 us=90.45 gb=295.6
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 gate_up M=1 us=84.32 gb=317.1
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 gate_up M=1 us=87.62 gb=305.2
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 gate_up M=1 us=80.05 gb=334.0
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 gate_up M=1 us=95.53 gb=279.9
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 gate_up M=1 us=46.83 gb=571.0
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 gate_up M=1 us=119.29 gb=224.2
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 gate_up M=1 us=46.65 gb=573.2
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 gate_up M=1 us=216.81 gb=123.3
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 gate_up M=1 us=44.41 gb=602.1
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 gate_up M=1 us=81.15 gb=329.5
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 gate_up M=1 us=44.40 gb=602.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 gate_up M=1 us=183.64 gb=145.6
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 gate_up M=1 us=101.93 gb=262.3
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 gate_up M=1 us=188.18 gb=142.1
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 gate_up M=1 us=107.09 gb=249.7
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 gate_up M=1 us=389.40 gb=68.7
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 gate_up M=1 us=98.30 gb=272.0
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 gate_up M=1 us=161.05 gb=166.0
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 gate_up M=1 us=90.33 gb=296.0
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 gate_up M=1 us=290.07 gb=92.2
+QSPIKE_BEST fmt=w4 class=gate_up M=1 us=42.84 gb=624.2 eta=0.619 variant=bn64_bk128_w4_s3_u1_g0_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=gate_up M=1 variant=bn64_bk128_w4_s3_u1_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7020)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 gate_up M=8 us=85.54 gb=312.6
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 gate_up M=8 us=101.75 gb=262.8
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 gate_up M=8 us=83.19 gb=321.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 gate_up M=8 us=97.13 gb=275.3
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 gate_up M=8 us=78.06 gb=342.5
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 gate_up M=8 us=91.62 gb=291.8
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 gate_up M=8 us=76.14 gb=351.2
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 gate_up M=8 us=93.00 gb=287.5
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 gate_up M=8 us=83.85 gb=318.9
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 gate_up M=8 us=92.84 gb=288.0
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 gate_up M=8 us=78.57 gb=340.3
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 gate_up M=8 us=97.89 gb=273.1
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 gate_up M=8 us=82.86 gb=322.7
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 gate_up M=8 us=90.53 gb=295.4
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 gate_up M=8 us=82.71 gb=323.3
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 gate_up M=8 us=140.89 gb=189.8
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 gate_up M=8 us=78.94 gb=338.7
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 gate_up M=8 us=86.81 gb=308.0
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 gate_up M=8 us=78.11 gb=342.3
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 gate_up M=8 us=104.57 gb=255.7
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 gate_up M=8 us=78.28 gb=341.6
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 gate_up M=8 us=87.62 gb=305.2
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 gate_up M=8 us=75.95 gb=352.1
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 gate_up M=8 us=104.32 gb=256.3
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 gate_up M=8 us=43.83 gb=610.0
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 gate_up M=8 us=70.47 gb=379.4
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 gate_up M=8 us=43.90 gb=609.1
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 gate_up M=8 us=146.86 gb=182.1
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 gate_up M=8 us=44.29 gb=603.7
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 gate_up M=8 us=64.45 gb=414.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 gate_up M=8 us=42.93 gb=622.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 gate_up M=8 us=143.48 gb=186.4
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 gate_up M=8 us=45.14 gb=592.3
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 gate_up M=8 us=72.73 gb=367.6
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 gate_up M=8 us=43.49 gb=614.8
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 gate_up M=8 us=142.87 gb=187.2
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 gate_up M=8 us=43.89 gb=609.2
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 gate_up M=8 us=67.95 gb=393.5
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 gate_up M=8 us=43.66 gb=612.4
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 gate_up M=8 us=129.10 gb=207.1
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 gate_up M=8 us=42.72 gb=625.9
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 gate_up M=8 us=62.70 gb=426.4
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 gate_up M=8 us=43.05 gb=621.1
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 gate_up M=8 us=112.42 gb=237.8
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 gate_up M=8 us=44.69 gb=598.3
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 gate_up M=8 us=72.84 gb=367.1
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 gate_up M=8 us=43.67 gb=612.3
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 gate_up M=8 us=113.40 gb=235.8
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 gate_up M=8 us=83.64 gb=319.7
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 gate_up M=8 us=113.81 gb=234.9
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 gate_up M=8 us=83.37 gb=320.7
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 gate_up M=8 us=185.37 gb=144.2
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 gate_up M=8 us=83.70 gb=319.5
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 gate_up M=8 us=96.79 gb=276.3
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 gate_up M=8 us=84.77 gb=315.4
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 gate_up M=8 us=193.88 gb=137.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 gate_up M=8 us=85.87 gb=311.4
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 gate_up M=8 us=98.09 gb=272.6
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 gate_up M=8 us=85.50 gb=312.7
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 gate_up M=8 us=194.87 gb=137.2
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 gate_up M=8 us=82.78 gb=323.0
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 gate_up M=8 us=103.96 gb=257.2
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 gate_up M=8 us=82.86 gb=322.7
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 gate_up M=8 us=110.77 gb=241.4
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 gate_up M=8 us=82.87 gb=322.7
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 gate_up M=8 us=90.41 gb=295.7
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 gate_up M=8 us=78.52 gb=340.5
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 gate_up M=8 us=93.09 gb=287.2
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 gate_up M=8 us=83.29 gb=321.0
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 gate_up M=8 us=91.72 gb=291.5
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 gate_up M=8 us=78.74 gb=339.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 gate_up M=8 us=96.64 gb=276.7
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 gate_up M=8 us=51.35 gb=520.7
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 gate_up M=8 us=91.59 gb=292.0
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 gate_up M=8 us=47.22 gb=566.3
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 gate_up M=8 us=219.82 gb=121.6
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 gate_up M=8 us=47.26 gb=565.8
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 gate_up M=8 us=72.15 gb=370.6
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 gate_up M=8 us=44.38 gb=602.4
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 gate_up M=8 us=185.09 gb=144.5
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 gate_up M=8 us=108.04 gb=247.5
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 gate_up M=8 us=199.77 gb=133.8
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 gate_up M=8 us=107.28 gb=249.3
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 gate_up M=8 us=391.58 gb=68.3
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 gate_up M=8 us=103.33 gb=258.8
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 gate_up M=8 us=164.55 gb=162.5
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 gate_up M=8 us=90.08 gb=296.8
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 gate_up M=8 us=289.15 gb=92.5
+QSPIKE_BEST fmt=w4 class=gate_up M=8 us=42.72 gb=625.9 eta=0.621 variant=bn64_bk128_w8_s3_u0_g0_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=gate_up M=8 variant=bn64_bk128_w8_s3_u0_g0_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=0.7476)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 down M=1 us=145.54 gb=183.7
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 down M=1 us=237.97 gb=112.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 down M=1 us=150.94 gb=177.1
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 down M=1 us=219.82 gb=121.6
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 down M=1 us=136.56 gb=195.8
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 down M=1 us=174.18 gb=153.5
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 down M=1 us=110.84 gb=241.2
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 down M=1 us=167.10 gb=160.0
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 down M=1 us=136.26 gb=196.2
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 down M=1 us=174.41 gb=153.3
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 down M=1 us=142.96 gb=187.0
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 down M=1 us=167.35 gb=159.8
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 down M=1 us=146.25 gb=182.8
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 down M=1 us=193.00 gb=138.5
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 down M=1 us=146.41 gb=182.6
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 down M=1 us=214.40 gb=124.7
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 down M=1 us=134.98 gb=198.1
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 down M=1 us=147.22 gb=181.6
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 down M=1 us=108.78 gb=245.8
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 down M=1 us=156.00 gb=171.4
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 down M=1 us=134.57 gb=198.7
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 down M=1 us=147.81 gb=180.9
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 down M=1 us=100.34 gb=266.5
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 down M=1 us=156.35 gb=171.0
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 down M=1 us=84.99 gb=314.6
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 down M=1 us=246.58 gb=108.4
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 down M=1 us=84.60 gb=316.1
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 down M=1 us=275.91 gb=96.9
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 down M=1 us=78.20 gb=341.9
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 down M=1 us=227.78 gb=117.4
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 down M=1 us=76.48 gb=349.6
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 down M=1 us=279.23 gb=95.8
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 down M=1 us=78.43 gb=340.9
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 down M=1 us=227.76 gb=117.4
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 down M=1 us=76.79 gb=348.2
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 down M=1 us=291.78 gb=91.6
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 down M=1 us=83.18 gb=321.4
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 down M=1 us=140.69 gb=190.1
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 down M=1 us=80.08 gb=333.9
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 down M=1 us=192.69 gb=138.8
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 down M=1 us=71.58 gb=373.6
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 down M=1 us=110.56 gb=241.8
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 down M=1 us=73.49 gb=363.8
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 down M=1 us=165.34 gb=161.7
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 down M=1 us=71.90 gb=371.9
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 down M=1 us=138.87 gb=192.5
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 down M=1 us=73.72 gb=362.7
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 down M=1 us=165.80 gb=161.3
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 down M=1 us=209.06 gb=127.9
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 down M=1 us=320.02 gb=83.6
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 down M=1 us=184.83 gb=144.7
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 down M=1 us=501.99 gb=53.3
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 down M=1 us=179.25 gb=149.2
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 down M=1 us=283.49 gb=94.3
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 down M=1 us=211.50 gb=126.4
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 down M=1 us=511.78 gb=52.2
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 down M=1 us=202.02 gb=132.4
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 down M=1 us=283.78 gb=94.2
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 down M=1 us=211.63 gb=126.3
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 down M=1 us=537.18 gb=49.8
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 down M=1 us=164.18 gb=162.9
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 down M=1 us=297.36 gb=89.9
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 down M=1 us=164.49 gb=162.6
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 down M=1 us=319.66 gb=83.6
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 down M=1 us=146.27 gb=182.8
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 down M=1 us=255.40 gb=104.7
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 down M=1 us=148.74 gb=179.8
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 down M=1 us=259.24 gb=103.1
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 down M=1 us=146.39 gb=182.7
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 down M=1 us=255.70 gb=104.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 down M=1 us=148.88 gb=179.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 down M=1 us=269.61 gb=99.2
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 down M=1 us=134.18 gb=199.3
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 down M=1 us=450.48 gb=59.4
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 down M=1 us=131.86 gb=202.8
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 down M=1 us=565.89 gb=47.3
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 down M=1 us=109.82 gb=243.5
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 down M=1 us=240.17 gb=111.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 down M=1 us=109.51 gb=244.2
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 down M=1 us=441.87 gb=60.5
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 down M=1 us=300.89 gb=88.9
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 down M=1 us=756.31 gb=35.4
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 down M=1 us=313.95 gb=85.2
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 down M=1 us=1145.84 gb=23.3
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 down M=1 us=290.62 gb=92.0
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 down M=1 us=480.40 gb=55.7
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 down M=1 us=257.27 gb=103.9
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 down M=1 us=809.10 gb=33.0
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk2 down M=1 us=55.47 gb=482.1
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk4 down M=1 us=48.73 gb=548.7
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk2 down M=1 us=56.04 gb=477.2
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk4 down M=1 us=50.19 gb=532.7
+QSPIKE_BEST fmt=w4 class=down M=1 us=48.73 gb=548.7 eta=0.544 variant=bn64_bk128_w8_s3_u0_g0_sk4 skipped=0
+QSPIKE_CAP fmt=w4 class=down M=1 variant=bn64_bk128_w8_s3_u0_g0_sk4 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=1.2027)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 down M=8 us=156.68 gb=170.7
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 down M=8 us=242.26 gb=110.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 down M=8 us=150.68 gb=177.5
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 down M=8 us=219.57 gb=121.8
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 down M=8 us=143.79 gb=186.0
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 down M=8 us=217.31 gb=123.0
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 down M=8 us=110.63 gb=241.7
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 down M=8 us=165.68 gb=161.4
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 down M=8 us=144.48 gb=185.1
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 down M=8 us=217.46 gb=123.0
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 down M=8 us=142.99 gb=187.0
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 down M=8 us=166.02 gb=161.1
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 down M=8 us=148.17 gb=180.5
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 down M=8 us=190.74 gb=140.2
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 down M=8 us=146.07 gb=183.1
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 down M=8 us=212.80 gb=125.7
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 down M=8 us=140.54 gb=190.3
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 down M=8 us=160.12 gb=167.0
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 down M=8 us=118.08 gb=226.4
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 down M=8 us=156.68 gb=170.7
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 down M=8 us=140.50 gb=190.3
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 down M=8 us=160.63 gb=166.5
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 down M=8 us=114.72 gb=233.1
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 down M=8 us=157.52 gb=169.7
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 down M=8 us=85.84 gb=311.5
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 down M=8 us=173.41 gb=154.2
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 down M=8 us=85.49 gb=312.8
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 down M=8 us=281.05 gb=95.1
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 down M=8 us=70.40 gb=379.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 down M=8 us=153.30 gb=174.4
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 down M=8 us=76.41 gb=349.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 down M=8 us=273.35 gb=97.8
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 down M=8 us=70.64 gb=378.5
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 down M=8 us=179.44 gb=149.0
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 down M=8 us=76.73 gb=348.5
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 down M=8 us=287.15 gb=93.1
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 down M=8 us=85.46 gb=312.9
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 down M=8 us=152.17 gb=175.7
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 down M=8 us=80.08 gb=333.9
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 down M=8 us=192.92 gb=138.6
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 down M=8 us=73.07 gb=365.9
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 down M=8 us=133.71 gb=200.0
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 down M=8 us=73.36 gb=364.5
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 down M=8 us=164.82 gb=162.2
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 down M=8 us=73.92 gb=361.7
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 down M=8 us=177.86 gb=150.3
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 down M=8 us=73.68 gb=362.9
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 down M=8 us=165.09 gb=162.0
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 down M=8 us=212.36 gb=125.9
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 down M=8 us=353.12 gb=75.7
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 down M=8 us=184.86 gb=144.6
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 down M=8 us=501.88 gb=53.3
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 down M=8 us=193.75 gb=138.0
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 down M=8 us=302.07 gb=88.5
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 down M=8 us=211.80 gb=126.2
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 down M=8 us=515.18 gb=51.9
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 down M=8 us=219.67 gb=121.7
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 down M=8 us=302.20 gb=88.5
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 down M=8 us=211.71 gb=126.3
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 down M=8 us=538.99 gb=49.6
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 down M=8 us=176.83 gb=151.2
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 down M=8 us=304.53 gb=87.8
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 down M=8 us=164.85 gb=162.2
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 down M=8 us=313.63 gb=85.3
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 down M=8 us=148.87 gb=179.6
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 down M=8 us=269.77 gb=99.1
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 down M=8 us=150.45 gb=177.7
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 down M=8 us=265.82 gb=100.6
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 down M=8 us=149.12 gb=179.3
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 down M=8 us=270.04 gb=99.0
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 down M=8 us=150.56 gb=177.6
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 down M=8 us=272.07 gb=98.3
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 down M=8 us=150.06 gb=178.2
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 down M=8 us=271.95 gb=98.3
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 down M=8 us=133.43 gb=200.4
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 down M=8 us=579.52 gb=46.1
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 down M=8 us=128.40 gb=208.2
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 down M=8 us=203.22 gb=131.6
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 down M=8 us=109.47 gb=244.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 down M=8 us=447.51 gb=59.7
+QSPIKE w4 bn256_bk64_w4_s2_u0_g0_sk1 down M=8 us=306.60 gb=87.2
+QSPIKE w4 bn256_bk64_w4_s2_u0_g1_sk1 down M=8 us=766.13 gb=34.9
+QSPIKE w4 bn256_bk64_w4_s2_u1_g0_sk1 down M=8 us=313.98 gb=85.2
+QSPIKE w4 bn256_bk64_w4_s2_u1_g1_sk1 down M=8 us=1146.27 gb=23.3
+QSPIKE w4 bn256_bk64_w8_s2_u0_g0_sk1 down M=8 us=297.40 gb=89.9
+QSPIKE w4 bn256_bk64_w8_s2_u0_g1_sk1 down M=8 us=494.21 gb=54.1
+QSPIKE w4 bn256_bk64_w8_s2_u1_g0_sk1 down M=8 us=257.21 gb=104.0
+QSPIKE w4 bn256_bk64_w8_s2_u1_g1_sk1 down M=8 us=804.53 gb=33.2
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk2 down M=8 us=56.16 gb=476.2
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk4 down M=8 us=49.69 gb=538.1
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk2 down M=8 us=56.83 gb=470.5
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk4 down M=8 us=50.51 gb=529.4
+QSPIKE_BEST fmt=w4 class=down M=8 us=49.69 gb=538.1 eta=0.534 variant=bn64_bk128_w4_s3_u0_g0_sk4 skipped=0
+QSPIKE_CAP fmt=w4 class=down M=8 variant=bn64_bk128_w4_s3_u0_g0_sk4 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=ok(maxabs=1.3149)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 lm_head M=1 us=1195.98 gb=276.4
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 lm_head M=1 us=1206.86 gb=273.9
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 lm_head M=1 us=1190.24 gb=277.8
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 lm_head M=1 us=972.42 gb=340.0
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 lm_head M=1 us=1181.41 gb=279.8
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 lm_head M=1 us=1190.07 gb=277.8
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 lm_head M=1 us=1150.59 gb=287.3
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 lm_head M=1 us=1040.42 gb=317.8
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 lm_head M=1 us=1176.46 gb=281.0
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 lm_head M=1 us=1182.26 gb=279.6
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 lm_head M=1 us=1178.11 gb=280.6
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 lm_head M=1 us=1036.24 gb=319.1
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 lm_head M=1 us=1162.68 gb=284.4
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 lm_head M=1 us=1139.81 gb=290.1
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 lm_head M=1 us=1144.15 gb=289.0
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 lm_head M=1 us=1346.66 gb=245.5
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 lm_head M=1 us=1148.16 gb=288.0
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 lm_head M=1 us=1166.46 gb=283.4
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 lm_head M=1 us=1135.89 gb=291.1
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 lm_head M=1 us=984.48 gb=335.8
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 lm_head M=1 us=1135.61 gb=291.1
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 lm_head M=1 us=1158.37 gb=285.4
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 lm_head M=1 us=1123.81 gb=294.2
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 lm_head M=1 us=977.31 gb=338.3
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 lm_head M=1 us=600.04 gb=551.0
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 lm_head M=1 us=640.10 gb=516.5
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 lm_head M=1 us=592.33 gb=558.2
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 lm_head M=1 us=1639.37 gb=201.7
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 lm_head M=1 us=592.95 gb=557.6
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 lm_head M=1 us=643.38 gb=513.9
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 lm_head M=1 us=587.98 gb=562.3
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 lm_head M=1 us=1696.93 gb=194.8
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 lm_head M=1 us=582.35 gb=567.7
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 lm_head M=1 us=645.79 gb=512.0
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 lm_head M=1 us=570.75 gb=579.3
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 lm_head M=1 us=1466.93 gb=225.4
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 lm_head M=1 us=589.54 gb=560.8
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 lm_head M=1 us=532.56 gb=620.8
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 lm_head M=1 us=580.76 gb=569.3
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 lm_head M=1 us=1214.92 gb=272.1
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 lm_head M=1 us=597.53 gb=553.3
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 lm_head M=1 us=517.07 gb=639.4
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 lm_head M=1 us=583.65 gb=566.5
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 lm_head M=1 us=1049.57 gb=315.0
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 lm_head M=1 us=595.89 gb=554.8
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 lm_head M=1 us=594.07 gb=556.5
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 lm_head M=1 us=579.12 gb=570.9
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 lm_head M=1 us=1068.93 gb=309.3
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 lm_head M=1 us=1186.79 gb=278.6
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 lm_head M=1 us=1162.78 gb=284.3
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 lm_head M=1 us=1190.66 gb=277.7
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 lm_head M=1 us=1607.32 gb=205.7
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 lm_head M=1 us=1181.08 gb=279.9
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 lm_head M=1 us=1171.89 gb=282.1
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 lm_head M=1 us=1187.38 gb=278.4
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 lm_head M=1 us=1602.02 gb=206.4
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 lm_head M=1 us=1169.04 gb=282.8
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 lm_head M=1 us=1161.86 gb=284.6
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 lm_head M=1 us=1179.01 gb=280.4
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 lm_head M=1 us=1469.18 gb=225.0
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 lm_head M=1 us=1190.30 gb=277.8
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 lm_head M=1 us=1179.67 gb=280.3
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 lm_head M=1 us=1191.55 gb=277.5
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 lm_head M=1 us=1107.64 gb=298.5
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 lm_head M=1 us=1130.83 gb=292.4
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 lm_head M=1 us=1198.18 gb=275.9
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 lm_head M=1 us=1180.90 gb=280.0
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 lm_head M=1 us=1099.36 gb=300.7
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 lm_head M=1 us=1127.50 gb=293.2
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 lm_head M=1 us=1193.63 gb=277.0
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 lm_head M=1 us=1172.56 gb=282.0
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 lm_head M=1 us=1002.75 gb=329.7
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 lm_head M=1 us=547.40 gb=604.0
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 lm_head M=1 us=706.94 gb=467.7
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 lm_head M=1 us=567.49 gb=582.6
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 lm_head M=1 us=3910.96 gb=84.5
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 lm_head M=1 us=580.33 gb=569.7
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 lm_head M=1 us=566.73 gb=583.4
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 lm_head M=1 us=560.20 gb=590.2
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 lm_head M=1 us=1984.95 gb=166.6
+QSPIKE_BEST fmt=w4 class=lm_head M=1 us=517.07 gb=639.4 eta=0.634 variant=bn64_bk128_w8_s3_u0_g1_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=lm_head M=1 variant=bn64_bk128_w8_s3_u0_g1_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=skip(lm_head fp32 参考省略,bitwise 钉 + kv CHECK 已覆盖)
+QSPIKE w4 bn64_bk64_w4_s2_u0_g0_sk1 lm_head M=8 us=1295.85 gb=255.1
+QSPIKE w4 bn64_bk64_w4_s2_u0_g1_sk1 lm_head M=8 us=1267.71 gb=260.8
+QSPIKE w4 bn64_bk64_w4_s2_u1_g0_sk1 lm_head M=8 us=1196.01 gb=276.4
+QSPIKE w4 bn64_bk64_w4_s2_u1_g1_sk1 lm_head M=8 us=984.88 gb=335.7
+QSPIKE w4 bn64_bk64_w4_s3_u0_g0_sk1 lm_head M=8 us=1191.06 gb=277.6
+QSPIKE w4 bn64_bk64_w4_s3_u0_g1_sk1 lm_head M=8 us=1195.46 gb=276.6
+QSPIKE w4 bn64_bk64_w4_s3_u1_g0_sk1 lm_head M=8 us=1158.22 gb=285.4
+QSPIKE w4 bn64_bk64_w4_s3_u1_g1_sk1 lm_head M=8 us=1056.31 gb=313.0
+QSPIKE w4 bn64_bk64_w4_s4_u0_g0_sk1 lm_head M=8 us=1197.47 gb=276.1
+QSPIKE w4 bn64_bk64_w4_s4_u0_g1_sk1 lm_head M=8 us=1188.04 gb=278.3
+QSPIKE w4 bn64_bk64_w4_s4_u1_g0_sk1 lm_head M=8 us=1193.52 gb=277.0
+QSPIKE w4 bn64_bk64_w4_s4_u1_g1_sk1 lm_head M=8 us=1048.39 gb=315.4
+QSPIKE w4 bn64_bk64_w8_s2_u0_g0_sk1 lm_head M=8 us=1174.19 gb=281.6
+QSPIKE w4 bn64_bk64_w8_s2_u0_g1_sk1 lm_head M=8 us=1151.54 gb=287.1
+QSPIKE w4 bn64_bk64_w8_s2_u1_g0_sk1 lm_head M=8 us=1158.81 gb=285.3
+QSPIKE w4 bn64_bk64_w8_s2_u1_g1_sk1 lm_head M=8 us=1345.36 gb=245.7
+QSPIKE w4 bn64_bk64_w8_s3_u0_g0_sk1 lm_head M=8 us=1160.42 gb=284.9
+QSPIKE w4 bn64_bk64_w8_s3_u0_g1_sk1 lm_head M=8 us=1173.81 gb=281.7
+QSPIKE w4 bn64_bk64_w8_s3_u1_g0_sk1 lm_head M=8 us=1150.08 gb=287.5
+QSPIKE w4 bn64_bk64_w8_s3_u1_g1_sk1 lm_head M=8 us=989.60 gb=334.1
+QSPIKE w4 bn64_bk64_w8_s4_u0_g0_sk1 lm_head M=8 us=1150.49 gb=287.4
+QSPIKE w4 bn64_bk64_w8_s4_u0_g1_sk1 lm_head M=8 us=1163.08 gb=284.3
+QSPIKE w4 bn64_bk64_w8_s4_u1_g0_sk1 lm_head M=8 us=1139.15 gb=290.2
+QSPIKE w4 bn64_bk64_w8_s4_u1_g1_sk1 lm_head M=8 us=979.59 gb=337.5
+QSPIKE w4 bn64_bk128_w4_s2_u0_g0_sk1 lm_head M=8 us=588.06 gb=562.2
+QSPIKE w4 bn64_bk128_w4_s2_u0_g1_sk1 lm_head M=8 us=575.72 gb=574.3
+QSPIKE w4 bn64_bk128_w4_s2_u1_g0_sk1 lm_head M=8 us=604.52 gb=546.9
+QSPIKE w4 bn64_bk128_w4_s2_u1_g1_sk1 lm_head M=8 us=1679.80 gb=196.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g0_sk1 lm_head M=8 us=608.00 gb=543.8
+QSPIKE w4 bn64_bk128_w4_s3_u0_g1_sk1 lm_head M=8 us=555.52 gb=595.1
+QSPIKE w4 bn64_bk128_w4_s3_u1_g0_sk1 lm_head M=8 us=598.43 gb=552.5
+QSPIKE w4 bn64_bk128_w4_s3_u1_g1_sk1 lm_head M=8 us=1652.79 gb=200.0
+QSPIKE w4 bn64_bk128_w4_s4_u0_g0_sk1 lm_head M=8 us=606.77 gb=544.9
+QSPIKE w4 bn64_bk128_w4_s4_u0_g1_sk1 lm_head M=8 us=620.36 gb=532.9
+QSPIKE w4 bn64_bk128_w4_s4_u1_g0_sk1 lm_head M=8 us=581.61 gb=568.4
+QSPIKE w4 bn64_bk128_w4_s4_u1_g1_sk1 lm_head M=8 us=1495.60 gb=221.1
+QSPIKE w4 bn64_bk128_w8_s2_u0_g0_sk1 lm_head M=8 us=587.60 gb=562.7
+QSPIKE w4 bn64_bk128_w8_s2_u0_g1_sk1 lm_head M=8 us=572.11 gb=577.9
+QSPIKE w4 bn64_bk128_w8_s2_u1_g0_sk1 lm_head M=8 us=591.64 gb=558.8
+QSPIKE w4 bn64_bk128_w8_s2_u1_g1_sk1 lm_head M=8 us=1218.69 gb=271.3
+QSPIKE w4 bn64_bk128_w8_s3_u0_g0_sk1 lm_head M=8 us=589.00 gb=561.3
+QSPIKE w4 bn64_bk128_w8_s3_u0_g1_sk1 lm_head M=8 us=561.51 gb=588.8
+QSPIKE w4 bn64_bk128_w8_s3_u1_g0_sk1 lm_head M=8 us=593.90 gb=556.7
+QSPIKE w4 bn64_bk128_w8_s3_u1_g1_sk1 lm_head M=8 us=1058.41 gb=312.4
+QSPIKE w4 bn64_bk128_w8_s4_u0_g0_sk1 lm_head M=8 us=590.87 gb=559.5
+QSPIKE w4 bn64_bk128_w8_s4_u0_g1_sk1 lm_head M=8 us=726.07 gb=455.3
+QSPIKE w4 bn64_bk128_w8_s4_u1_g0_sk1 lm_head M=8 us=590.05 gb=560.3
+QSPIKE w4 bn64_bk128_w8_s4_u1_g1_sk1 lm_head M=8 us=1063.11 gb=311.0
+QSPIKE w4 bn128_bk64_w4_s2_u0_g0_sk1 lm_head M=8 us=1184.54 gb=279.1
+QSPIKE w4 bn128_bk64_w4_s2_u0_g1_sk1 lm_head M=8 us=1169.92 gb=282.6
+QSPIKE w4 bn128_bk64_w4_s2_u1_g0_sk1 lm_head M=8 us=1201.36 gb=275.2
+QSPIKE w4 bn128_bk64_w4_s2_u1_g1_sk1 lm_head M=8 us=1623.73 gb=203.6
+QSPIKE w4 bn128_bk64_w4_s3_u0_g0_sk1 lm_head M=8 us=1194.57 gb=276.8
+QSPIKE w4 bn128_bk64_w4_s3_u0_g1_sk1 lm_head M=8 us=1180.01 gb=280.2
+QSPIKE w4 bn128_bk64_w4_s3_u1_g0_sk1 lm_head M=8 us=1201.04 gb=275.3
+QSPIKE w4 bn128_bk64_w4_s3_u1_g1_sk1 lm_head M=8 us=1618.71 gb=204.2
+QSPIKE w4 bn128_bk64_w4_s4_u0_g0_sk1 lm_head M=8 us=1180.54 gb=280.1
+QSPIKE w4 bn128_bk64_w4_s4_u0_g1_sk1 lm_head M=8 us=1169.10 gb=282.8
+QSPIKE w4 bn128_bk64_w4_s4_u1_g0_sk1 lm_head M=8 us=1190.14 gb=277.8
+QSPIKE w4 bn128_bk64_w4_s4_u1_g1_sk1 lm_head M=8 us=1482.68 gb=223.0
+QSPIKE w4 bn128_bk64_w8_s2_u0_g0_sk1 lm_head M=8 us=1180.00 gb=280.2
+QSPIKE w4 bn128_bk64_w8_s2_u0_g1_sk1 lm_head M=8 us=1194.70 gb=276.7
+QSPIKE w4 bn128_bk64_w8_s2_u1_g0_sk1 lm_head M=8 us=1204.99 gb=274.4
+QSPIKE w4 bn128_bk64_w8_s2_u1_g1_sk1 lm_head M=8 us=1101.96 gb=300.0
+QSPIKE w4 bn128_bk64_w8_s3_u0_g0_sk1 lm_head M=8 us=1153.74 gb=286.6
+QSPIKE w4 bn128_bk64_w8_s3_u0_g1_sk1 lm_head M=8 us=1206.12 gb=274.1
+QSPIKE w4 bn128_bk64_w8_s3_u1_g0_sk1 lm_head M=8 us=1194.31 gb=276.8
+QSPIKE w4 bn128_bk64_w8_s3_u1_g1_sk1 lm_head M=8 us=1094.82 gb=302.0
+QSPIKE w4 bn128_bk64_w8_s4_u0_g0_sk1 lm_head M=8 us=1153.12 gb=286.7
+QSPIKE w4 bn128_bk64_w8_s4_u0_g1_sk1 lm_head M=8 us=1198.74 gb=275.8
+QSPIKE w4 bn128_bk64_w8_s4_u1_g0_sk1 lm_head M=8 us=1187.66 gb=278.4
+QSPIKE w4 bn128_bk64_w8_s4_u1_g1_sk1 lm_head M=8 us=998.78 gb=331.0
+QSPIKE w4 bn128_bk128_w4_s2_u0_g0_sk1 lm_head M=8 us=567.32 gb=582.8
+QSPIKE w4 bn128_bk128_w4_s2_u0_g1_sk1 lm_head M=8 us=601.29 gb=549.8
+QSPIKE w4 bn128_bk128_w4_s2_u1_g0_sk1 lm_head M=8 us=573.59 gb=576.4
+QSPIKE w4 bn128_bk128_w4_s2_u1_g1_sk1 lm_head M=8 us=3882.44 gb=85.2
+QSPIKE w4 bn128_bk128_w8_s2_u0_g0_sk1 lm_head M=8 us=606.62 gb=545.0
+QSPIKE w4 bn128_bk128_w8_s2_u0_g1_sk1 lm_head M=8 us=698.59 gb=473.3
+QSPIKE w4 bn128_bk128_w8_s2_u1_g0_sk1 lm_head M=8 us=570.62 gb=579.4
+QSPIKE w4 bn128_bk128_w8_s2_u1_g1_sk1 lm_head M=8 us=2002.02 gb=165.1
+QSPIKE_BEST fmt=w4 class=lm_head M=8 us=555.52 gb=595.1 eta=0.590 variant=bn64_bk128_w4_s3_u0_g1_sk1 skipped=0
+QSPIKE_CAP fmt=w4 class=lm_head M=8 variant=bn64_bk128_w4_s3_u0_g1_sk1 capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok ref=skip(lm_head fp32 参考省略,bitwise 钉 + kv CHECK 已覆盖)
+QSPIKE_SUMMARY fmt=w4 class=kv M=1 us=18.89 gb=117.9 eta=0.117 variant=bn64_bk128_w8_s4_u1_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=qo M=1 us=21.59 gb=412.9 eta=0.410 variant=bn64_bk128_w8_s4_u1_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=gate_up M=1 us=42.84 gb=624.2 eta=0.619 variant=bn64_bk128_w4_s3_u1_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=down M=1 us=48.73 gb=548.7 eta=0.544 variant=bn64_bk128_w8_s3_u0_g0_sk4
+QSPIKE_SUMMARY fmt=w4 class=lm_head M=1 us=517.07 gb=639.4 eta=0.634 variant=bn64_bk128_w8_s3_u0_g1_sk1
+QSPIKE_ETA fmt=w4 M=1 weighted_eta=0.482 weighted_gbps=486.1 assume=0.75 dev_pct=-35.7 step_bytes_gb=4.021 step_time_ms=8.271 (roofline=1008GB/s 权重字节口径)
+QSPIKE_SUMMARY fmt=w4 class=kv M=8 us=20.55 gb=108.4 eta=0.108 variant=bn64_bk128_w8_s4_u1_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=qo M=8 us=21.57 gb=413.2 eta=0.410 variant=bn64_bk128_w8_s4_u1_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=gate_up M=8 us=42.72 gb=625.9 eta=0.621 variant=bn64_bk128_w8_s3_u0_g0_sk1
+QSPIKE_SUMMARY fmt=w4 class=down M=8 us=49.69 gb=538.1 eta=0.534 variant=bn64_bk128_w4_s3_u0_g0_sk4
+QSPIKE_SUMMARY fmt=w4 class=lm_head M=8 us=555.52 gb=595.1 eta=0.590 variant=bn64_bk128_w4_s3_u0_g1_sk1
+QSPIKE_ETA fmt=w4 M=8 weighted_eta=0.472 weighted_gbps=475.7 assume=0.75 dev_pct=-37.1 step_bytes_gb=4.021 step_time_ms=8.453 (roofline=1008GB/s 权重字节口径)
+QSPIKE_ANCHOR fmt=w4 dev_pct=-37.1..-35.7 assume=0.75 threshold=±10% (>10% → 锚修正条款一次;判定留控制器)
+```
+
+### 逐档最优 η 表(从 QSPIKE_BEST/SUMMARY 行汇总;η = gb/1008)
+
+W8(胜出 variant 全记录;每步字节加权合计按调用数 72/72/72/36/1):
+
+| 类 (N,K) | 每步字节占比 | M=1 η (GB/s) | M=8 η (GB/s) | 胜出 variant |
+|---|---|---|---|---|
+| kv (1024,4096) | 4.0% | 0.278 (280.5) | 0.307 (309.0) | bn64_bk128_w4_s4_sk1 |
+| qo (4096,4096) | 16.0% | 0.816 (822.3) | 0.815 (821.9) | bn64_bk128_w4_s4_sk1 |
+| gate_up (12288,4096) | 47.9% | 0.877 (884.4) | 0.876 (882.9) | bn64_bk128_w4_s4_sk1 |
+| down (4096,12288) | 23.9% | 0.863 (869.8) | 0.864 (870.4) | bn64_bk128_w4_s4_**sk2** |
+| lm_head (151936,4096) | 8.2% | 0.934 (941.4) | 0.917 (924.0) | bn64_bk128_w4_s4_sk1 |
+| **加权合计** | 100% | **0.800 (806.2)** | **0.807 (813.2)** | GEMM 面 9.391 / 9.311 ms/步 |
+
+W4(同口径):
+
+| 类 (N,K) | 每步字节占比 | M=1 η (GB/s) | M=8 η (GB/s) | 胜出 variant |
+|---|---|---|---|---|
+| kv (1024,4096) | 4.0% | 0.117 (117.9) | 0.108 (108.4) | bn64_bk128_w8_s4_**u1**_g0_sk1 |
+| qo (4096,4096) | 16.0% | 0.410 (412.9) | 0.410 (413.2) | bn64_bk128_w8_s4_**u1**_g0_sk1 |
+| gate_up (12288,4096) | 47.9% | 0.619 (624.2) | 0.621 (625.9) | M=1 bn64_bk128_w4_s3_**u1**_g0_sk1 / M=8 bn64_bk128_w8_s3_**u0**_g0_sk1 |
+| down (4096,12288) | 23.9% | 0.544 (548.7) | 0.534 (538.1) | bn64_bk128_{w8_s3 / w4_s3}_**u0**_g0_**sk4** |
+| lm_head (151936,4096) | 8.2% | 0.634 (639.4) | 0.590 (595.1) | bn64_bk128_{w8_s3 / w4_s3}_**u0**_**g1**_sk1 |
+| **加权合计** | 100% | **0.482 (486.1)** | **0.472 (475.7)** | GEMM 面 8.271 / 8.453 ms/步 |
+
+### 变体面判读(形态结论,供 Task 1 段 A 定档 / Task 4 段 B)
+
+- **BLOCK_N=64 全胜**(W8/W4 五档全部胜出配置 bn64):M≤16 小瓦片下 CTA 数主导(64 CTAs@N=4096 vs bn128 32);BK=128 > BK=64 全带,stages 4≥3>2,warps 4≈8 带内(±1%)。
+- **down split-K 受益**(W8 sk1 最优 62.24µs/808.8 → sk2 57.83µs/870.4 = +7.6%:64→128 programs 整 1 波;W4 sk1 76.48 → sk4 48.73µs = ×1.57;fp32 partials + 确定性 reduce 代价可忽略)。
+- **kv 未受益于 split-K**(sk2–sk8 全劣于 sk1 ~40%):kv kernel 13.6–15.0µs 量级,reduce 第二发 launch 间隔主导,微基准轮转口径下 kv 即 launch/欠填充-bound(η 0.28–0.31 为该口径真实下界;字节占比仅 4%,加权拖累 0.04–0.05;引擎内 graph 相邻发射的真实 kv 成本留 Task 2 引擎内账)。qo 同为 N=4096 欠填充形(64 CTAs,η 0.815),任务口径未评 sk;Task 1 autotune 可按同先例开放。
+- **W4 组形态:g0(组对齐,BLOCK_K=128 整除组)为主形态**;g1 逐元素 gather 在低占用类灾难(gate_up bn128_w4_s2_u1:g0 566 → g1 122 GB/s;u1g1 组合全域 85–271 GB/s)——仅 lm_head(594–1187 CTAs 高占用)下 g1≈g0 带内且偶小胜(555.5µs g1 vs 608.0 g0)。**段 B 定档建议:BLOCK_K=128 组对齐,gather 形态出局**。
+- **W4 unpack 两法 g0 下平手**:u0(移位掩码拆半双 dot)vs u1(tl.interleave 单 dot)差 <±5%(down bn64_w4_s3_g0:u0 78.20 vs u1 76.48µs;胜出配置两法都有)→ 段 B 两法皆可入 autotune,无定档必要。
+- **W4 vs W8 同类开销比 = unpack/组反量化 ALU 税的实测**(R1 风险兑现):gate_up ×0.71、down ×0.62、lm_head ×0.68、qo ×0.50、kv ×0.39。
+- 数值门:W8 maxabs 0.59–0.97(kv/qo/gate_up)、down 1.12–1.51(K=12288 点积更长);W4 0.60–0.75 / down 1.20–1.31。atol=1.0 下 down 类靠 rtol 项兜住(Task 1 正式 TOL 标定时 down 类需单独标定,勿复用 1.0)。
+
+### capture 证据(20/20 全过;M6 T5 协议)
+
+逐 (fmt, class, M) 胜出配置:`torch.cuda.CUDAGraph` 捕获(捕获前 side-stream warmup×3,workspace 捕获前就位)→ 重放×2 `torch.equal` 逐位钉 + eager 同输入 launch 逐位对照 + `set_sync_debug_mode(2)` 下 launch 零 host 同步;非 lm_head 类另对 fp32 dequant 参考锚 assert_close(spike 级容差)。QSPIKE_CAP 20 行(上方 stdout 逐字)全部 `capture=ok replay_bitwise=True eager_bitwise=True sync_debug=ok`,ref maxabs 0.55–1.51(spike 宽松门内)。split-K 胜出类(down)捕获含主 kernel + reduce 双发射,重放逐位同(确定性 second-pass 复验)。torch 侧注:`set_sync_debug_mode` 为 prototype 特性(首调打 UserWarning,如实记录)。
+
+### 锚修正判定数据(段 0 → 控制器;**本节只交数据与建议,判定行留控制器**)
+
+锚推导假设(spec §1):W8 η=0.85、W4 η=0.75(权重字节口径);修正条款:>10% 偏离允许一次修正。
+
+| fmt | weighted η 实测 (M=1 / M=8) | 假设 | dev | 条款线 ±10% |
+|---|---|---|---|---|
+| W8 | 0.800 / 0.807 | 0.85 | **−5.9% / −5.1%** | 不触发 |
+| W4 | 0.482 / 0.472 | 0.75 | **−35.7% / −37.1%** | 触发 |
+
+- **W8(建议:锚不动,GO 口径成立)**:实测 dev 在 ±10% 内,条款不触发。GEMM 面 9.391(M=1)/ 9.311(M=8)ms/步 vs 假设 8.89ms:+0.42~0.50ms,由锚自带余量吸收——按段 0 GEMM 面推算 W8 C=8 TPOT ≈ 9.31+2.04+0.19 ≈ 11.5 GPU → ~12.3ms ≤ 14.0 锚(余量 ~12%);C=1 ≈ 9.39+非 GEMM ≈ ~9.9 ≤ 10.5 锚(推算口径,终仪式实测为准)。加权 η 被 kv(launch-bound,占比 4%)拖 ~0.04;**主类面(gate_up+down+qo+lm_head,96% 字节)η = 0.85–0.93,段 B 门若按「kernel η ≥ 80% roofline」读段 A kernel 质量,主类全过、加权 0.80 刚过线**。
+- **W4(条款触发;两个选项留控制器裁,建议 A)**:段 0 探索级 kernel 加权 η 0.47–0.48,对 0.75 假设偏离 −36~−37%。按 η=0.48 修正口径,GEMM 面 ≈ 8.45ms,W4 C=8 TPOT 推算 ≈ 8.45+2.2+0.19 ≈ 11.2ms > 现锚 10.5 → **现 W4 锚按段 0 数据不过**。选项 A:行使一次修正,把 W4 锚改写到实测口径(η≈0.48 → C=8 ≤ ~12ms 量级,精确值由控制器按 M8 台账裁),docs 记录原推导与新锚后写死;选项 B:维持 0.75 锚 → 段 B 按门 NO-GO(W4 挪 M8),除非段 B kernel 形态实测(打包宽载、寄存器级交织等未探面)压到 0.75。段 B 开工资格门(spec §1 另取 0.80)按段 0 数据同样不过(探索级)。
+- 如实边界:以上 η 为**探索级 kernel + 孤立冷口径**数字(坏数据是段 0 的目的,未修到好看);W4 未探面(宽载 unpack、scale 预广播、双 buffer)与引擎内 L2 环境都可能改变段 B 终值;W4 判定本就门控到 Task 4。
+
+### 口径注记
+
+同日同机(RTX 4090;物理 GPU 1,`CUDA_VISIBLE_DEVICES=1`;每腿跑前 `nvidia-smi` 验净 4MiB;前台 timeout 3500s);torch 2.13.0+cu130 / triton 3.7.1;轮转 36 套(lm_head 8 套,22.4GB 超显存的如实偏离,单套 > L2 70× 充分冷);轮转套由 randn 过**真实 quantize 函数**构建(dequant 值 ~N(0,1) 逼真分布,capture fp32 参考对拍 atol 口径才成立;字节随机性对带宽无差);QSPIKE stdout 逐字进本节(上两个 code block);证据归档 `/tmp/opencode/m7/`(spike_w8.log / spike_w4.log 全文);调试用 `--classes kv` 冒烟两轮(W8 一轮 + W4 一轮,后者暴露 unpack_w4 设备 bug)不计入账;quantize 单测重跑复绿(`4 passed`);本节树 = 694b4dc + 本 commit。M7 段 0 不打 tag、不 push(留用户)。
