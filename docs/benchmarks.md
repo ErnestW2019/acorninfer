@@ -902,3 +902,130 @@ TOL 标定账(`tests/test_decode_gemm.py` 模块头,协议 `tests/triton_utils.p
 偏差清单(如实):①gate_up 按 per-call [12288,4096]×2 接线评估(预注册决策;融合口径仅作探针参照,理由零存储变更);②iter2 曾加宽 autotune 网格致 warm 3.22s 超 <2s 目标 → 按探针证据回削至终版(warm 1.16s 达标),宽网格数据留档不入产;③TRANS_B/CACHE 访存变体、PAD_X、SWAP、split>2、stages 5/6、BN=32 七类变体探针证伪(噪声级或更差),kernel 内仅保留 TRANS_B/CACHE constexpr(缺省 (0,0) 与初版逐位同,变体账在 docstring);④EngineConfig.gemm_layout 字段施工后回退 + 对应测试撤下(17 项而非 18);⑤iter4 探针脚本曾绕过整除断言触发 illegal access(gate_up split3/6 非整除),为探针脚本缺陷非 kernel 缺陷(`_launch` 断言在档),已在新进程修复复测。
 
 口径注记(照前节同款):同日同机(物理 GPU 1,RTX 4090,24GB;每轮跑前 nvidia-smi 验净 4 MiB / 0 进程,前台 timeout ≥1800s);冷口径协议 = 段 0 `--gemm-cold` 同款(36 套独立权重轮转,warmup 一整轮 + 计 5 轮 ÷ 轮×36,CUDA event 计时;nn 变体 8 套轮转);autotune 仪 = 8 套轮转同协议;证据归档 `/tmp/opencode/m6t5/`(cold_cublas.py、calib_tol.py、run_configure.py、iter3/4/5/6 探针脚本 + 全部 stdout log、configure_cold.log / configure_iter2.log / configure_final.log)。
+
+## M6 终账(2026-11-01,收官仪式:零漂移硬证 + 双轨仪式轨 1 主验 + 判定行落笔,真机输出)
+
+**裁决记录(承段 0/控制器)**:段 0 四腿拆账数据面收口——RECOVER 清单 Σ ≈ **0.51ms**(knobs 0.00(H)+ layout down-NN hybrid 0.40(M)+ overhead prep 0.10(M)+ commit_lens 0.005(H)),对残余缺口 ~2.0–2.1ms;裁决门条件 1(Σ < 2.31ms)成立,缺口主体两读法并存下**控制器取读法 B(物理屋顶口径)段 2 立项,限范围**(仅 gate_up [12288,4096]×2/call 与 down [4096,12288] 两类;qkv/o 冷口径已 88–92% roofline、lm_head 93.5% 峰值不接;接入阀 = triton 冷口径超该类 cuBLAS 最优变体 ≥5%)。段 2 结局见前节:两类 +1.1~+2.5% 全部未过阀,**兑现 0ms**。
+
+**计划偏离(控制器批准,如实入档)**:双轨仪式的轨 2(TP=2)**免跑**——M6 五个施工任务(T1/T1b/T2-4/T5)全部如实 no-op、生产净变化 = 零(零漂移硬证见下),TP=2 外溢量问题在零 delta 下 moot,轨 2 终账数字延续 M5 收官(vLLM TP=2 99.44/321.79/541.94 vs AcornInfer 满配方 72.92/233.09/349.40,达标率 73.3%/72.4%/64.5%)。本仪式 = **轨 1 主验**。
+
+### 终账·零漂移硬证(先行,生产净变化 = 零)
+
+`git diff 7a20a12..HEAD --stat -- acorninfer/`(原样;逐行核对):
+
+```
+ acorninfer/ops/decode_gemm.py | 493 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 493 insertions(+)
+```
+
+唯一运行时树差异 = M6 Task 5 新增的 `acorninfer/ops/decode_gemm.py`;grep 全仓核实**零运行时 import**(仅 `tests/test_decode_gemm.py` 引用;engine/models/server 运行时链只 import paged_attention/rope/rmsnorm,config.py 还原至 240f0cc)——生产行为与 7a20a12 逐字节同,硬门自然成立。
+
+全量回归三尾行(零换金;跑前双卡各 4 MiB 验净):
+
+| 套件 | 命令 | 尾行(逐字) | 判定 |
+|---|---|---|---|
+| fast | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q` | `155 passed, 6 skipped, 17 deselected, 1 warning in 11.11s` | = 预期(T5 后基线),零改动 ✓ |
+| slow | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q -m slow` | `17 passed, 161 deselected in 398.53s (0:06:38)` | golden 原样,零换金 ✓ |
+| 双卡 tp 全套 | `CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m pytest -q tests/test_tp_eager.py tests/test_tp_engine.py tests/test_tp_server.py` | `13 passed in 18.90s`;跑后双卡回落 4 MiB 双查,无计算进程 | 全绿 ✓ |
+
+tp 计数注记(如实):计划头基线行写「双卡 tp 全套 **16 passed**」;三个 TP 测试文件(M5 期 20e8059→7a20a12 全部提交)在任意提交点收集数最多为 **13 项**(eager 1 + engine 3 + server 8 函数含 e2e 参数化 ×2 = 13),16 从未与文件收集吻合——计数入档以实跑尾行为准,文件与 7a20a12 基线逐字节同(零换金结构成立),差异本身如实记录不抹平。
+
+### 终账·in-process 终bench 零漂移(对照 M5/M6 收官带)
+
+命令(每跑前 GPU 1 验净 4 MiB,三样本串行):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_ab.py --label m6_final`(warmup 10 + 计 30,stdout 逐字归档 `/tmp/opencode/m6t6/m6_final_s{1,2,3}.log`):
+
+| 样本(step_ms) | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| m6_final s1 | 18.00 | 19.91 | 19.16 | 21.19 |
+| m6_final s2 | 17.93 | 19.92 | 19.14 | 21.37 |
+| m6_final s3 | 17.94 | 19.92 | 19.23 | 21.23 |
+| 当日带(M6 段 0–段 2 基线带) | 17.91–17.96 | 19.87–19.93 | 19.13–19.35 | 21.11–21.28 |
+
+判定(如实):graph 两档 12 样本全部贴当日带(C=1 graph 17.93–18.00,s1 18.00 出历史带顶 17.96 +0.04——基线带极差本 0.04–0.05ms 级噪声;C=8 graph 19.91–19.92 与 T2-4 收官锚 19.91/19.92 逐位同带)——**引擎级零漂移成立**;eager C=8 s2 21.37 出带顶 +0.09(该档历史带宽本宽,T0 有 22.24 离带先例如实入档),其余在带。零生产 delta 与零漂移互证。
+
+### 终账·轨 1 仪式(GPU 0 同卡对照;照 M5 配方,AcornInfer 腿升级满配方)
+
+配方注记(照抄 + 偏离如实):命令/端口/协议照 docs M5 节原样(seed=20261027、in=128/out=32、temperature=0、max_tokens=32、warmup 1 条不计入;`ss -tlnp` 取真身 PID 定向 kill,每腿切换双卡 4 MiB 验净)。**两处口径升级如实入档**:①M5 轨 1 验收腿为 in-process 满配方(server 无配方旗标所致);M5 修复后 server 支持 `--attention-backend/--fused-ops/--cuda-graph`,本仪式**主验腿 = AcornInfer HTTP 满配方 8200**(HTTP 对 HTTP,产品真实路径);②GPU 归属按本仪式派单**全腿 GPU 0 同卡**(M5:vLLM GPU 0 / AcornInfer GPU 1;双 4090 同型,in-process 数字与 M5 GPU 1 带零漂移互证双卡等价)。vLLM 就绪 ~40 s;每腿起跑前 `nvidia-smi` 双卡 4 MiB 实录在档。
+
+命令原样(四腿串行):
+
+- vLLM TP=1:`CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90 --dtype bfloat16`
+- AcornInfer HTTP 满配方(主验):`CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --attention-backend triton --fused-ops --cuda-graph`
+- AcornInfer in-process graph(M5 验收口径延续腿):`CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32 --attention-backend triton --fused-ops --cuda-graph`;eager:同去 `--cuda-graph`
+- AcornInfer HTTP 缺省配方(补充口径):`CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --port 8200`
+- 压测:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:{8100|8200} --concurrency 1 4 8`
+
+RESULT 行逐字(stdout 原样归档 `/tmp/opencode/m6t6/leg{A..E}_*.log`;`RESULT-VLLM` 前缀为 `bench_remote` 固定标签):
+
+- vLLM TP=1 HTTP 8100:`RESULT-VLLM C=1 ttft_p50=0.0270s ttft_mean=0.0270s tpot_mean=16.89ms tok_s=58.12`
+- (续)`RESULT-VLLM C=4 ttft_p50=0.0682s ttft_mean=0.0576s tpot_mean=17.86ms tok_s=207.49`
+- (续)`RESULT-VLLM C=8 ttft_p50=0.0810s ttft_mean=0.0740s tpot_mean=17.81ms tok_s=355.91`
+- AcornInfer HTTP 满配方 8200(主验):`RESULT-VLLM C=1 ttft_p50=0.0379s ttft_mean=0.0379s tpot_mean=18.31ms tok_s=52.85`
+- (续)`RESULT-VLLM C=4 ttft_p50=0.0814s ttft_mean=0.0814s tpot_mean=20.72ms tok_s=174.26`
+- (续)`RESULT-VLLM C=8 ttft_p50=0.1846s ttft_mean=0.1665s tpot_mean=20.96ms tok_s=276.55`
+- AcornInfer in-process graph(满配方,M5 验收口径):`RESULT C=1 ttft_p50=0.0393s ttft_mean=0.0393s tpot_mean=17.96ms tok_s=53.68`
+- (续)`RESULT C=4 ttft_p50=0.0777s ttft_mean=0.0777s tpot_mean=19.54ms tok_s=187.27`
+- (续)`RESULT C=8 ttft_p50=0.1446s ttft_mean=0.1446s tpot_mean=19.97ms tok_s=296.88`
+- AcornInfer in-process eager(triton+fused):`RESULT C=1 ttft_p50=0.0360s ttft_mean=0.0360s tpot_mean=19.61ms tok_s=49.70`
+- (续)`RESULT C=4 ttft_p50=0.0845s ttft_mean=0.0845s tpot_mean=21.03ms tok_s=173.81`
+- (续)`RESULT C=8 ttft_p50=0.1465s ttft_mean=0.1465s tpot_mean=21.17ms tok_s=281.80`
+- AcornInfer HTTP 缺省配方 sdpa(补充口径):`RESULT-VLLM C=1 ttft_p50=0.0364s ttft_mean=0.0364s tpot_mean=26.98ms tok_s=36.67`
+- (续)`RESULT-VLLM C=4 ttft_p50=0.1237s ttft_mean=0.1019s tpot_mean=44.85ms tok_s=85.12`
+- (续)`RESULT-VLLM C=8 ttft_p50=0.2061s ttft_mean=0.1857s tpot_mean=60.82ms tok_s=111.91`
+
+**轨 1 表(M6 终账;vLLM HTTP vs AcornInfer 满配方两口径 + eager/缺省补充):**
+
+| 腿 | C=1 tok/s | C=4 tok/s | C=8 tok/s | TTFT p50 C=1/4/8 (s) | TPOT mean C=1/4/8 (ms) |
+|---|---|---|---|---|---|
+| vLLM TP=1 HTTP | 58.12 | 207.49 | 355.91 | 0.0270 / 0.0682 / 0.0810 | 16.89 / 17.86 / 17.81 |
+| AcornInfer HTTP 满配方(**主验腿,M6 口径**) | 52.85 | 174.26 | 276.55 | 0.0379 / 0.0814 / 0.1846 | 18.31 / 20.72 / 20.96 |
+| AcornInfer in-process graph(M5 验收口径,延续对照) | 53.68 | 187.27 | 296.88 | 0.0393 / 0.0777 / 0.1446 | 17.96 / 19.54 / 19.97 |
+| AcornInfer in-process eager(triton+fused) | 49.70 | 173.81 | 281.80 | 0.0360 / 0.0845 / 0.1465 | 19.61 / 21.03 / 21.17 |
+| AcornInfer HTTP 缺省配方 sdpa(**非验收口径**) | 36.67 | 85.12 | 111.91 | 0.0364 / 0.1237 / 0.2061 | 26.98 / 44.85 / 60.82 |
+
+达标率算术(逐档,AcornInfer ÷ vLLM):
+
+- **主验(HTTP 满配方)**:C=1 52.85/58.12 = **90.9%**、C=4 174.26/207.49 = **84.0%**、C=8 276.55/355.91 = **77.7%**;
+- M5 验收口径(in-process graph):C=1 53.68/58.12 = **92.4%**、C=4 187.27/207.49 = **90.3%**、C=8 296.88/355.91 = **83.4%**——对 M5 收官带 92.4%/90.0%/83.7% = **+0.0 / +0.3 / −0.3 pp,机时漂移带内,轨 1 验收数字零漂移**;
+- eager 85.5%/83.8%/79.2%(M5 带 87.2/84.5/79.6);HTTP 缺省 63.1%/41.0%/31.4%(M5 带 61.7/42.4/32.6,含已知配方差,非验收口径)。
+
+判读(如实):①满配方 HTTP 主验对 M5 in-process 验收口径的差(C=8 296.88→276.55,×0.931)= SSE 流式全程开销在满配方引擎上的占比,与 M5 判读 4 的 HTTP 开销小修正项口径(×0.96–1.0 于缺省配方)同向偏大——C=8 档 TTFT 0.1846s 复刻 M5 in-process 同档 0.1450s + 发射合批排队轮廓(与 M5 HTTP 缺省腿 0.1931s 同型),如实记为主验口径的方法学代价,不进引擎归因;②vLLM 三档对 M5 收官 +0.1%/−0.1%/+0.5%,基线侧同样零漂移。
+
+**收服实录(每腿切换验净)**:vLLM 真身 PID 4105695(`ss -tlnp` 定位)定向 kill → 端口闭、双卡 4 MiB;AcornInfer 满配方 PID 4120684、缺省 PID 4193056 同法收服,均 SIGTERM 优雅退出、端口闭、双卡 4 MiB、无计算进程;全程无 pkill 模糊匹配,无包装壳误伤。
+
+### 终账·逐任务结局表(M6 五施工任务,全部如实 no-op,生产净变化 = 零)
+
+| 任务 | 面 | 结局 | 关键定量证据 |
+|---|---|---|---|
+| T1 | 布局面:down-only NN hybrid | **no-op**(双 C 门 FAIL) | C=8 graph −0.27~−0.34 ✓ / eager −0.18~−0.30 ✓,但 **C=1 graph 三样本 +0.06~+0.08 全出带**、C=1 eager +0.17~+0.51;归因微测定量闭环:M=1 下 NN 比 TN 慢 +1.3µs/层 × 36 ≈ +0.05ms/步,与实测 +0.06~+0.08 吻合——同一布局在 M=1(gemvx 行主)与 M=7/8(cutlass tile)方向相反,结构性 |
+| T1b | M 条件分派 down_t_m2(单存储 + 按批 M) | **revert + no-op**(C=1 门仍未过) | 形态探针:**[K,N] 单存储下 TN 原径(gemvx)不可达**(全部 M=1 形态落 cutlass NN 核 109.9~110.9µs hot)——获批分派的 C=1 救活机制被存储物理证伪;C=8 收益 −0.28~−0.35 复现 ✓,C=1 eager +0.11~+0.13(2/3 系统性,dispatch 面 +1.39µs/调用 + 核面差定量吻合)→ no-regression 门 FAIL 按预注册协议回退;双存储形态(+3.6GB 显存换 ~0.3ms)违零双存储红线,判不值,留台账 |
+| T2-4 | 开销面:mirror 批量 + commit_lens + H2D/D2H + pager scatter | **no-op**(施工面空集) | 四子项三个在禁改文件内(graph_runner.py :149-184),唯一解禁面(pager `_lens`)在 graph 门口径下**捕获期执行一次、重放不执行** = host 隐于 GPU 影;腿 4 三口径互证:真实 CPU 侧步内开销仅 172–218µs/步(M4.1 旧账「wall−GPU 1.70ms」修正归因 ~90% profiler 税),开销面不存在 1.7ms 可回收空间;零施工 → 改后 ≡ 改前,门 wall-step ≥ 0.05ms 不可能被合规改动满足 |
+| T5 | 段 2:decode GEMM triton kernel(限范围:gate_up + down) | **no-op**(零接线,cuBLAS TN 继续站岗) | 六轮探针迭代后两类逐桶最优仍仅 **+1.1~+2.5% < 接入阀 5%**(且 M=1 桶两类皆负);三层证据:①cuBLAS nn 变体逐轮漂移 ±5%,+2% 级优势统计不可靠;②**同瓦片纯读天花板 gate_up 920–934 / down ≤904 GB/s,GEMM 923/920 ≈ 100%**——kernel 已在其访问模式读上限;③triton 融合口径渐近线 937–944 仍低于阀线(cuBLAS 融合 947)——**阀不可达为形状物理,非工程欠账** |
+
+### 终账·可回收 → 兑现对照表(RECOVER Σ≈0.51ms 预估 vs 0ms 兑现,逐项死因)
+
+| RECOVER 项 | 预估 ms_c8(conf) | 兑现 | 死因(如实) |
+|---|---|---|---|
+| knobs_tuning_face | 0.00(H) | 0 | 12 组合死平(极差 0.04ms),实证排除;本就无施工面 |
+| layout_down_nn_hybrid | 0.40(M) | 0 | C=8 收益真实(引擎内复现 −0.27~−0.35)但 C=1 结构性回归(T1 微测定量闭环);M 条件分派救活被存储物理证伪(T1b:[K,N] 单存储 TN 不可达)→ 双 C 门 FAIL 不上线;布局面在 cuBLAS 维度收干 |
+| overhead_step_prep | 0.10(M) | 0 | 施工面全在禁改文件;解禁面捕获期影子化(graph 重放不执行 host 提交);真实 host prep 仅 ~0.17–0.19ms/步且隐于 GPU 影 → 合规改动不可能进 wall-step |
+| commit_lens_write | 0.005(H) | 0 | T0 已判「压缩价值趋零,不值得做」;调用链整体在禁改方法体内 |
+| (段 2 立项)triton GEMM | —(读法 B 物理面) | 0 | 两类 +1.1~+2.5% < 阀 5%;同瓦片纯读天花板 = GEMM 实测(99–100%),triton 渐近线 937–944 < cuBLAS 947——形状物理 |
+| **Σ** | **≈ 0.51** | **0** | 五面全部实证收干:三面(triton/布局/调参)kernel 与布局物理、一面(开销)禁改影子、一面(commit_lens)价值趋零 |
+
+### 终账·判定行(如实,本里程碑最重要的一行)
+
+**锚「TP=1 graph tok_s 逐档 ≥100%」未达**:主验(HTTP 满配方)90.9%/84.0%/77.7%,M5 验收口径(in-process graph)92.4%/90.3%/83.4%(对 M5 收官带 +0.0/+0.3/−0.3 pp,机时带内零漂移)——距 100% 线余 7.6–9.1 / 9.7–16.0 / 16.6–22.3 pp,逐档未过,**北极星继续挂账**。归因(三面实证闭环):**权重流访存天花板**——四类 GEMM 已在其访问模式的读上限 99–100%(gate_up 923 ≈ 同瓦片纯读 920 GB/s、down 902–911 ≈ 纯读 ≤904;qkv/o 冷口径 88–92% roofline、lm_head 93.5% 峰值),**cuBLAS ≈ 物理上限**;triton(段 2:+1.1~2.5% < 阀 5%,融合渐近线不及 cuBLAS)、布局(T1/T1b:C=1 结构性回归 + TN 单存储不可达)、调参(腿 2:12 组合死平)三面全部实证排除;引擎内 GEMM-vs-cold 罚金 +0.81ms 为 kernel 间 L2 干扰,非单 kernel 工程可回收。**差距定性为硬件访问模式物理,非实现缺陷**:vLLM 同口径有效带宽同带(C=8:13.9GB ÷ TPOT 17.81–17.85ms ≈ **779–780 GB/s**,我们引擎内 GEMM 窗 13.9GB ÷ 17.78ms = 782 GB/s)——**不是 vLLM 有魔法 kernel,是两者都贴着同一堵墙**(孤立冷口径 889 GB/s、4090 峰值 1008 GB/s 之上的系统性差距,只能在访存模式层面重开:更宽 M、权重常驻 L2 的批间复用、或融合存储改访问模式本身)。
+
+### 终账·M7 候选台账(留控制器,本里程碑不立项)
+
+- **triton decode_gemm 模块**(已入库未接线,`acorninfer/ops/decode_gemm.py` + 17 测试全绿):kernel/实测仪/阀机制可复跑,`configure()` 装载期直接可用;重开前提 = 融合存储或访问模式变更(届时阀线重算);
+- **双存储 down_t**(+3.6GB 显存换 ~0.3ms C=8,T1/T1b 实测收口):违零双存储红线,判不值;若显存预算放宽可整体重开(M 条件分派形态随存储物理一并重估);
+- **连续到达 bench 协议**:chunked 的收益场景(「不被长 prefill 阻塞」)不在同步批量到达协议内(M5 判读 3 挂账),需先建协议再裁 chunked 面价值;
+- **半宽 GEMM**(TP=2 半宽 37% 效率塌方,M5 段 0 实测):TP=2 北极星(73.3/72.4/64.5%)的 kernel 面第一候选;
+- **custom allreduce**(TP=2 集合通信 74 次/步,M5 段 0 微基准 17.84µs 在档):TP=2 通信栈候选,与半宽 GEMM 同轨;
+- **rank0 快失败**(TP 装载崩溃 rank1 先崩、rank0 慢败,M5 轨 2 BLOCKED 实录):工程健壮性项,非性能。
+
+### 终账·口径注记(照前节同款)
+
+同日同机(RTX 4090 ×2;in-process 终bench 物理 GPU 1、轨 1 仪式全腿物理 GPU 0;每腿跑前 `nvidia-smi` 验净 4 MiB / 0 进程,前台 timeout ≥1800s);全部腿 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);仪式四腿 + 终bench 三样本同窗口串行,腿间以双卡 4 MiB 验净为界;vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;13.9GB/步 = 段 0 腿 1 CHECK 口径(四类投影 + lm_head,含 lm_head 略偏高);证据归档 `/tmp/opencode/m6t6/`(m6_final 三样本 stdout、五腿 bench/server stdout 全文);本节树 = a13fa46 + 本 commit(docs)。M6 不打 tag、不 push(留用户)。
