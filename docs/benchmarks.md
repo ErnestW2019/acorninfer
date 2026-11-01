@@ -798,3 +798,25 @@ M=8:
 **判定行:留控制器**(两条件 + 两读法所需数据已齐,本节不裁)。
 
 口径注记(照前节同款):同日同机(物理 GPU 1,RTX 4090,24GB;每腿跑前 nvidia-smi 验净 4 MiB / 0 进程,前台运行 timeout ≥ 1800s);全部腿 seed=20261027 同批 prompt(token ids 直投),C=8 计时窗内 batch 恒 7(sid7 稳定期 EOS 退役,graph bucket 8 + 1 padding 行);m6_ab 协议 warmup 10 + 计 30;腿 1 冷口径参照 15.64ms 引 M5 段 0 补充二(M=7 四类投影,不含 lm_head);腿 4 wrapper 插桩为逐语句镜像(graph_runner.py @ c6b311b),语义零改动;全部 harness monkey-patch,引擎/模型源码零触碰;py-spy 目标为 `m6_ab.py --steps 30` 全四档长窗;证据归档 `/tmp/opencode/m6/`(四腿 stdout 全文 `*_official.log`/`layout_engine_t.log`、chrome trace `insitu_c{1,8}_{graph,eager}.json`、dmon 全文 `dmon_insitu.log`、py-spy raw `pyspy_overhead.raw` + 目标 stderr `pyspy_target.stderr.log`);锚 3.3ms 与门 2.31ms 引 spec §4 原文,今日残余缺口 ~2.0–2.1ms 为算术注明。
+
+### 段 1·布局账:down-NN hybrid 引擎内复测 —— 双 C 门未过,no-op 收尾(2026-11-01,`scripts/m6_ab.py --layout down_t`,真机输出)
+
+T0 裁决形态 = down-only NN hybrid(全局 NN 出局于 C=1 +0.64 回归;孤立 M=7/8 down NN −11.0~−11.2µs/层 = −0.40ms/步 C=8 口径,唯一胜者),本段 = M6 Task 1 的 Step 1 欠账复测(**先测后写码**:harness `--layout down_t` monkey-patch 仅 down_proj 进 NN,引擎/模型源码零触碰;双 C 门通过才进生产接线)。当日基线跑双样本、RETEST 跑三样本(交错执行控漂移;每跑前 nvidia-smi 验净 4 MiB):
+
+| 样本(step_ms) | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| baseline ×2(当日) | 17.91 / 17.91 | 19.87 / 19.89 | 19.11 / 19.18 | 21.11 / 21.17 |
+| RETEST down_t ×3 | 17.99 / 17.97 / 17.98 | 19.60 / 19.61 / 19.55 | 19.34 / 19.69 / 19.35 | 20.93 / 20.87 / 20.91 |
+| Δ(同日配对) | **+0.06 ~ +0.08** | **−0.27 ~ −0.34** | **+0.17 ~ +0.51** | −0.18 ~ −0.30 |
+
+RETEST stdout 逐字(三样本,`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_ab.py --layout down_t --label down_t`):
+
+- `RETEST down_t C=1 mode=graph step_ms=17.99 tpot_ms=18.01` / `C=8 graph 19.60` / `C=1 eager 19.34` / `C=8 eager 20.93`(样本 1)
+- `RETEST down_t C=1 mode=graph step_ms=17.97 tpot_ms=17.99` / `C=8 graph 19.61` / `C=1 eager 19.69` / `C=8 eager 20.87`(样本 2)
+- `RETEST down_t C=1 mode=graph step_ms=17.98 tpot_ms=18.00` / `C=8 graph 19.55` / `C=1 eager 19.35` / `C=8 eager 20.91`(样本 3)
+
+M=1 归因微测(补 T0 腿 3 盲区「M=1 gemvx 面 NN 未做孤立打分」;`/tmp/opencode/m6t1/attr_m1_down.py`,36 套权重冷口径轮转,down [N=4096, K=12288] bf16,M=1):`ATTR down m=1 variant=tn us=110.15 gb=914` / `variant=nn us=111.43 gb=904`(复跑 tn2=109.74 / nn2=111.08 同向)——**M=1 下 NN 比 TN 慢 +1.3µs/层 × 36 层 ≈ +0.05ms/步,与 C=1 graph 实测 +0.06~+0.08 定量吻合**:C=1 流量的 down 跑在 M=1,NN 布局在该 M 略输 gemvx 对 [N,K] 行主布局的访存;C=8 流量跑 M=7/8(cutlass TN tile),NN 的 [K,N] 布局赢 −11µs/层。同一布局在两类 M 上方向相反,是无条件 hybrid 的结构性矛盾。
+
+判定(双 C 门,如实):C=8 graph 收益 −0.27~−0.34 ≥ 0.2ms ✓、C=8 eager −0.18~−0.30 ✓;但 **C=1 graph 三样本 +0.06~+0.08 全出带(基线带极差 0.04,历史带顶 17.96)且 C=1 eager 三样本全劣于同日基线(+0.17~+0.51)→ no-regression 门 FAIL → 按派单停手:生产接线(qwen3 调用点分派 / EngineConfig / server CLI)不落地,本任务如实 no-op 收尾**。无 revert 面(生产零改动;fast 138 passed, 6 skipped, 17 deselected / slow 17 passed 全套件零改动复核通过)。T0 腿 3 的「孤立赢、引擎内输 = R2 实录」在 down-only 形态上兑现:RECOVER 清单 `layout_down_nn_hybrid ms_c8=0.40` 按引擎内实测修正为 **ms_c8=0.27~0.34 且 C=1 侧 −0.05ms 反向账,门未过不上线**。
+
+候选留存(裁决留控制器,本任务不越权落地):M 条件分派(如 batch≥2 才对 down 走 NN,M=1 维持 TN)两头可通吃——M=8 NN 胜 −11.2µs/层、M=1 TN 胜 +1.3µs/层,均为冷口径实测;但形态变更(布局选择器进 dispatch 面)超出本次裁决的「down-only NN hybrid」,需新裁决与同款双 C 门复测。

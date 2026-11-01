@@ -12,10 +12,15 @@
 (wall 21.50 / GPU 19.81 / gap 1.70 ms,graph C=8)同协议可比。窗口内任何
 提前退役 → RuntimeError 立即失败(测得的数据必须 batch 恒定)。
 
---layout <none|t|pad8|pad16>(缺省 none = 逐字节旧行为):harness 内
+--layout <none|t|down_t|pad8|pad16>(缺省 none = 逐字节旧行为):harness 内
 monkey-patch 投影模块(零仓库改动,仅脚本内),段 0 腿 3 的引擎内复测入口:
   t     权重装载后预变换 .t().contiguous() 存 [K,N](原 [N,K] 存储随之
         释放,显存不翻倍)+ 替换 forward 为 torch.mm(x2d, w_t);
+  down_t 同 t 的变换与 mm 前向,但仅打 down_proj(T0 裁决:全局 NN 出局
+        于 C=1 +0.64 回归,down-only NN 是唯一胜者;输出行 RETEST down_t;
+        2026-11-01 引擎内复测:C=8 graph −0.27~−0.34 ✓ 但 C=1 graph
+        +0.06~+0.08 / C=1 eager +0.17~+0.51 ✗ —— 双 C 门未过,生产接线
+        不落地,账目见 docs/benchmarks.md M6 段 1 布局账);
   pad8/pad16  权重不动,x2d 零填充行切片(F.linear(pad, W)[:M]);
   四类投影(q/k/v/o + gate/up/down)+ lm_head 全patch;embed/norm 不动。
     数值 = 同一数学的不同 cuBLAS 路径,bf16 下不保逐位(本脚本只计时;
@@ -49,8 +54,11 @@ def apply_layout_patch(model, layout: str) -> None:
         targets += [sa.q_proj, sa.k_proj, sa.v_proj, sa.o_proj,
                     mlp.gate_proj, mlp.up_proj, mlp.down_proj]
     targets.append(model.lm_head)
+    if layout == "down_t":
+        # T0 裁决形态:仅 down_proj 进 NN(m6_ab.py --layout t 的 down-only 腿)
+        targets = [layer.mlp.down_proj for layer in model.layers]
 
-    if layout == "t":
+    if layout in ("t", "down_t"):
         def make_forward(w_t, n):
             def forward(x):
                 m = x.numel() // x.shape[-1]
@@ -80,11 +88,12 @@ def apply_layout_patch(model, layout: str) -> None:
         for mod in targets:
             mod.forward = make_forward(mod.weight.data, p)
     else:
-        raise ValueError(f"layout must be none|t|pad8|pad16, got {layout!r}")
+        raise ValueError(
+            f"layout must be none|t|down_t|pad8|pad16, got {layout!r}")
 
 
 def run_combo(engine: Engine, model, c: int, warmup: int, steps: int,
-              label: str, mode: str) -> None:
+              label: str, mode: str, prefix: str = "AB") -> None:
     """C=c 档:prefill → 3 步稳定 → warmup → 计 30 步 → AB 行。"""
     vocab = model.cfg.vocab_size
     prompts = _prompts(c, 128, vocab, SEED)
@@ -120,7 +129,7 @@ def run_combo(engine: Engine, model, c: int, warmup: int, steps: int,
         if len(engine.seqs[i].generated_ids) > 1
     ]
     tpot_ms = sum(tpots) / len(tpots) * 1000
-    print(f"AB {label} C={c} mode={mode} step_ms={wall / steps * 1000:.2f} "
+    print(f"{prefix} {label} C={c} mode={mode} step_ms={wall / steps * 1000:.2f} "
           f"tpot_ms={tpot_ms:.2f}", flush=True)
     # 收尾:驱动到全部完成(按 length),drop 清场;下一档零残留
     while engine.has_pending():
@@ -133,7 +142,8 @@ def run_combo(engine: Engine, model, c: int, warmup: int, steps: int,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", default="baseline")
-    ap.add_argument("--layout", default="none", choices=["none", "t", "pad8", "pad16"])
+    ap.add_argument("--layout", default="none",
+                    choices=["none", "t", "down_t", "pad8", "pad16"])
     ap.add_argument("--bf16-reduction", default=None, choices=["true", "false"],
                     help="allow_bf16_reduced_precision_reduction;缺省 = torch 默认")
     ap.add_argument("--warmup", type=int, default=10)
@@ -160,9 +170,12 @@ def main() -> None:
         model.decode_graph = mode == "graph"
         engine = Engine(model, None, num_blocks=1024, page_size=16, max_running=8)
         try:
+            # down_t 腿(T0 裁决复测)输出行换 RETEST down_t 前缀,便于 grep 归档
+            prefix = "RETEST" if args.layout == "down_t" else "AB"
+            shown = "down_t" if args.layout == "down_t" else args.label
             for c in (1, 8):
                 run_combo(engine, model, c, args.warmup, args.steps,
-                          args.label, mode)
+                          shown, mode, prefix)
         finally:
             # 失败安全:del engine 先释放 KV pool / graph runner 引用,
             # empty_cache 回收池子;权重驻留 GPU,下个模式(eager)复用,
