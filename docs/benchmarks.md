@@ -2510,3 +2510,155 @@ PPLPOS quant=w8a16 counted=299007 mean_nll=2.308768 eval_s=80.1 peak_gib=15.78
 **装载耗时(R5 账延续)**:none load 30.6–31.1s(两次进程);w8a16 load 31.4 + apply 0.6(253 模块 RTN)+ configure 5.0(triton 缓存热)≈ **37.0s 全链**,120s 预算内 ✓。eval 耗时 none 75.7 / w8a16 80.1s(+5.8%,大 M 桶 dequant ALU 开销,prefill C=8 flop-bound 结论同源);peak VRAM 18.78(none,bf16 权重+logits)/15.78(w8a16,int8 存储)GiB。
 
 全套件复核:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **217 passed, 6 skipped, 17 deselected**(本任务零生产码改动,新增仅 `scripts/perplexity.py`(非测试路径,零收集)+ docs + .gitignore,golden 零换金)。证据归档 `/tmp/opencode/m7/`(wikitext.zip、wiki.test.raw 提取物、ppl_none.log、ppl_w8a16.log、ppl_windows_none.json、ppl_windows_w8a16.json)。本节树 = 17061b6 + 本 commit。不打 tag、不 push(留用户)。
+
+## M7 终账(2026-11-02,收官:全量回归 + in-process 终bench + 仪式三腿(轨 1,W4 腿撤销)+ 判定行落笔,真机输出)
+
+**仪式构成(承段 B 门裁决)**:段 B NO-GO(裁决在档:W4 kernel η 资格门 FAIL,0.472–0.482 vs 门 0.80,W4 挪 M8 台账)→ 计划四腿撤销 W4 腿,**仪式 = 三腿**:vLLM bf16 8100 → AcornInfer none 8200(满配方)→ AcornInfer w8a16 8200;轨 2 免跑(TP×quant 构造期互斥,无外溢面,照 plan Task 5)。
+
+### 终账·全量回归(零换金;跑前双卡各 4 MiB 验净)
+
+| 套件 | 命令 | 尾行(逐字) | 判定 |
+|---|---|---|---|
+| fast | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q` | `217 passed, 6 skipped, 17 deselected, 1 warning in 16.19s` | = Task 2/3 后基线,零改动 ✓ |
+| slow | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q -m slow` | `17 passed, 223 deselected in 416.51s (0:06:56)` | golden 17 原样,零换金 ✓ |
+| 双卡 tp 全套 | `CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m pytest -q tests/test_tp_eager.py tests/test_tp_engine.py tests/test_tp_server.py` | `13 passed in 18.97s`;跑后双卡回落 4 MiB 双查、零计算进程 | 全绿 ✓ |
+
+slow deselect 计数注记(如实):M6 终账基线行为 `17 passed, 161 deselected`(总收集 178);本日 223 deselected 系 M7 三个测试任务扩容后总收集 240 = 217 + 6 + 17,三套件计数自洽,golden 面本身零变化。
+
+### 终账·in-process 终bench(GPU 1;none 零漂移 + w8a16 复核)
+
+命令(五样本串行,stdout 逐字归档 `/tmp/opencode/m7t5/ab_*.log`):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_ab.py --label m7t5_{none,w8a16}_s{1,2,3}`(w8a16 加 `--quant w8a16`;warmup 10 + 计 30):
+
+| 样本 | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| none s1 | 17.92 | 19.91 | 19.19 | 21.15 |
+| none s2 | 17.91 | 19.89 | 19.14 | 21.14 |
+| M6 带 | 17.91–17.96 | 19.87–19.93 | 19.13–19.35 | 21.11–21.28 |
+| w8a16 s1 | 10.75 | 11.49 | 17.49 | 18.34 |
+| w8a16 s2 | 10.72 | 11.50 | 17.64 | 18.14 |
+| w8a16 s3 | 10.73 | 11.49 | 19.25 | 19.03 |
+| T2 带 | 10.74–11.02 | 11.54–11.68 | 16.65–17.59 | 16.77–18.13 |
+
+判定(如实):none 腿 8/8 全带内 = **引擎级零漂移硬证延续**;w8a16 graph C=1 10.72–10.75 与 T2 带底 10.74 带缘重合(−0.02~+0.01 噪声级)、C=8 11.49–11.50 低于 T2 带底 0.05(−0.4%,三样本同侧一致的有利侧机时偏快——none 腿同窗贴中带,非全局机时偏快;autotune 胜者轮转漂移先例同款,如实);eager 整体略偏慢 +0.3~+1.1ms(s3 19.25/19.03 最宽,该档历史带宽本宽 + 首跑机器态离带先例同款,graph 主口径不受影响)。锚轨迹终值:**C=8 graph 11.49–11.50(锚 ≤14.0);C=1 graph 10.72–10.75(锚 ≤10.5,未达,判定行如实裁)**。
+
+### 终账·仪式三腿(GPU 0 照 M5/M6 配方;逐腿 stdout 原样)
+
+配方注记(照抄 + gate-basis 腿如实):命令/端口/协议照 M6 终账节原样(seed=20261027、in=128/out=32、temperature=0、max_tokens=32、warmup 1 条不计入;`ss -tlnp` 取真身 PID 定向 kill:vLLM 55424 / none 70758 / w8a16 102713,均 SIGTERM 优雅退出、端口闭、双卡 4 MiB、无计算进程;每腿起跑前双卡 4 MiB 实录在档;全程无 pkill 模糊匹配)。vLLM 就绪 ~35s;AcornInfer none 就绪 ~30s、w8a16 就绪 ~36s(Δ≈+6s = apply+configure,装载耗时账同向)。**gate-basis 腿如实入档**:派单引用门(92.4/90.3/83.4 ±1pp)的原口径 = M5/M6 in-process graph,故在派单三腿之外照 M6 配方补跑一条 in-process graph none 腿(`acorninfer.bench`,M6 终账同款命令),供同基线读数;它不是第四条验收腿,是引用门自身的口径腿。
+
+命令原样(腿序照派单,gate-basis 腿居 none 之后):
+
+- vLLM TP=1:`CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90 --dtype bfloat16`
+- AcornInfer HTTP 满配方 none:`CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --attention-backend triton --fused-ops --cuda-graph`
+- AcornInfer HTTP 满配方 w8a16:同上加 `--quant w8a16`
+- gate-basis 腿(in-process graph none,M6 终账 92.4/90.3/83.4 原口径):`CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.bench --in-tokens 128 --out-tokens 32 --attention-backend triton --fused-ops --cuda-graph`
+- 压测:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:{8100|8200} --concurrency 1 4 8`
+
+逐腿 stdout 逐字(server 全文归档 `/tmp/opencode/m7t5/leg{A,B,B2,C}_*.log`;`RESULT-VLLM` 前缀为 `bench_remote` 固定标签):
+
+```
+# leg A:vLLM bf16 8100
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0267s ttft_mean=0.0267s tpot_mean=16.88ms tok_s=58.17
+RESULT-VLLM C=4 ttft_p50=0.0679s ttft_mean=0.0573s tpot_mean=17.87ms tok_s=207.57
+RESULT-VLLM C=8 ttft_p50=0.0804s ttft_mean=0.0732s tpot_mean=17.91ms tok_s=356.12
+
+# leg B:AcornInfer HTTP 满配方 none 8200
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0382s ttft_mean=0.0382s tpot_mean=18.32ms tok_s=52.79
+RESULT-VLLM C=4 ttft_p50=0.0824s ttft_mean=0.0823s tpot_mean=20.71ms tok_s=174.23
+RESULT-VLLM C=8 ttft_p50=0.1861s ttft_mean=0.1675s tpot_mean=20.95ms tok_s=276.06
+
+# leg B2:gate-basis 腿(in-process graph none,M6 原口径)
+RESULT C=1 ttft_p50=0.0346s ttft_mean=0.0346s tpot_mean=17.93ms tok_s=54.21
+RESULT C=4 ttft_p50=0.0775s ttft_mean=0.0775s tpot_mean=19.55ms tok_s=187.21
+RESULT C=8 ttft_p50=0.1455s ttft_mean=0.1455s tpot_mean=19.98ms tok_s=296.32
+
+# leg C:AcornInfer HTTP 满配方 w8a16 8200
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0358s ttft_mean=0.0358s tpot_mean=10.88ms tok_s=85.74
+RESULT-VLLM C=4 ttft_p50=0.1225s ttft_mean=0.1009s tpot_mean=12.11ms tok_s=266.58
+RESULT-VLLM C=8 ttft_p50=0.1903s ttft_mean=0.1714s tpot_mean=12.57ms tok_s=401.84
+```
+
+**仪式表(M7 终账):**
+
+| 腿 | C=1 tok/s | C=4 tok/s | C=8 tok/s | TTFT p50 C=1/4/8 (s) | TPOT mean C=1/4/8 (ms) |
+|---|---|---|---|---|---|
+| vLLM TP=1 HTTP bf16 | 58.17 | 207.57 | 356.12 | 0.0267 / 0.0679 / 0.0804 | 16.88 / 17.87 / 17.91 |
+| AcornInfer HTTP 满配方 none(零漂移证明腿) | 52.79 | 174.23 | 276.06 | 0.0382 / 0.0824 / 0.1861 | 18.32 / 20.71 / 20.95 |
+| AcornInfer HTTP 满配方 w8a16(**副锚腿**) | 85.74 | 266.58 | 401.84 | 0.0358 / 0.1225 / 0.1903 | 10.88 / 12.11 / 12.57 |
+| AcornInfer in-process graph none(gate-basis 口径腿,M6 终账同款) | 54.21 | 187.21 | 296.32 | 0.0346 / 0.0775 / 0.1455 | 17.93 / 19.55 / 19.98 |
+
+达标率算术(逐档,AcornInfer ÷ vLLM):
+
+- **none HTTP**:C=1 52.79/58.17 = **90.8%**、C=4 174.23/207.57 = **83.9%**、C=8 276.06/356.12 = **77.5%**;
+- **none in-process graph(gate 原口径)**:C=1 54.21/58.17 = **93.2%**、C=4 187.21/207.57 = **90.2%**、C=8 296.32/356.12 = **83.2%**;
+- **w8a16(副锚,对 vLLM bf16)**:C=1 85.74/58.17 = **147.4%**、C=4 266.58/207.57 = **128.4%**、C=8 401.84/356.12 = **112.8%**(预估 ~150% 量级的实测兑现:C=1 贴近预估,C=4/C=8 递减——递减主体非 decode 面,见判读②)。
+
+none 腿硬门读数(如实,三读法并列):
+
+1. **字面读法**(HTTP none 达标率 vs 引用门 92.4/90.3/83.4 ±1pp):90.8/83.9/77.5 = **−1.6 / −6.4 / −5.9 pp,超带**;
+2. **同基线读法 A**(HTTP none vs M6 终账同口径 HTTP 满配方腿 90.9/84.0/77.7):**−0.2 / −0.0 / −0.2 pp,带内**(tok_s 原值 −0.1% / 0.0% / −0.2%);
+3. **同基线读法 B**(in-process graph none vs 引用门原口径 92.4/90.3/83.4):**+0.8 / −0.1 / −0.2 pp,三档全带内**(tok_s 原值 +1.0% / 0.0% / −0.2%)。
+
+裁决依据(如实):字面超带是**口径错配的已知物理,非生产漂移**——引用门数字为 M5/M6 in-process graph 口径,三腿仪式的 none 腿为 HTTP 口径;HTTP/in-process 比 C=8 276.06/296.32 = ×0.932,M6 终账同口径 276.55/296.88 = ×0.932 **逐位复现**(= M6 终账判读①已入档的 SSE 全程流式开销 ×0.93)。同基线双读法 A、B 三档全带内 = **生产零漂移双证**(且 vLLM 基线侧对 M6 +0.1%/+0.0%/+0.1% 同样零漂移),「生产漂移疑云」被数据否定,**不触发 BLOCKED,终账照落**。
+
+判读(如实):①vLLM 三档对 M6 收官 58.12/207.49/355.91 = +0.1%/+0.0%/+0.1%,基线侧零漂移;②w8a16 达标率逐档递减(147.4→128.4→112.8)的拆读:decode-only TPOT 比 = 17.91/12.57 = ×1.43(C=8)恒定强劲,递减来自 out=32 短输出协议下 tok_s span 含 TTFT 全额——我方 C=8 TTFT p50 0.1903s vs vLLM 0.0804s(prefill flop-bound +5.8% 账 + 发射合批排队轮廓),TTFT 占比越高 tok_s 越被拖低,C=1 档 TTFT 占比小故 147.4% 最接近 decode 真值;③w8a16 TTFT 轮廓与 T2 prefill 账同向(C=1 0.0358 < none 0.0382 = 量化 prefill C=1 更快的兑现;C=8 0.1903 > none 0.1861 同向劣化);④HTTP none C=8 TTFT 0.1861 复刻 M6 0.1846 发射合批排队轮廓(同款如实,主验口径方法学代价)。
+
+### 终账·锚判定行(如实,本里程碑最重要的一行)
+
+**主锚「W8 C=8 TPOT ≤ 14.0ms」:过。** 两读法并给(实测口径):①**TPOT 直读 = 锚的原生口径**——HTTP w8a16 腿 C=8 tpot_mean **12.57ms ≤ 14.0 ✓**(余量 10.2%),in-process graph(m6_ab 终bench)**11.49–11.50ms ≤ 14.0 ✓**(余量 ~18%);②达标率换算口径:vLLM TPOT 17.91 ÷ 达标率 112.8% = 15.88ms,表面超锚——**该换算被 TTFT 差污染,如实注记不采信**(out=32 短输出下 tok_s span 含 TTFT 全额:我方 0.1903 vs vLLM 0.0804;decode-only TPOT 比 ×1.43,若 TTFT 等额则达标率应 ~142%、换算 ~12.5ms 与直读同带)。段 0 推算 12.3ms 与仪式直读 12.57 同带,推算链闭合。
+
+**C=1 锚「≤ 10.5ms」:未过,如实裁。** 实测:in-process graph 10.72–10.75(仪式终bench 三样本)/ HTTP 直读 10.88ms;对 10.5 = **+2.1~+2.4%(in-process)/ +3.6%(HTTP)**;三窗口互证语义一致(段 0 推算 ~9.9 → T2 轨迹 10.74–11.02 → 仪式 10.72–10.75,稳定高于锚 ~3%)。归因(数据闭环,**这是 GEMM 面假设的边界,非量化 kernel 缺陷**):①引擎内隐含 GEMM 面 9.26–9.29ms(C=1)与段 0 微基准 9.391ms 同带(隐含 η 0.81 vs 0.800)——**GEMM 面全额兑现,量化 kernel 无缺陷**(ppl −0.088%、capture 20/20+25/25 逐位、TOL 紧比 ≤0.43);②缺口主体在非投影面:M6 腿 1 实测 C=1 非投影 GPU 面 1.46ms/步(attention+norm+rope+copy+other),而段 0 锚推算假设非 GEMM ~0.5ms(9.39+0.5≈9.9 ≤ 10.5),实测口径 9.4+1.46 ≈ 10.85 ≈ 仪式实测 10.72–10.75——**锚推算对 C=1 非 GEMM 面占比低估,是未过的算术主因**;③结构性加重项:C=1 步时 10.7ms 下 kv 投影 M=1 launch/欠填充-bound(段 0 实证 η 0.28;字节占比 4% 但 72 发/步)与 lm_head M=1 大 GEMV(段 0 η 0.28–0.31 口径下界)的固定发射成本、host 面占比相对升高。10.5 锚的重开条件 = 非 GEMM 面收账(M8 台账新立项),不在 W8 kernel 域内。
+
+**精度锚「W8 ppl ≤ +1%」:过(负增量)。** ppl none **10.0709** / w8a16 **10.0620** = **−0.088%**(NLL 总额口径 −0.038% 同向;对称噪声不解读为量化更优,Task 3 账原样)。
+
+**段 B(W4A16):NO-GO(裁决在档)。** kernel η 资格门 FAIL(段 0 探索级加权 0.472–0.482 vs 门 0.80,缺口 ~67%;主类最高 gate_up 0.62;ALU 税 ×0.50–0.71 of W8 为结构性),W4 挪 M8;仪式 W4 腿按裁决撤销,一次锚修正权未行使、保留闭合(W8 条款未触发;W4 无需修正即 NO-GO,条款自然失效)。
+
+### 终账·η 表(段 0 微基准 vs Task 2 引擎内账)
+
+| 口径 | C=1(M=1) | C=8(M=8) |
+|---|---|---|
+| 段 0 微基准 GEMM 面(ms/步;36 套冷口径轮转) | 9.391 | 9.311 |
+| 段 0 加权 η(GB/s,roofline 1008 权重字节口径) | 0.800(806.2) | 0.807(813.2) |
+| Task 2 装载期 autotune 隐含 GEMM 面(五档 µs × 调用数 72/72/72/36/1) | —(装载期单 M 口径) | 10.35(η 0.726) |
+| Task 2 引擎内 m6_ab graph 步时(M7 终bench 带) | 10.72–10.75 | 11.49–11.50 |
+| 引擎内隐含 GEMM 面(步时 − 非投影面 1.46/2.03ms,M6 腿 1 bf16 实测口径) | 9.26–9.29 | 9.46–9.47 |
+| 引擎内隐含 η(7.57GB 权重流/步) | 0.81(815–818) | 0.79(800) |
+| 隐含 vs 段 0 微基准偏差 | −1.1~−1.4% | +1.6~+1.7% |
+
+判读:引擎内隐含 GEMM 面与孤立微基准互证同带(±2% 内)——**W8 kernel 在真实引擎环境(投影间 L2 干扰/相邻发射)零增益损失,微基准 η 直接兑现为生产 TPOT**;Task 2 装载期 autotune 口径(10.35ms / 0.726)为独立 harness 的低读(轮转/占用与段 0 不同),如实并列不作锚判据。前提注记:非投影面按 bf16 口径不变假设(W8 只换投影 kernel;attention/norm/rope/copy 不动,dispatch host 开销 30–50µs/步 T2 实证不可见);kv/lm_head 引擎内大 M 不出现(prefill_batch 只取行末位,M≤8 → decode 桶)。
+
+### 终账·ppl 三行与精度判定(引 Task 3 账)
+
+```
+PPL quant=none tokens=299078 nll_sum=690601.61 ppl=10.0709 windows=1167
+PPL quant=w8a16 tokens=299078 nll_sum=690337.84 ppl=10.0620 windows=1167
+PPLDELTA (10.0620/10.0709 − 1)×100% = −0.088%  → 精度锚 ≤ +1% ✓(负增量 = 对称噪声,不解读为量化更优)
+```
+
+(数据源 wikitext-2-raw wiki.test.raw 299,078 token / 滑窗 window=512 stride=256 counted=299,007;parity 账 8B 单请求 16/16 token 逐位一致、top-1 |Δ| ≤ 0.75 无 argmax 翻转,见段 A·接线账。)
+
+### 终账·prefill/TTFT 账(引用)
+
+T2 ABPREFILL 入账(原样):C=1 32.49→**31.56(−2.9%)✓** / C=8 142.50→**150.82(+5.8%)如实入账**(M=1024 flop-bound,dequant ALU 纯增开销;chunked prefill 预算切块下 M 更小、向 C=1 侧移动)。本终账 in-process 复核同向:C=1 31.65–32.11 vs none 32.62/32.63(量化更快兑现);C=8 153.79–154.40 vs none 141.35/144.30(罚金 +8.1%,略宽于 T2 的 +5.8%,单步墙钟口径噪声级,如实注记)。TTFT(仪式 HTTP):w8a16 C=1 0.0358s < none 0.0382s(单请求 128-token 场景净改善兑现);C=8 0.1903s > none 0.1861s(8 并发到齐 +4.2ms,同向劣化)。
+
+### 终账·装载耗时账(引 T2/Task 3 账 + 本仪式活证)
+
+none 30.8–34.3s(纯 bf16 读盘;本终bench 两样本 30.9/31.9);w8a16 load 30.7–31.2 + apply 0.5–0.6(253 模块 RTN)+ configure 5.0(triton 缓存热)/ 6.97(冷,含 JIT)≈ **36.2–38.7s 全链,预算 120s 内 ✓**(本终bench w8a16 s1:31.3 + 0.5 + 5.0 = 36.8)。本仪式活证:none 腿 server 就绪 ~30s vs w8a16 腿就绪 ~36s,Δ≈+6s ≈ apply+configure,与账同。磁盘量化缓存 = non-goal 不变。
+
+### 终账·段 B NO-GO(引用,裁决在档)
+
+段 B 门裁决(2026-11-02,Task 4 = NO-GO close-out,控制器裁)原样引用:三条件读数——①主锚 C=8:T2 A/B 轨迹 11.53–11.70 ≤ 14.0 ✓;②精度:W8 ppl 增量 −0.088% ✓;③**kernel η 资格门:FAIL——段 0 探索级加权 0.472–0.482 vs 门 0.80,缺口 ~67%;主类最高 gate_up 0.62;ALU 税为结构性 → 判定:段 B NO-GO,W4 挪 M8 台账**。附带否决轴:W4 净收益 ~0.9ms/步对已落地 W8 微薄;RTN W4 g128 精度典型 +2~5% ppl 数量级劣化。W4 复活条件:kernel 形态突破(marlin 级重构)/ 精度算法升级(GPTQ)/ 显存受限场景价值重估。
+
+### 终账·M8 台账(承 M6 终账 M7 候选台账 + 本里程碑移入/新立)
+
+- **W4A16 复活**(段 B NO-GO 移入):复活条件三条(形态突破/GPTQ/显存受限重估);若复活,锚按届时生产级实测重估(原 10.5 锚从未被测试,修正权已随 NO-GO 自然失效);
+- **GPTQ/AWQ**(算法域另立里程碑):W4 精度路径主候选,W8 RTN→GPTQ 亦受益;
+- **C=1 非 GEMM 面收账**(本终账新立,10.5 锚重开的唯一路径):C=1 非投影 GPU 面 1.46ms/步(M6 腿 1 口径)= attention/小核 launch 面(段 0 kv η 0.28 实证)+ host 提交面;与 C=8 的 2.03ms 同域,收账同时利好 C=1/C=8 双锚余量;
+- **KV 量化** / **TP×quant**(构造期互斥已落地,解禁需 quant_gemm TP 语义 + 通信面评估)/ **磁盘量化缓存**(R5 账 120s 预算内,non-goal 不变);
+- 承 M6 终账原样:**双存储 down_t**(+3.6GB 换 ~0.3ms,违零双存储红线)、**连续到达 bench 协议**(chunked 价值裁定的前置)、**半宽 GEMM**(TP=2 kernel 面第一候选,段 0 实测 37% 效率塌方)、**custom allreduce**(TP=2 通信栈,17.84µs 微基准在档)、**rank0 快失败**(工程健壮性)、triton decode_gemm 模块(已入库未接线,重开前提 = 融合存储或访问模式变更)。
+
+### 终账·口径注记(照前节同款)
+
+同日同机(RTX 4090 ×2;in-process 终bench 物理 GPU 1、仪式三腿 + gate-basis 腿物理 GPU 0、压测客户端照配方 `CUDA_VISIBLE_DEVICES=1` 零 GPU 占用;每腿跑前/收服后 nvidia-smi 双卡 4 MiB 验净 + 零计算进程双查,前台 timeout ≥1800s);全部腿 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);三腿 + gate-basis 腿 + 终bench 五样本同窗口串行,腿间以双卡 4 MiB 验净为界;关服纪律:`ss -tlnp` 取真身 PID(vLLM 55424 / none 70758 / w8a16 102713)定向 kill,无包装壳误伤、无 pkill;vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;7.57GB/步 = W8 权重流口径(bf16 15.13GB ÷ 2,scale 可忽略);证据归档 `/tmp/opencode/m7t5/`(三腿 server+bench stdout、gate-basis 腿、终bench 五样本、slow 尾行);本节树 = 37b528d + 本 commit(docs)。M7 不打 tag、不 push(留用户)。
