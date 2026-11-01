@@ -639,3 +639,162 @@ graph 稳定性注记(如实):graph 腿当日首跑因取尾管道截去 C=1 行
 **判定行(如实,对照 spec 验收锚「双轨配对 + TP=2 逐档 ≥100%」):轨 1 双腿齐——92.4%/90.0%/83.7%,逐档未过 100%(与 M4.1 挂账同带延续,缺口的 prefill/发射侧归因见判读 2);轨 2 修复后双腿齐——73.3%/72.4%/64.5%,逐档未过 100%,**TP=2 逐档 ≥100% 北极星维持挂账**;但自家 TP=2 decode 增益已兑现(1.38×,谱系闭合,判读 1),与 vLLM 的差距从「无数据/不可判」变为可归因的工程差距(kernel/通信栈,判读 1/2)。双轨配对仪式数据面收官;M5 不打 tag、不 push(留用户)。**
 
 口径注记(照前节同款):同日同机(RTX 4090 ×2,GPU0-GPU1 PCIe NODE 无 NVLink);六组腿全部 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);轨内各腿同窗口串行,轨间(vLLM TP=1 → vLLM TP=2 → AcornInfer TP=2 补测)切换以双卡 4 MiB 验净为界;轨 2 补测为满配方旗标 + HF 前缀归一修复后的同一产品路径(修复与旗标落点见轨 2 BLOCKED 段修复注);vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;补测时点树 = 0e35482 + 本 commit 修复(未提交),修复与补测数据同 commit 入库(历史序如实)。
+
+## M6 段 0 尖刀:decode 四腿拆账 + 可回收清单(2026-11-01,`scripts/m6_spike.py` + `scripts/m6_ab.py`,真机输出)
+
+背景:锚继 M4 挂账「C=8 需 TPOT 净省 ~3.3ms/步」(M4 期 21.12 → 锚 ~17.82);M5 收官 graph C=8 TPOT 19.96(已收 ~1.2ms),本日基线带 19.89–19.93,**今日残余缺口 ≈ 2.0–2.1ms**(对 vLLM 17.85 同带)。裁决门(spec §4):**Σ(腿 2/3/4 可回收)< 2.31ms(= 3.3 × 70%)且腿 1 定因显示缺口主体在 GEMM 面 → 段 2 triton 立项;否则休眠**。四腿全部 harness 内完成(`--layout` monkey-patch + 逐语句镜像 `graph_runner.decode_batch` 的插桩副本),引擎/模型源码零触碰;每天每腿跑前 GPU 1 验净(4 MiB)、前台运行。本节为四腿数据 + RECOVER 清单;**判定行留控制器**。
+
+### 基线带(m6_ab,当日双样本带内确认)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_ab.py`(warmup 10 + 计 30,同 seed 同输入;下表「首跑」为当日首次基线,「knobs[0]」为腿 2 组合 0(全缺省 env,同协议复跑):
+
+| 样本 | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| 首跑 | 17.91 | 19.92 | 19.83 | 21.15 |
+| knobs[0](缺省 env) | 17.92 | 19.89 | 19.16 | 21.28 |
+
+### 腿 1:引擎内 GEMM 拆账(insitu)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_spike.py insitu`(torch.profiler 包 decode loop,C=1/C=8 × graph/eager;chrome trace 实例序映射:每层发射序 q,k,v,o,gate,up,down × 36 + lm_head = 252+1,splitKreduce 辅核附着前实例不占槽;结构自证 count/step 逐类核对通过,零 INSITU_WARN;dmon 同窗)。
+
+四模式总账(stdout 逐字值):
+
+| 口径 | wall_ms | gpu_ms | gap_ms | gemm_proj µs/步 | proj−cold(ms) | lm_head µs/步(GB/s) |
+|---|---|---|---|---|---|---|
+| C=1 graph | 19.27 | 17.93 | 1.34 | 15168.5 | −0.47 | 1298.5(958) |
+| C=8 graph | 21.52 | 19.80 | 1.71 | 16454.8 | **+0.81** | 1320.5(943) |
+| C=1 eager | 25.64 | 18.08 | 7.56 | 15184.7 | −0.46 | 1298.6(958) |
+| C=8 eager | 26.01 | 19.96 | 6.05 | 16473.0 | +0.83 | 1316.4(945) |
+
+C=8 graph 逐类(stdout 逐字;冷口径参照 = M5 段 0 补充二 full=15.64ms,M=7 四类投影不含 lm_head):
+
+- `INSITU C=8 mode=graph wall_ms=21.52 gpu_ms=19.80 gap_ms=1.71 gemm_all_us_per_step=17775.3 cold_ref_ms=15.64(M=7 四类投影,不含 lm_head)`
+- `INSITU C=8 mode=graph class=gemm_proj us_per_step=16454.8 proj_minus_cold_ms=0.81`
+- `INSITU C=8 mode=graph class=qkv us_per_step=2262.4 n_per_step=108 check_gb=801`
+- `INSITU C=8 mode=graph class=o us_per_step=1404.3 n_per_step=36 check_gb=860`
+- `INSITU C=8 mode=graph class=gate_up us_per_step=8348.6 n_per_step=72 check_gb=868`
+- `INSITU C=8 mode=graph class=down us_per_step=4439.5 n_per_step=36 check_gb=816`
+- `INSITU C=8 mode=graph class=lm_head us_per_step=1320.5 n_per_step=1 check_gb=943`
+- `INSITU C=8 mode=graph class=attention us_per_step=646.3`
+- `INSITU C=8 mode=graph class=norm us_per_step=110.8`
+- `INSITU C=8 mode=graph class=rope us_per_step=86.1`
+- `INSITU C=8 mode=graph class=copy us_per_step=332.1`
+- `INSITU C=8 mode=graph class=other us_per_step=848.1`
+- `INSITU C=8 mode=graph class=memcpy us_per_step=4.4 count_per_step=3.00`
+- `CHECK C=8 mode=graph proj_gb=13.9GB/步 eff_gb=782(按 gemm_all 分母,含 lm_head 略偏高);cold 对照 889GB/s`
+
+主 kernel 分类学(TOPKERN,M=7/8 全部四类投影同一 cutlass kernel 名——按名映射不可能,实例序映射为腿 1 前提):`TOPKERN C=8 mode=graph n_per_step=253.00 us_per_step=17694.6 name=…cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8`;C=1 侧 M=1 全部走 `internal::gemvx::kernel`(108/步 11634.5µs + 145/步 4832.6µs 两实例组)。`cublasLt::splitKreduce_kernel` 72/步 80.7µs(C=8 graph)。
+
+腿 1 判读(如实):
+
+- **GEMM-vs-cold(C=8)= +0.81ms,是缺口(~2.0ms)的 ~40%,非主体**;C=1 侧 −0.47 为 M=1(gemvx)对冷口径 M=7(cutlass)的跨 M 对照,只作方向参考(口径差如实注记)。
+- lm_head 1320.5µs @943GB/s = 峰值 93.5%,已近屋顶;四类投影 782–868GB/s(峰值 78–86%)。
+- 非投影面合计 2026µs/步 = attention 646.3 + other 848.1 + copy 332.1 + norm 110.8 + rope 86.1 + memcpy 4.4;`other` 内含未融合 q/k-norm RMSNorm 链(TOPKERN 实测 reduce_kernel 117.6 + rsqrt 70.7 + pow 68.1 + bf16 copy 65.5 + add 65.3 ≈ 387µs/步,非 GEMM 融合候选)。
+- **降频排除**:dmon 计算窗(C=8 graph)pclk 2790MHz 全平、pwr ≤192W;全程 pclk min=210 为装载/构建空闲段(全文 54 行 `/tmp/opencode/m6/dmon_insitu.log`)。归因候选(同名 kernel 时长不同/L2 污染/插桩稀释/降频)中降频出局,余者不改变 +0.81 的量级归属。
+
+### 腿 2:调参面扫(knobs)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_spike.py knobs`(12 组合 = {CUBLASLT_WORKSPACE_SIZE ∈ 缺省/64M/256M} × {bf16_reduced_precision_reduction ∈ T/F} × {CUBLAS_WORKSPACE_CONFIG ∈ 缺省/:4096:8};env 在 CUDA 初始化前经子进程注入,各组合跑 m6_ab 四档 + 孤立冷微基准)。
+
+12 组合逐字值(step_ms):
+
+| # | ws | red | cfg | C=1 graph | C=8 graph | C=1 eager | C=8 eager | cold full |
+|---|---|---|---|---|---|---|---|---|
+| 0 | def | T | def | 17.92 | 19.89 | 19.16 | 21.28 | 15.63 |
+| 1 | def | T | 4096x8 | 17.96 | 19.89 | 19.73 | 21.14 | 15.63 |
+| 2 | def | F | def | 17.93 | 19.92 | 19.35 | 21.19 | 15.64 |
+| 3 | def | F | 4096x8 | 17.94 | 19.92 | 19.15 | 21.20 | 15.64 |
+| 4 | 64M | T | def | 17.92 | 19.90 | 19.15 | 21.18 | 15.64 |
+| 5 | 64M | T | 4096x8 | 17.95 | 19.90 | 19.15 | 21.18 | 15.63 |
+| 6 | 64M | F | def | 17.92 | 19.91 | 19.17 | 21.16 | 15.64 |
+| 7 | 64M | F | 4096x8 | 17.93 | 19.92 | 19.16 | 21.19 | 15.63 |
+| 8 | 256M | T | def | 17.93 | 19.90 | 19.20 | 21.15 | 15.64 |
+| 9 | 256M | T | 4096x8 | 17.92 | 19.93 | 19.24 | 22.24* | 15.64 |
+| 10 | 256M | F | def | 17.95 | 19.92 | 19.16 | 21.17 | 15.63 |
+| 11 | 256M | F | 4096x8 | 17.92 | 19.91 | 19.13 | 21.17 | 15.64 |
+
+带:C=1 graph 17.92–17.96(极差 0.04)、C=8 graph **19.89–19.93(极差 0.04)**、cold full 15.63–15.64(极差 0.01)——**死平,R1 实证排除**。*离带样本如实归档:组合 9 eager C=8 22.24(eager C=8 历史带宽本宽,余 11 组合 21.14–21.28);cold half 全程 8.14–8.15。输出格式样例(stdout 逐字,组合 0):`KNOB ws=def,red=T,cfg=def C=8_graph_step_ms 19.89` / `KNOB ws=def,red=T,cfg=def gemm_cold_full_perstep_ms 15.63`。
+
+### 腿 3:布局面扫(layout)
+
+孤立打分命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_spike.py layout`(冷口径 36 套权重轮转;变体:tn=现行 F.linear / nn=预变换 mm(x, w_t) / pad8 / pad16)。逐字值(us / GB/s):
+
+M=7:
+
+| 类 | tn | nn | pad8 | pad16 |
+|---|---|---|---|---|
+| qkv | 56.32/894 | 58.63/859 | 56.11/897 | 56.13/897 |
+| o | 39.00/860 | 39.58/848 | 38.98/861 | 39.02/860 |
+| gate_up | 216.73/929 | 217.39/926 | 217.77/924 | 219.27/918 |
+| down | 124.39/809 | **113.22/889** | 123.26/817 | 123.90/812 |
+
+M=8:
+
+| 类 | tn | nn | pad8 | pad16 |
+|---|---|---|---|---|
+| qkv | 56.14/897 | 56.54/890 | 56.11/897 | 56.14/896 |
+| o | 39.00/860 | 40.69/825 | 39.00/860 | 39.04/859 |
+| gate_up | 216.98/928 | 217.50/926 | 217.76/925 | 219.27/918 |
+| down | 124.55/808 | **113.51/887** | 123.24/817 | 123.85/813 |
+
+- `LAYOUT_BEST m=7 down nn us=113.22`、`LAYOUT_BEST m=8 down nn us=113.51`(其余三类 best 落 tn/pad8,差 ≤0.2µs = 噪声带)。**NN 只在 down 赢**(−11.0~−11.2µs/层,808→889GB/s),pad8/pad16 ≈ TN。down-only 投影:11.0~11.2µs × 36 层 = **−0.40~0.41ms/步**(C=8 口径)。
+
+引擎内复测命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_spike.py layout --engine-retest t`(全局 NN;harness monkey-patch 接线,当日第三样本,stdout 逐字):
+
+- `AB layout_t C=1 mode=graph step_ms=18.60 tpot_ms=18.62`
+- `AB layout_t C=8 mode=graph step_ms=19.31 tpot_ms=19.33`
+- `AB layout_t C=1 mode=eager step_ms=19.95 tpot_ms=20.06`
+- `AB layout_t C=8 mode=eager step_ms=20.60 tpot_ms=20.63`
+
+三样本带:graph C=8 19.31/19.32/19.31(**−0.58~−0.62**,增益方向与量级超出孤立 down-only 投影 0.40——引擎内交互效应如实记录)、**graph C=1 18.59/18.60/18.60(+0.64~+0.68 回归)**、eager C=8 20.55–20.62(−0.52~−0.73,对主带 21.14–21.28)、eager C=1 19.91–20.04(+0.6~+0.9,对主带 19.13–19.35)。**全局 NN 触 no-regression 门(C=1 回归)→ 出局(R2 实录)**;M=1(gemvx)面 NN 未做孤立打分,引擎 C=1 回归与之相容(推断)。down-only hybrid 引擎内未复测,Task 1 候选(C=1 面同样须过 A/B 门)。
+
+### 腿 4:步开销拆账(overhead)
+
+命令:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m6_spike.py overhead`(wrapper 逐语句镜像 decode_batch @ c6b311b + torch.profiler 交叉窗 + py-spy 第三口径;C=8 graph,n=35,EOS 窗约束:探针实测 sid7 stop@2 / sid5 stop@55 / sid4 stop@74 → 全窗 ≤54 步,n=35 末端 49 留 6 步余量)。stdout 逐字(当日第 4 样本,前三样本同带):
+
+- `OHEAD step_wall_total us_per_step=19926.1 evidence=perf_counter,c=8,graph,real_B=7,steps=35,seed=20261027`
+- `OHEAD sched_schedule us_per_step=4.8 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_ensure(:146) us_per_step=2.3 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_mirror_fill(:150-157) us_per_step=28.1 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_tables_build(:158-160) us_per_step=45.3 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_pad_restore(:166-168) us_per_step=8.8 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_h2d_2x(:170-171) us_per_step=19.6 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_commit_lens(:172,36xB) us_per_step=5.3 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_replay_launch(:173) us_per_step=7.9 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_d2h_sync(:177) us_per_step=19736.6 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD db_gpu_span(ev0->ev1) us_per_step=37.8 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD eng_record(bookkeeping) us_per_step=4.8 evidence=wrapper,c=8,graph,bucket=8,real_B=7,steps=35`
+- `OHEAD residual_other us_per_step=62.6 evidence=step_wall−Σ段(engine.step 内 views 查表/num_pages/finally 退休循环/executor 分派)`
+- `OHEAD profiler_wall us_per_step=21501.0 evidence=torch.profiler,5 步独立窗(插桩仍在)`
+- `OHEAD profiler_gpu us_per_step=19902.9 evidence=self_device_time_total 只按 DeviceType.CUDA 事件累加(profile_decode.py 注记,防 CPU 算子双计)`
+- `OHEAD profiler_gap us_per_step=1598.0 evidence=wall−GPU(profiler 口径)`
+- `OHEAD cpu_runtime:cudaGraphLaunch us_per_step=1180.3 count_per_step=1.00 evidence=profiler-cpu-events(cuda_runtime)`
+- `OHEAD cpu_runtime:cudaMemcpyAsync us_per_step=19857.4 count_per_step=3.00 evidence=profiler-cpu-events(cuda_runtime)`
+- `PYSPY denom_engine_step_samples=984 decode_batch_samples=924 total_samples=1431 eff_hz=11.9 evidence=collapsed-stacks,attach=pid,req_rate=200Hz,120s(m6_ab 各档 warmup10+计30 长窗 ×4 组合;attach 采样有税,目标 AB 偏慢,与 knobs 同档对照为准)`
+- `PYSPY decode_batch pct_of_engine_step=93.90`
+- `PYSPY build_tables pct_of_decode_batch=0.22 samples=2`
+
+三口径互证(如实):
+
+- **真实 CPU 侧步内开销 = wall − d2h_sync = 19926.1 − 19736.6 = 189.5µs/步**(四样本 172–190µs);其余 19.74ms 全部是 graph 等待(GPU 执行)。d2h_sync 内 argmax 只占 ~38µs(gpu_span ev0→ev1)。
+- **M4.1 段一「wall−GPU 1.70ms」修正归因:~90% 是 profiler 税**(gap 1598–1716µs,其中 cudaGraphLaunch 一项 1123–1254µs = 74%,余为 runtime 采样开销);真实 CPU prep 从来只有 ~0.17–0.19ms/步。开销面不存在 1.7ms 的可回收空间——旧账修正入档。
+- py-spy 独立口径:decode_batch 占 engine.step 采样 93.9%,全部 CPU 段只有 build_tables 捕到 2 个采样(0.22%)——CPU prep 各段低于采样分辨率,与 wrapper 数字互证。
+- **py-spy 方法实录(如实)**:spawn 模式(`py-spy record -- <cmd>`)两次 rc=1 `Error: No child process (os error 10)`,且 spawn 吞掉目标 stderr 无法取证;平凡子进程 spawn 测试 rc=0 → 机制未坏,嫌疑在目标进程早夭不可见。改父进程自起目标(stderr 落盘)+ nvidia-smi 轮询就绪 + **attach(-p PID)** 后成功:目标 rc=0 完整跑完四档(父进程收尾后 GPU 1 余留 642MiB,目标装载 16803MiB——首跑「父进程持 ~20GB 致 OOM」假设经 teardown 重排后实测排除)。attach 采样有税:目标 AB 对 knobs 同档偏慢(graph +0.2ms 带内,eager +1.4~3.7ms 出带),结构读法不受影响。
+
+### 可回收清单(RECOVER,C=8 口径)+ 裁决门数据
+
+- `RECOVER knobs_tuning_face ms_c8=0.00 confidence=H risk=R1`(12 组合死平 0.04ms 带宽,实证排除)
+- `RECOVER layout_down_nn_hybrid ms_c8=0.40 confidence=M risk=R2`(孤立实测 −11.0~−11.2µs × 36 层;引擎内仅全局 NN 复测过——C=8 赢 −0.6 但 C=1 回归 +0.68 出局;down-only hybrid 引擎内未复测,C=1 面风险未排)
+- `RECOVER overhead_step_prep ms_c8=0.10 confidence=M risk=R4`(实测可压面 96.5µs = mirror 28.1 + tables 45.3 + pad 8.8 + h2d 19.6(non_blocking 仅捕获外,R3 约束),按 60–80% 压缩率 + residual 部分压缩 ~20µs 估 0.09–0.10ms;改动落在 graph_runner.py 保护文件,须最小侵入 + token 逐位硬门)
+- `RECOVER commit_lens_write ms_c8=0.005 confidence=H risk=R4`(5.3µs 实测;压缩价值趋零,如实:不值得做)
+
+**Σ(RECOVER)= 0.00 + 0.40 + 0.10 + 0.005 ≈ 0.51ms**;该清单同时是段 1 施工顺序候选表(layout down-NN hybrid 0.40 → overhead prep 0.10 → commit_lens 弃)。
+
+裁决门两条件(数据面,判定行留控制器):
+
+1. **Σ = 0.51ms < 2.31ms → 条件 1 成立**。
+2. **缺口主体是否在 GEMM 面——两种读法如实呈现**:读法 A(操作口径,vs 孤立冷基准 15.64):GEMM in-situ penalty +0.81ms 占缺口(~2.0–2.1ms)的 **~40%,非主体**;其余 ~1.2ms 在非 GEMM 面(attention 0.646、未融合 norm 链 ~0.39、copy 0.332、other 余量)→ 条件 2 不成立 → **休眠读法**。读法 B(物理屋顶口径):cold 本身 889GB/s = 峰值 88%,cold-vs-roofline ≈ 1.85ms 若计入 GEMM 面,则 GEMM 面合计 ~2.66ms 占步-vs-屋顶距离的 ~65% → 条件 2 成立 → **立项读法**(但段 2 triton 须在 M=7/8 四类形状上先打赢 cuBLAS 冷口径,腿 3 未提供该证据,R5 风险未动)。
+
+**判定行:留控制器**(两条件 + 两读法所需数据已齐,本节不裁)。
+
+口径注记(照前节同款):同日同机(物理 GPU 1,RTX 4090,24GB;每腿跑前 nvidia-smi 验净 4 MiB / 0 进程,前台运行 timeout ≥ 1800s);全部腿 seed=20261027 同批 prompt(token ids 直投),C=8 计时窗内 batch 恒 7(sid7 稳定期 EOS 退役,graph bucket 8 + 1 padding 行);m6_ab 协议 warmup 10 + 计 30;腿 1 冷口径参照 15.64ms 引 M5 段 0 补充二(M=7 四类投影,不含 lm_head);腿 4 wrapper 插桩为逐语句镜像(graph_runner.py @ c6b311b),语义零改动;全部 harness monkey-patch,引擎/模型源码零触碰;py-spy 目标为 `m6_ab.py --steps 30` 全四档长窗;证据归档 `/tmp/opencode/m6/`(四腿 stdout 全文 `*_official.log`/`layout_engine_t.log`、chrome trace `insitu_c{1,8}_{graph,eager}.json`、dmon 全文 `dmon_insitu.log`、py-spy raw `pyspy_overhead.raw` + 目标 stderr `pyspy_target.stderr.log`);锚 3.3ms 与门 2.31ms 引 spec §4 原文,今日残余缺口 ~2.0–2.1ms 为算术注明。
