@@ -2459,3 +2459,46 @@ PARITY w8a16 top1=[14.69, 35.0, 34.25, 34.0, 38.25, 39.75, 51.5, 45.75, 38.0, 41
 **none 硬门证据**:全套件 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **217 passed, 6 skipped, 17 deselected**(= 基线 185 原样全绿 + 新增 32:quant_wiring 9 + quant_gemm 大 M 23;golden m0–m5 零换金,golden 文件 diff 为零);none 缺省时 `dispatch_linear` 走 `mod(x)` 原路径(CPU 逐位单测 + golden 面),A/B none 腿与 M6 带重合(上表)= 8B 生产级零漂移复核。
 
 测试账(TDD 红绿):红 = `ImportError: cannot import name 'dispatch_linear'` + 大 M `KeyError/NotImplementedError`(实现前,24 failed);绿 = wiring 9 + gemm 49。**对 plan 草稿/关键现实偏离逐条**:①walk 测试不能用 tiny(plan 草稿"CPU/tiny 为主"):tiny hidden=64 触发 quantize_w8 零特例守门(T0 钉死契约)→ 改 128 倍数 mini 配置,none 逐位测仍用 tiny;②草稿 `mod.weight.data = q` 直接换存储实测失败(torch 禁止 requires_grad 的 .data 换非浮点——草稿注③预判命中)→ 换存储前置 `requires_grad_(False)`(int8 权重本就不可训,引擎全推理无 backward,语义无损);③cls 形态在"装载期打标 vs shape 查表"两候选中定 shape 查表(理由见上;两候选均为指令允许面,选型如实报告);④quant×tp 互斥落点 = `server._build_engine`(EngineConfig 无 tp 字段,指令已预授权"以 config.py 现状为准");⑤大 M 桶 split-K 不评估(sk1 结构性定死,网格自足;非"评估后放弃");⑥T1 注记期契约测试 `test_bucket_guard_m_gt16_prefill_note`(NotImplementedError)退役改写为大 M 契约测试;⑦prefill 账仪器 = m6_ab `ABPREFILL`(指令"bench --in-tokens 128 或等价"的等价腿);⑧warm 预算口径从 T1 的 <1s 放宽为本指令 <2s(实测 0.027–0.165s ✓)。lm_head 引擎内大 M 不出现(prefill_batch 只取各行末位,M=N≤8 → decode 桶;大 M lm_head 消费面 = Task 3 ppl window=512 / M0 oracle)。证据归档 `/tmp/opencode/m7b/`(ab_none_r1/r2/r3.log、ab_w8a16_r1/r2/r3.log、calib_tol_w8_m.log、parity 两腿 stdout、baseline_pytest)。本节树 = 6dc7c00 + 本 commit。不打 tag、不 push(留用户)。
+
+### 段 A·精度账:自研困惑度 harness + W8 ppl(2026-11-02,`scripts/perplexity.py` + `data/wikitext-2-raw/`,真机输出)
+
+背景:spec §3 精度锚 **W8 ppl ≤ +1% vs bf16 基线**。harness 自研(运行时零 transformers;纪律自查 grep:本文件与 import 链 `acorninfer.tokenizer`/`models.qwen3`/`quant.quantize`/`ops.quant_gemm` 零命中):分词 = 自家 `Tokenizer(f"{model_dir}/tokenizer.json")` 全文一次性 encode;模型直建 `qwen3.from_pretrained`(cache=None 无 KV 全前向,logits [B,S,vocab] fp32);量化腿生产同构(装载后 `apply_quant(model,"w8a16")` + `quant_gemm.configure(device)`,window=512 → lm_head M=4096 走大 M 桶,m_configs 表须先配置,与 m6_ab/engine 接线同码)。
+
+**滑窗 stride 法**(window=512 stride=256 batch=8,注释钉死在脚本内):wiki.test.raw 按 "\n" 切行保序、"\n".join 拼接(空行原样保留,与原文件逐字节等价),Tokenize 全文一次 → 299,078 token。窗口 i 覆盖 [i·stride, i·stride+window);logits 行 r 预测 token s+r+1。窗口 0 计全部 window−1 个位置(行 0..window−2);后续窗口只计"新暴露"的末 stride 个位置(行 window−stride−1..window−2,与此前所有窗口目标集严格不相交 → 每 token 恰计一次;CPU 纯索引覆盖校验:299,007 目标连续无重无漏)。counted = (window−1)+(windows−1)·stride,ppl = exp(nll_sum/counted) 可复算;窗口定长,尾部 71 token 不计。fp32 logits 全量物化 [8,512,151936] ≈2.5GB/批,逐批 CE 累加(批内逐窗行求和),零跨批拼接。one-off 修正:harness 首版计数行末行切片 off-by-one(行 window−1 预测窗外 token,首批即抛 batch_size mismatch),索引校验后修正重跑,**两腿均为修正后同一版本**(首跑未产生任何入账数字)。
+
+**数据源(R7 双源,取活者)**:首选 Smerity zip 实测活(2026-11-02),命令原样:
+
+```bash
+curl -L https://wikitext.smerity.com/wikitext-2-raw-v1.zip -o /tmp/opencode/m7/wikitext.zip && unzip
+cp wikitext-2-raw/wiki.test.raw → data/wikitext-2-raw/   # 4358 行 1,290,590 字节
+```
+
+HF parquet 备选未启用;`.gitignore` 增 `data/`(数据不入 git)。环境:GPU 1(`CUDA_VISIBLE_DEVICES=1`),双腿跑前 `nvidia-smi` 各验净 4MiB;torch 2.13.0+cu130 / triton 3.7.1。
+
+**PPL 行逐字**(stdout 全文归档 `/tmp/opencode/m7/ppl_none.log`、`ppl_w8a16.log`;各一遍):
+
+```
+DATA path=data/wikitext-2-raw/wiki.test.raw lines=4359 tokens=299078
+LOADTIME quant=none load_s=31.1 apply_s=0.0 configure_s=0.0
+PPL quant=none tokens=299078 nll_sum=690601.61 ppl=10.0709 windows=1167
+PPLPOS quant=none counted=299007 mean_nll=2.309650 eval_s=75.7 peak_gib=18.78
+DATA path=data/wikitext-2-raw/wiki.test.raw lines=4359 tokens=299078
+LOADTIME quant=w8a16 load_s=31.4 apply_s=0.6 configure_s=5.0
+PPL quant=w8a16 tokens=299078 nll_sum=690337.84 ppl=10.0620 windows=1167
+PPLPOS quant=w8a16 counted=299007 mean_nll=2.308768 eval_s=80.1 peak_gib=15.78
+```
+
+(注:两腿同 token 同 counted,ppl 比值 = nll 比值;`lines=4359` 为 split 元素数——文件以换行结尾多出一个空尾元素,join 后与原文件逐字节等价。)
+
+**精度账与锚对照**:
+
+| 腿 | tokens | windows | counted | nll_sum | ppl | 相对增量 |
+|---|---|---|---|---|---|---|
+| none(bf16 基线) | 299,078 | 1,167 | 299,007 | 690,601.61 | **10.0709** | — |
+| w8a16 | 299,078 | 1,167 | 299,007 | 690,337.84 | **10.0620** | **−0.09%** |
+
+增量 = (ppl_w8/ppl_none − 1)×100% = (10.0620/10.0709 − 1)×100% = **−0.088%**(NLL 总额口径 −0.038% 同向)。**锚 ≤ +1%:✓ 通过,且为负增量**。初步归因:W8 per-channel 对称 RTN 逐元素误差 ≤ scale/2(+fp16 scale 表示误差),对 logits 是对称小扰动(parity 账 top-1 |Δ| ≤ 0.75 同量级);逐窗 NLL 差呈对称噪声(45.2% 窗口为正,中位 −0.20 nats,极值 −8.8/+8.7),正负相消后净差为统计涨落量级,**不解读为"量化更优"**。超标归因条款(R4)未触发,top-10 恶化窗口列表不适用;判定行(锚过/不过终裁)留控制器/Task 5。
+
+**装载耗时(R5 账延续)**:none load 30.6–31.1s(两次进程);w8a16 load 31.4 + apply 0.6(253 模块 RTN)+ configure 5.0(triton 缓存热)≈ **37.0s 全链**,120s 预算内 ✓。eval 耗时 none 75.7 / w8a16 80.1s(+5.8%,大 M 桶 dequant ALU 开销,prefill C=8 flop-bound 结论同源);peak VRAM 18.78(none,bf16 权重+logits)/15.78(w8a16,int8 存储)GiB。
+
+全套件复核:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **217 passed, 6 skipped, 17 deselected**(本任务零生产码改动,新增仅 `scripts/perplexity.py`(非测试路径,零收集)+ docs + .gitignore,golden 零换金)。证据归档 `/tmp/opencode/m7/`(wikitext.zip、wiki.test.raw 提取物、ppl_none.log、ppl_w8a16.log、ppl_windows_none.json、ppl_windows_w8a16.json)。本节树 = 17061b6 + 本 commit。不打 tag、不 push(留用户)。
