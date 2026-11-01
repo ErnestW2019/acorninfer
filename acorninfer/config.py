@@ -80,6 +80,9 @@ class EngineConfig:
     attention_backend: str = "sdpa"  # "sdpa" | "triton"(M3 paged attention)
     fused_ops: bool = False          # True → decode 走 K1/K2 融合算子(M3)
     decode_graph: bool = False       # True → decode 走 CUDA graph(M4;须 triton 后端)
+    quant: str = "none"              # "none"|"w8a16"|"w4a16"(M7;w4a16 = 段 B 门控,
+                                     # 装载期 apply_quant 硬报错;与 tp>1 互斥——
+                                     # tp 在 CLI/server 层,互斥在 _build_engine 把守)
 
     def __post_init__(self) -> None:
         # CLI(Task 10 bench/server)直接透传参数,坏值在构造期爆掉而非运行期排队卡死
@@ -94,6 +97,10 @@ class EngineConfig:
         if self.attention_backend not in ("sdpa", "triton"):
             raise ValueError(
                 f"attention_backend must be 'sdpa'|'triton', got {self.attention_backend!r}"
+            )
+        if self.quant not in ("none", "w8a16", "w4a16"):
+            raise ValueError(
+                f"quant must be 'none'|'w8a16'|'w4a16', got {self.quant!r}"
             )
         if self.decode_graph and self.attention_backend != "triton":
             raise ValueError("decode_graph requires attention_backend='triton'")

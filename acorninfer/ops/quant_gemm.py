@@ -35,10 +35,14 @@ CUDA-graph 兼容硬约束(decode_gemm 同款):launch 路径零 host 同步(无
 .item()/synchronize;M 为 runtime 参数零重编译);autotune 全部发生在装载期
 (configure(),graph 捕获前);捕获/重放路径只查表 + launch。
 
-M regime:decode M≤16 本任务范围(BLOCK_M=16 单瓦片);**prefill 大 M 桶
-(M>16)是 Task 2 接线范围,本任务只留接口注记** —— `_launch` 对 M>16 显式
-NotImplementedError(防误用静默错慢),Task 2 按独立 autotune 桶落地(spec §2
-段 A 两 regime)。
+M regime:decode M≤16(BLOCK_M=16 单瓦片,本文件 T1 范围)与 prefill 大 M
+(Task 2 落地):大 M 桶 = s(17–64)/m(65–256)/l(>256),kernel
+`_w8_gemm_kernel_m` 增 pid_m 瓦片轴(BM∈{32,64,128} 逐桶 cfg,sk1 定死——
+大 M 网格 N//BN × cdiv(M,BM) 并行自足,split-K 的 partials/reduce 无增益);
+`quant_gemm()` 入口按 M 分流(M≤16 → T1 decode 表;M>16 → m_configs 大 M 表),
+桶边界 `bucket_for`(与 decode_gemm.M_BUCKETS graph 批桶无关)。显式 cfg 在
+大 M 桶解释为 (BM,BN,BK,warps,stages)(BM 首位;decode 桶 5 元组 = (BN,BK,
+warps,stages,SK),解释随 M regime,勿混用)。
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ import triton.language as tl
 from acorninfer.ops.decode_gemm import (
     _BLOCK_M,
     _REDUCE_BLOCK,
+    _SHMEM_BUDGET,
     _bench_rot,
     _cfg_shmem_ok,
     _splitk_reduce_kernel,
@@ -71,8 +76,31 @@ _AUTO_SETS = 8                 # autotune 轮转套(decode_gemm _autotune_config
 _AUTO_SPLIT = {"down", "qo"}   # 开 sk2 候选的类(段 0 裁决;kv 定 sk1)
 _AUTO_SKS = (2,)               # 段 0:down sk2 胜出,qo 评估 sk∈{1,2}(sk1 在数值网格)
 
+# 大 M 桶(Task 2):桶名 → autotune 代表 M(取桶上界;grid 随 M runtime 变,
+# 代表点只定编译变体与带宽口径)。桶数克制:decode d(M≤16)之外仅三桶,边界
+# 覆盖生产面(prefill/extend M = rows×chunk_len;A/B 实测 128(C=1)/1024(C=8))
+M_BUCKETS_LARGE = ("s", "m", "l")
+_M_REP_M = {"s": 64, "m": 256, "l": 1024}
+
+
+def bucket_for(M: int) -> str:
+    """M → 桶名:d(M≤16,decode T1 路径直判)/ s / m / l。"""
+    if M <= _BLOCK_M:
+        return "d"
+    if M <= 64:
+        return "s"
+    if M <= 256:
+        return "m"
+    return "l"
+
+
+# cls 反查表:dispatch_linear 按 (N, K) 查五档键(load-time walk 不打标,调用期
+# 一次 host dict 查(~0.1µs),graph 捕获期定死零 host 同步;五档形状全唯一)
+_CLS_BY_SHAPE = {v: k for k, v in CLASSES.items()}
+
 _state: dict = {
     "configs": {},             # cls -> (BLOCK_N, BLOCK_K, warps, stages, SPLIT_K)
+    "m_configs": {},           # cls -> {bucket: (BM, BN, BK, warps, stages)}
     "shapes": {},              # cls -> (N, K)(warmup 用)
     "device": None,
     "report": None,
@@ -128,6 +156,60 @@ def _w8_gemm_kernel(x_ptr, q_ptr, s_ptr, out_ptr, part_ptr,
 
 # ---------- launch(捕获/重放路径:只查表 + launch,零 host 同步) ----------
 
+@triton.jit
+def _w8_gemm_kernel_m(x_ptr, q_ptr, s_ptr, out_ptr, M, N, K,
+                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """大 M 桶(Task 2):C[M,N] = x[M,K] @ dequant(q,s)[N,K]^T;sk1 多 M 瓦片。
+
+    dequant 数学与 decode kernel 逐字同源(int8→fp32 ×scale 行广播→bf16→
+    tl.dot fp32 累加),差异仅 M 轴:pid_m 瓦片轴 × BM + 逐瓦 m_mask;sk1
+    定死(大 M 并行自足)。K % BK == 0 host 断言,W/K 侧免 mask;x 行主连续
+    由 quant_gemm 保证。
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    m_mask = offs_m < M
+    s = tl.load(s_ptr + offs_n).to(tl.float32)          # [BN] 循环不变
+    x_ptrs = x_ptr + offs_m[:, None] * K + offs_k[None, :]
+    q_ptrs = q_ptr + offs_n[:, None] * K + offs_k[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for _ in range(0, K, BK):
+        a = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        q = tl.load(q_ptrs)
+        w = (q.to(tl.float32) * s[:, None]).to(tl.bfloat16)
+        acc = tl.dot(a, tl.trans(w), acc)
+        x_ptrs += BK
+        q_ptrs += BK
+    out_ptrs = out_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+
+
+def _launch_m(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor,
+              cfg_m: tuple, out: torch.Tensor | None = None) -> torch.Tensor:
+    """大 M launch:x2 [M,K] 连续 bf16、q [N,K] int8、s [N] fp16 → [M,N] bf16。
+
+    cfg_m = (BM, BN, BK, warps, stages)(BM 首位,表载或显式绕表);sk1 零
+    workspace,grid = (N//BN, cdiv(M,BM)) 全 host int,零 host 同步。
+    """
+    bm, bn, bk, warps, stages = cfg_m
+    M, K = x2.shape
+    N = q.shape[0]
+    assert N % bn == 0 and K % bk == 0, \
+        f"quant_gemm[large] 形状不整除: N={N} K={K} cfg={cfg_m}"
+    if out is None:
+        out = torch.empty(M, N, dtype=x2.dtype, device=x2.device)
+    grid = (N // bn, triton.cdiv(M, bm))
+    _w8_gemm_kernel_m[grid](
+        x2, q, s, out, M, N, K,
+        BM=bm, BN=bn, BK=bk,
+        num_warps=warps, num_stages=stages,
+    )
+    return out
+
+
 def _launch(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, cls: str,
             out: torch.Tensor | None = None) -> torch.Tensor:
     """x2 [M, K] 连续 bf16、q [N, K] int8、s [N] fp16 → [M, N] bf16。
@@ -143,10 +225,10 @@ def _launch(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, cls: str,
     assert N % bn == 0 and K % (split_k * bk) == 0, \
         f"quant_gemm 形状不整除: N={N} K={K} cfg={cfg}"
     if M > _BLOCK_M:
-        # M>16(prefill 大 M 桶)= Task 2 范围(接口注记;BLOCK_M=16 单瓦片
-        # 只覆盖 decode)。显式报错防误用静默错慢,不回落(cuBLAS 不吃 int8 权重)。
+        # quant_gemm() 入口已按 M 分流;直调 _launch 传大 M 仍显式报错
+        # (decode 路径 BLOCK_M=16 单瓦片只覆盖 M≤16,静默错慢防误用)
         raise NotImplementedError(
-            f"quant_gemm M={M} > 16:prefill 大 M 桶为 M7 Task 2 范围(接口注记)")
+            f"_launch(decode)收到 M={M} > 16:大 M 走 quant_gemm() 大 M 路由")
     if out is None:
         out = torch.empty(M, N, dtype=x2.dtype, device=x2.device)
     grid = (N // bn, split_k)
@@ -174,15 +256,31 @@ def _launch(x2: torch.Tensor, q: torch.Tensor, s: torch.Tensor, cls: str,
 
 def quant_gemm(x, q, scale, cls, cfg=None, out=None):
     """W8 dequant-GEMM 入口(Task 2 调用点形态):x [..., K]、q int8 [N,K]、
-    scale fp16 [N]、cls ∈ CLASSES → [..., N] bf16。
+    scale fp16 [N]、cls ∈ CLASSES → [..., N] bf16(2D 返回;3D 调用点由
+    dispatch_linear view 回领先维)。
 
-    cfg None = 装载期 tuned config(须先 configure());显式 cfg = 绕表
-    (单测对拍 / 装载期实测仪;decode_gemm.triton_gemm 同款存取恢复)。
+    M 分流:M ≤ 16 → decode 路径(cfg 5 元组 = (BN,BK,warps,stages,SK));
+    M > 16 → 大 M 桶路径(cfg 显式 5 元组 = (BM,BN,BK,warps,stages),BM 首位;
+    cfg None = 查 _state["m_configs"][cls][bucket_for(M)],未配置显式报错——
+    生产须先 configure())。两 regime 解释随 M,勿混用。
     """
     K = x.shape[-1]
     x2 = x.reshape(x.numel() // K, K)
     if not x2.is_contiguous():
         x2 = x2.contiguous()
+    if x2.shape[0] > _BLOCK_M:
+        if cfg is not None:
+            return _launch_m(x2, q, scale, tuple(cfg), out)
+        table = _state["m_configs"].get(cls)
+        if not table:
+            raise RuntimeError(
+                f"quant_gemm 大 M 桶未配置: cls={cls}(M={x2.shape[0]});"
+                f"生产路径须先 configure()(装载期一次;单测可显式 cfg 绕表)")
+        bucket = bucket_for(x2.shape[0])
+        if bucket not in table:
+            raise RuntimeError(
+                f"quant_gemm 大 M 桶缺桶: cls={cls} bucket={bucket}(M={x2.shape[0]})")
+        return _launch_m(x2, q, scale, table[bucket], out)
     saved = _state["configs"].get(cls)
     if cfg is not None:
         _state["configs"][cls] = tuple(cfg)
@@ -265,9 +363,71 @@ def _autotune_config(cls, n, k, device, verbose=True):
     return best_cfg
 
 
+def _cfg_shmem_ok_m(cfg) -> bool:
+    """大 M 瓦片 shmem 预过滤:同 `_cfg_shmem_ok` 式,x/w 瓦片 (BM+BN)×BK×2B
+    × stages;decode_gemm 版钉 _BLOCK_M=16,大 M 的 BM 进瓦片和,本模块自算。"""
+    bm, bn, bk, _, stages = cfg
+    return (bm + bn) * bk * 2 * stages <= _SHMEM_BUDGET
+
+
+# 大 M autotune 候选面(克制:BM 逐桶 + BN/BK 邻域;warps 4 主 / l 桶 BM128 配 8;
+# stages 3 主 / 短 K 邻 4;sk1 定死)。shmem 预过滤 + 整除过滤同 decode 桶。
+_M_AUTO_CANDS = {
+    "s": ((32, 64, 128, 4, 3), (32, 64, 128, 4, 4), (32, 64, 64, 4, 4),
+          (32, 128, 64, 4, 4)),
+    "m": ((64, 64, 128, 4, 3), (64, 64, 64, 4, 4), (64, 128, 64, 4, 4),
+          (64, 64, 128, 8, 3)),
+    "l": ((64, 64, 128, 4, 3), (64, 64, 64, 4, 4), (128, 64, 64, 8, 3),
+          (128, 64, 64, 4, 3)),
+}
+
+
+def _autotune_config_m(cls, n, k, m, bucket, device, verbose=True):
+    """大 M 桶装载期 autotune(代表 M = 桶上界 _M_REP_M;8 套轮转热测)。
+
+    返回 (BM, BN, BK, warps, stages);sk1 定死(大 M 网格自足,split-K 无
+    增益;down sk2 先例只属 decode 桶)。
+    """
+    sets = _rot_sets(n, k, _AUTO_SETS, device)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
+    grid_cfgs = [c for c in _M_AUTO_CANDS[bucket]
+                 if _cfg_shmem_ok_m(c) and n % c[1] == 0 and k % c[2] == 0]
+    results, skipped = [], 0
+
+    def _try(cfg):
+        nonlocal skipped
+        try:
+            us = _bench_rot(
+                lambda t, c=cfg: quant_gemm(x, t[0], t[1], cls, cfg=c), sets)
+            results.append((us, cfg))
+            if verbose:
+                gb = _qbytes(n, k) / (us * 1e-6) / 1e9
+                print(f"W8 AUTOTUNE {cls}[{bucket}] M={m} cfg={cfg} "
+                      f"us={us:.2f} gb={gb:.0f}", flush=True)
+        except Exception as e:   # 编译期资源失败:跳过并记账
+            skipped += 1
+            if verbose:
+                print(f"W8 AUTOTUNE {cls}[{bucket}] M={m} cfg={cfg} "
+                      f"SKIPPED {type(e).__name__}", flush=True)
+
+    for cfg in grid_cfgs:
+        _try(cfg)
+    results.sort()
+    if not results:
+        raise RuntimeError(f"quant_gemm 大 M autotune 全配置失败: {cls}[{bucket}]")
+    best_us, best_cfg = results[0]
+    gb = _qbytes(n, k) / (best_us * 1e-6) / 1e9
+    print(f"W8 AUTOTUNE_BEST {cls}[{bucket}] M={m} cfg={best_cfg} "
+          f"us={best_us:.2f} gb={gb:.0f} skipped={skipped}", flush=True)
+    del sets, x
+    torch.cuda.empty_cache()
+    return best_cfg
+
+
 def _warmup_table() -> float:
-    """表内逐类零值发射一次:编译(命中 autotune 期缓存)/ workspace / 表查
-    全链路就位(捕获前)。返回耗时秒(warm 预算 <1s,configure 报告)。"""
+    """表内逐类零值发射一次(decode d 桶 + 大 M 三桶代表 M):编译(命中
+    autotune 期缓存)/ 表查全链路就位(捕获前)。返回耗时秒(warm 预算 <2s,
+    configure 报告)。"""
     t0 = time.perf_counter()
     dev = _state["device"]
     for cls, (n, k) in sorted(_state["shapes"].items()):
@@ -275,7 +435,13 @@ def _warmup_table() -> float:
         s = torch.ones(n, dtype=torch.float16, device=dev)
         x = torch.zeros(8, k, dtype=torch.bfloat16, device=dev)
         out = quant_gemm(x, q, s, cls)          # 零值:数值无关,链路就位即可
-        del q, s, x, out
+        del out
+        for bucket in M_BUCKETS_LARGE:
+            m = _M_REP_M[bucket]
+            xm = torch.zeros(m, k, dtype=torch.bfloat16, device=dev)
+            out = quant_gemm(xm, q, s, cls)
+            del xm, out
+        del q, s, x
     torch.cuda.synchronize()
     return time.perf_counter() - t0
 
@@ -283,8 +449,9 @@ def _warmup_table() -> float:
 def configure(classes=None, *, device="cuda:0", verbose=True) -> dict:
     """装载期入口(Engine 构造 / graph 捕获之前调用一次;Task 2 接线)。
 
-    classes: {类名: (N, K)},None = 生产五档 CLASSES。逐类 autotune → warm
-    (预算 <1s,实测入 report)。返回 report(docs 账目直接引用)。
+    classes: {类名: (N, K)},None = 生产五档 CLASSES。逐类 decode 桶 autotune
+    (T1)→ 大 M 三桶 autotune(Task 2)→ warm(预算 <2s,实测入 report)。
+    返回 report(docs 账目直接引用)。
     """
     reset()
     classes = CLASSES if classes is None else dict(classes)
@@ -298,14 +465,29 @@ def configure(classes=None, *, device="cuda:0", verbose=True) -> dict:
         _state["configs"][cls] = cfg
         report["classes"][cls] = {"config": cfg,
                                   "autotune_s": time.perf_counter() - t1}
+    m_s = 0.0
+    for cls, (n, k) in classes.items():
+        _state["m_configs"][cls] = {}
+        for bucket in M_BUCKETS_LARGE:
+            t1 = time.perf_counter()
+            cfg_m = _autotune_config_m(cls, n, k, _M_REP_M[bucket], bucket,
+                                       device, verbose=verbose)
+            _state["m_configs"][cls][bucket] = cfg_m
+            report["classes"][cls]["m"] = report["classes"][cls].get("m", {})
+            report["classes"][cls]["m"][bucket] = {
+                "config": cfg_m, "autotune_s": time.perf_counter() - t1}
+            m_s += report["classes"][cls]["m"][bucket]["autotune_s"]
     warm_s = _warmup_table()
     total_s = time.perf_counter() - t0
     report["warm_s"] = warm_s
     report["total_s"] = total_s
     _state["report"] = report
+    cfgs = {c: r["config"] for c, r in report["classes"].items()}
+    m_cfgs = {c: {b: rr["config"] for b, rr in r["m"].items()}
+              for c, r in report["classes"].items()}
     print(f"W8 CONFIGURE total_s={total_s:.2f} warm_s={warm_s:.3f} "
-          f"(warm 预算 <1s;autotune 含 JIT 编译,装载期一次)"
-          f" cfgs={ {c: r['config'] for c, r in report['classes'].items()} }",
+          f"(warm 预算 <2s;autotune 含 JIT 编译,装载期一次;大 M 三桶 "
+          f"autotune_s={m_s:.2f}) cfgs={cfgs} m_cfgs={m_cfgs}",
           flush=True)
     return report
 
@@ -313,7 +495,8 @@ def configure(classes=None, *, device="cuda:0", verbose=True) -> dict:
 def reset() -> None:
     """清空全部状态(测试间隔离;workspace 归 decode_gemm 管理,不动)。"""
     _state.clear()
-    _state.update({"configs": {}, "shapes": {}, "device": None, "report": None})
+    _state.update({"configs": {}, "m_configs": {}, "shapes": {},
+                   "device": None, "report": None})
 
 
 # _AUTO_SETS=8 套热测轮转(decode_gemm autotune 同款);36 套冷口径轮转

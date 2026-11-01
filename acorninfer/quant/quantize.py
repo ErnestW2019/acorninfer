@@ -22,6 +22,58 @@ import torch
 EPS = 1e-8           # scale 下限 clamp(全零行/常值组不除零)
 _SHAPE_MULT = 128    # 零特例口径:N/K 必须 128 的倍数
 
+# 接线目标(M7 Task 2,spec §4):末段名 ∈ 8 类的 nn.Linear;embed/norm/KV/
+# q_norm/k_norm/rope 零触碰。末段名匹配(name.split(".")[-1])防跨层误伤。
+QUANT_ATTRS = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj", "lm_head",
+})
+
+
+def apply_quant(model, mode: str) -> None:
+    """装载期现场量化(spec §4 单存储):walk named_modules,末段名命中 8 类的
+    nn.Linear → quantize_w8 → weight.data 换 int8 存储(T1b data 换存储先例;
+    bf16 原存储随引用释放),scale/分派标记挂模块 attr:
+    - `_q_scale`:fp16 [N] per-channel 行广播(quant_gemm 核内消费);
+    - `_m7_quant`:分派标记,dispatch_linear 读它分流(none = 无标记 → 旧路径)。
+
+    mode "none":不 walk、模块零触碰(none 硬门的静态面)。
+    mode "w8a16":纯 torch 数学,CPU 可跑(单测不依赖 GPU);cls 五档键由
+    调用点按 (N,K) 查表(quant_gemm._CLS_BY_SHAPE),walk 期不打标。
+    mode "w4a16":段 B 门控,显式 NotImplementedError(构造期硬失败,不静默;
+    EngineConfig 校验面仍收 w4a16 字符串,spec §4 CLI 面)。
+    cls 形状守门:五档全为 128 倍数,quantize_w8 零特例守门即装载期守门——
+    非 8B 形状模型走 quant 在首个目标层显式 ValueError。
+    装载耗时(R5 预算 120s)print 进装载账(quant_gemm.configure 同款先例);
+    逐层转换、bf16 随换随放,峰值 ≈ 全量 bf16 + 单层 fp32 瞬态(~2.5GB)。
+    """
+    if mode == "none":
+        return
+    if mode != "w8a16":
+        raise NotImplementedError(
+            f"apply_quant: mode {mode!r} 未接线(w4a16 为段 B 门控,M7 段 A "
+            f"只落地 w8a16)")
+    import time
+
+    t0 = time.perf_counter()
+    hit = 0
+    for name, mod in model.named_modules():
+        if name.split(".")[-1] in QUANT_ATTRS and isinstance(mod, torch.nn.Linear):
+            q, s = quantize_w8(mod.weight.data)
+            # int8 data 换存储前必须 requires_grad_(False):torch 禁止把
+            # requires_grad 的 .data 换成非浮点(plan 草稿注③ 实测命中;
+            # 引擎全推理无 backward,int8 权重本就不可训,语义无损)
+            mod.weight.requires_grad_(False)
+            mod.weight.data = q          # int8 Parameter data 换存储
+            mod._q_scale = s             # fp16 [N]
+            mod._m7_quant = "w8a16"      # dispatch_linear 分派标记
+            hit += 1
+    if hit == 0:
+        raise ValueError(
+            "apply_quant 未命中任何量化目标(8 类投影 + lm_head;"
+            "模型结构或 walk 面有误)")
+    print(f"W8 APPLY modules={hit} s={time.perf_counter() - t0:.2f}", flush=True)
+
 
 def _guard_shape(w: torch.Tensor) -> tuple[int, int]:
     if w.dim() != 2:

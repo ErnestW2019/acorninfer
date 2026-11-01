@@ -40,6 +40,7 @@ from acorninfer.engine.engine import Engine
 from acorninfer.engine.tp_engine import TPEngine, TPLink, install_parent_guard, tp_rank1_loop
 from acorninfer.models.qwen3 import from_pretrained, map_hf_state_dict
 from acorninfer.models.qwen3_tp import Qwen3TPForCausalLM, build_shard_fn
+from acorninfer.quant.quantize import apply_quant
 from acorninfer.sampler import SamplingParams
 from acorninfer.tokenizer import Tokenizer
 from acorninfer.weights import load_safetensors_sharded
@@ -512,6 +513,12 @@ def _build_engine(args, link: TPLink | None = None):
     rank1 由 _tp_rank1_main 经本函数以 TPLink(1) 构造(返回裸 Engine,无壳)。
     """
     tp = getattr(args, "tp", 1)
+    quant = getattr(args, "quant", "none")
+    if tp != 1 and quant != "none":
+        # spec §4:--quant 与 --tp>=2 显式互斥,构造期硬报错(不做静默错误行为;
+        # EngineConfig 无 tp 字段,互斥在 tp 已知的本构造点把守)
+        raise ValueError(
+            f"--quant 与 --tp >= 2 互斥(spec §4): got quant={quant!r}, tp={tp}")
     # 后端配方旗标(--attention-backend/--fused-ops/--cuda-graph,bench 同名;
     # getattr 缺省 = CLI 缺省 = 旧调用方(SimpleNamespace 无字段)零改动;
     # --cuda-graph 须 triton 由 EngineConfig.__post_init__ 构造期校验)
@@ -528,12 +535,19 @@ def _build_engine(args, link: TPLink | None = None):
             page_size=args.page_size,
             max_running=args.max_running,
             watermark_blocks=args.watermark_blocks,
+            quant=quant,
             **backend,
         )
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
         model.attention_backend = cfg.attention_backend
         model.fused_ops = cfg.fused_ops
         model.decode_graph = cfg.decode_graph
+        if quant != "none":
+            # M7 段 A:装载后现场量化 + kernel 表 autotune(Engine 构造/graph
+            # 捕获之前;engine.from_config 双构造路径同款,改一处必查另一处)
+            apply_quant(model, quant)
+            from acorninfer.ops import quant_gemm
+            quant_gemm.configure(device=cfg.device)
         tok = Tokenizer(f"{args.model_dir}/tokenizer.json")
         return Engine(
             model,
@@ -648,6 +662,11 @@ def main() -> None:
     parser.add_argument(
         "--cuda-graph", action="store_true",
         help="decode 走 CUDA graph(M4;须 --attention-backend triton)",
+    )
+    parser.add_argument(
+        "--quant", default="none", choices=["none", "w8a16", "w4a16"],
+        help="权重量化(M7 段 A:w8a16;w4a16 = 段 B 门控,装载期硬报错;"
+             "与 --tp>=2 互斥)",
     )
     args = parser.parse_args()
 

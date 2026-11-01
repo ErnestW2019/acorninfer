@@ -27,6 +27,15 @@ atol=1.0 不得复用(段 0 裁决:K=12288 的 down 类 atol 余量薄,单独标
 capture 硬门:graph 捕获含 kernel(含 down sk2 的 split-K 双发射)重放
 torch.equal 逐位(M6 T5 / M7 段 0 QSPIKE_CAP 协议);launch 路径
 set_sync_debug_mode(2) 零 host 同步。
+
+大 M 桶(Task 2,2026-11-02):kernel `_w8_gemm_kernel_m`(pid_m 瓦片轴 × BM
+32/64/128,sk1 定死——大 M 网格 N//BN × cdiv(M,BM) 并行自足);桶 s(17–64)/
+m(65–256)/l(>256),装载期 autotune(`configure()`,代表 M = 桶上界
+{64,256,1024})。容差沿用 TOL_W8 逐类表:误差机制 = 核内 bf16 舍入 × K 点积,
+逐元素界与 M 无关(M 只改瓦片并行,不改归约链);大 M 标定复算确认(命令/
+日期见 test_w8_gemm_large_m_matches_fp32_reference docstring,选值不变)。
+显式 cfg 在大 M 桶解释为 (BM,BN,BK,warps,stages)(BM 首位,与 decode 桶
+(BN,BK,warps,stages,SK) 字段序不同——M regime 决定解释,见 quant_gemm docstring)。
 """
 import pytest
 import torch
@@ -157,6 +166,91 @@ def test_dispatch_no_host_sync():
     quant_gemm.reset()
 
 
+# ---------- 大 M 桶(Task 2:prefill/extend;桶边界 + 数值 + 捕获) ----------
+
+# 桶代表 cfg(显式,绕表;BM 首位):s→BM32 / m→BM64 / l→BM64,均 autotune
+# 候选面内(生产 cfg 由装载期 autotune 实测定,测试钉显式 cfg——T1 先例)
+CFG_LARGE = {
+    "s": (32, 64, 128, 4, 3),
+    "m": (64, 64, 128, 4, 3),
+    "l": (64, 64, 64, 4, 4),
+}
+LARGE_MS = (17, 64, 256, 257)   # 跨 s/m/l 三桶 + 边界(65 见 bucket_for 单测)
+
+
+def test_large_m_bucket_boundaries():
+    """桶边界契约(CPU 纯逻辑):大 M 三桶上界 64/256(d 桶边界见注记期测)。"""
+    assert quant_gemm.bucket_for(66) == "m"
+    assert quant_gemm.bucket_for(256) == "m"
+    assert quant_gemm.bucket_for(257) == "l"
+    assert quant_gemm.bucket_for(1024) == "l"
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("cls", list(CLASSES))
+@pytest.mark.parametrize("m", LARGE_MS)
+def test_w8_gemm_large_m_matches_fp32_reference(cls, m):
+    """大 M 对拍:fp32 dequant 参考逐类 TOL(TOL_W8 沿用;标定复算见下)。
+
+    标定复算(2026-11-02):CUDA_VISIBLE_DEVICES=1 .venv/bin/python
+    /tmp/opencode/m7b/calib_tol_w8_m.py —— 五档 × M∈{64,256,1024} × 桶代表
+    cfg,误差分布与 M≤16 桶同源(逐元素界 M 无关):maxabs(qo/kv/gate_up/
+    lm_head ≤0.57、down ≤0.84)均在 TOL_W8 原表覆盖内,紧比 ≤0.43(绑定元素
+    ≥2.3× 余量;T1 桶 ≤0.38),选值不变、零新桶容差。
+    """
+    x, q, s, wref = _gen(cls, m)
+    ref = x.float() @ wref.T
+    bucket = quant_gemm.bucket_for(m)
+    out = quant_gemm.quant_gemm(x, q, s, cls, cfg=CFG_LARGE[bucket])
+    assert out.dtype == torch.bfloat16 and out.shape == (m, CLASSES[cls][0])
+    torch.testing.assert_close(out.float(), ref, **TOL_W8[cls])
+
+
+@pytest.mark.gpu
+def test_w8_capture_replay_bitwise_large_m():
+    """大 M kernel graph 捕获重放逐位(pid_m 瓦片轴;T5 协议;sk1 单发射)。"""
+    x, q, s, _ = _gen("gate_up", 64)
+    n = CLASSES["gate_up"][0]
+    quant_gemm.quant_gemm(x, q, s, "gate_up", cfg=CFG_LARGE["s"])  # 预编译
+    torch.cuda.synchronize()
+    xs, qs, ss = x.clone(), q.clone(), s.clone()
+    out = torch.empty(64, n, dtype=torch.bfloat16, device="cuda")
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        for _ in range(3):
+            quant_gemm.quant_gemm(xs, qs, ss, "gate_up", cfg=CFG_LARGE["s"], out=out)
+    torch.cuda.current_stream().wait_stream(st)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        quant_gemm.quant_gemm(xs, qs, ss, "gate_up", cfg=CFG_LARGE["s"], out=out)
+    g.replay()
+    torch.cuda.synchronize()
+    r1 = out.clone()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(r1, out)
+    out_e = torch.empty_like(out)
+    quant_gemm.quant_gemm(xs, qs, ss, "gate_up", cfg=CFG_LARGE["s"], out=out_e)
+    torch.cuda.synchronize()
+    assert torch.equal(r1, out_e)
+
+
+@pytest.mark.gpu
+def test_large_m_routing_contract():
+    """大 M 路由契约:quant_gemm 入口按 M 分流(M≤16 decode 表 / M>16 大 M 表);
+    大 M 表未配置 → 显式 RuntimeError(不静默 KeyError);显式 cfg 绕表可用。"""
+    quant_gemm.reset()
+    x, q, s, _ = _gen("qo", 17)
+    # 未配置:显式报错(防静默 KeyError / 误用 decode 表)
+    with pytest.raises(RuntimeError, match="configure"):
+        quant_gemm.quant_gemm(x, q, s, "qo")
+    # 显式 cfg(BM 首位)绕表可用
+    out = quant_gemm.quant_gemm(x, q, s, "qo", cfg=CFG_LARGE["s"])
+    assert out.shape == (17, CLASSES["qo"][0])
+    quant_gemm.reset()
+
+
 # ---------- 分派契约(CPU 纯逻辑) ----------
 
 def test_classes_shape_contract():
@@ -168,9 +262,10 @@ def test_classes_shape_contract():
 
 
 def test_bucket_guard_m_gt16_prefill_note():
-    """M≤16 bucket 分派;M>16(prefill 大 M 桶)= Task 2 范围,接口注记期硬报错。"""
-    with pytest.raises(NotImplementedError):
-        quant_gemm.quant_gemm(
-            torch.zeros(17, 128, dtype=torch.bfloat16),
-            torch.zeros(64, 128, dtype=torch.int8),
-            torch.ones(64, dtype=torch.float16), "qo", cfg=CFG_MAIN)
+    """(Task 2 已落地,本注记期契约退役;NotImplementedError 不得恢复。)
+    大 M 桶路由/数值/捕获契约移交 test_large_m_* 三测;d/s/m/l 全边界在此。"""
+    assert quant_gemm.bucket_for(1) == "d"
+    assert quant_gemm.bucket_for(16) == "d"
+    assert quant_gemm.bucket_for(17) == "s"
+    assert quant_gemm.bucket_for(64) == "s"
+    assert quant_gemm.bucket_for(65) == "m"

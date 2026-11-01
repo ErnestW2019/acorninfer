@@ -92,6 +92,28 @@ def apply_layout_patch(model, layout: str) -> None:
             f"layout must be none|t|down_t|pad8|pad16, got {layout!r}")
 
 
+def prefill_account(engine: Engine, model, c: int, label: str, quant: str,
+                    in_tokens: int = 128) -> None:
+    """in-process prefill 计时(M7 Task 2 spec §6 R1 TTFT 账):C=c 一次 step
+    全准入(max_running=8),128 in_tokens/条;首步预热(JIT/池首触)后计一步,
+    sync 前后夹墙钟。输出行:ABPREFILL <label> C=<c> quant=<q> in_tokens=<n>
+    prefill_ms=<v>(none 腿 = 基线,w8a16 腿照实入账;prefill 回退允许不粉饰)。"""
+    prompts = _prompts(c, in_tokens, model.cfg.vocab_size, SEED)
+    for _ in range(2):          # 第 1 轮预热,第 2 轮计量
+        sids = [engine.submit(p, SamplingParams(temperature=0.0), max_tokens=1)
+                for p in prompts]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        engine.step()           # 全准入 prefill 步
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) * 1000
+        for sid in sids:
+            engine.drop(sid)
+    print(f"ABPREFILL {label} C={c} quant={quant} in_tokens={in_tokens} "
+          f"prefill_ms={ms:.2f}", flush=True)
+    engine.assert_balanced()
+
+
 def run_combo(engine: Engine, model, c: int, warmup: int, steps: int,
               label: str, mode: str, prefix: str = "AB") -> None:
     """C=c 档:prefill → 3 步稳定 → warmup → 计 30 步 → AB 行。"""
@@ -144,6 +166,9 @@ def main() -> None:
     ap.add_argument("--label", default="baseline")
     ap.add_argument("--layout", default="none",
                     choices=["none", "t", "down_t", "pad8", "pad16"])
+    ap.add_argument("--quant", default="none", choices=["none", "w8a16"],
+                    help="M7 Task 2:生产同构量化腿(装载后 apply_quant + "
+                         "quant_gemm.configure,与 engine/server 接线同码)")
     ap.add_argument("--bf16-reduction", default=None, choices=["true", "false"],
                     help="allow_bf16_reduced_precision_reduction;缺省 = torch 默认")
     ap.add_argument("--warmup", type=int, default=10)
@@ -157,10 +182,26 @@ def main() -> None:
             args.bf16_reduction == "true")
 
     print(f"loading {DEFAULT_MODEL} -> {args.device} (bf16) "
-          f"label={args.label} layout={args.layout} "
+          f"label={args.label} layout={args.layout} quant={args.quant} "
           f"bf16_reduction={args.bf16_reduction or 'torch-default'} ...",
           flush=True)
+    t_load = time.perf_counter()
     model = from_pretrained(DEFAULT_MODEL, args.device, torch.bfloat16)
+    load_s = time.perf_counter() - t_load
+    t_apply = time.perf_counter()
+    apply_s = configure_s = 0.0
+    if args.quant != "none":
+        # 生产同构:与 engine.from_config / server._build_engine 接线同码
+        from acorninfer.ops import quant_gemm
+        from acorninfer.quant.quantize import apply_quant
+        apply_quant(model, args.quant)
+        apply_s = time.perf_counter() - t_apply
+        t_cfg = time.perf_counter()
+        quant_gemm.configure(device=args.device)
+        configure_s = time.perf_counter() - t_cfg
+    print(f"LOADTIME label={args.label} quant={args.quant} "
+          f"load_s={load_s:.1f} apply_s={apply_s:.1f} configure_s={configure_s:.1f}",
+          flush=True)
     model.attention_backend = "triton"
     model.fused_ops = True
     apply_layout_patch(model, args.layout)
@@ -173,6 +214,11 @@ def main() -> None:
             # down_t 腿(T0 裁决复测)输出行换 RETEST down_t 前缀,便于 grep 归档
             prefix = "RETEST" if args.layout == "down_t" else "AB"
             shown = "down_t" if args.layout == "down_t" else args.label
+            if mode == "eager":
+                # prefill 账与 decode A/B 同进程同模型(prefill 无 graph 面,
+                # 双 mode 数值同;取 eager 腿一次,免重复)
+                for c in (1, 8):
+                    prefill_account(engine, model, c, shown, args.quant)
             for c in (1, 8):
                 run_combo(engine, model, c, args.warmup, args.steps,
                           shown, mode, prefix)

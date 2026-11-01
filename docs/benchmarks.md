@@ -2381,3 +2381,81 @@ TOL 逐类标定(协议:真实分布权重 randn→quantize_w8,五档 × M∈{1,
 紧比 = max\|diff\|/(atol+rtol·\|ref\|)(assert_close 判据全分布复算,余量的精确口径);maxrel(>1) 大值是 \|ref\|≈1 处 atol 覆盖区的相对误差尾,不单独选 rtol。**down K=12288 单独标定(段 0 警示证实)**:spike 级 (2e-2, 1.0) 紧比 0.711(余量仅 1.4×)→ 写死 (2e-2, 2.0);误差随 K 增长(√K 累计)五档可见(down maxabs 0.714 vs kv 0.315)。真错(索引/mask)差 O(10) 起,不可漏网。
 
 测试账(TDD 红绿):红 = `ImportError: cannot import name 'quant_gemm'`(实现前);绿 = 26 passed(对拍 5×4=20 + splitk 确定性 1 + capture 重放逐位 2(down sk2 双发射 / qo sk1)+ dispatch 零 host 同步 1 + CPU 契约 2)。全套件:`CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **185 passed, 6 skipped, 17 deselected**(基线 159 + 新增 26,零换金;decode_gemm 17 passed 零变化硬门成立)。对 plan 草稿偏离逐条:①文件落位 `acorninfer/ops/quant_gemm.py`(plan 写 `ops/…` 为包内简写,ops 无独立顶层目录);②`_bucket_for` 未复用(见上,归桶无消费者);③TOL 校准中发现 M=16 曾被 `_bucket_for(M) is None` 守门误拒(bucket 上限 8)——改为 M≤16 直判后红转绿,归桶偏离由此一并定案;④autotune 权重轮转用随机 int8+fp16 直构(免 spike 的 bf16→quantize 瞬态;带宽口径字节流等价,数值对拍由测试真实 quantize 链路覆盖)。kv autotune 择 (64,128,4,**3**,1) 与主形态 s4 差 0.3%(噪声级,装载期实测定,两轮复现一致)。证据归档 `/tmp/opencode/m7a/`(calib_tol_w8.log / calib_tol_w8_final.log / loadtime_w8.log / pytest_full.log)。本节树 = d83b3bc + 本 commit。不打 tag、不 push(留用户)。
+
+### 段 A·接线账:W8A16 生产接线(2026-11-02,`tests/test_quant_wiring.py` + 接线五文件 + `scripts/m6_ab.py --quant`,真机输出)
+
+接线面(关键现实逐条落地,调用点 = 4 前向 × 7 投影 + lm_head×4 = 23 处):`config.py::EngineConfig` 增 `quant: str = "none"`(`__post_init__` 校验 ∈ {none,w8a16,w4a16};**EngineConfig 无 tp 字段——quant×tp>1 互斥在 tp 已知的唯一构造点 `server._build_engine` 把守,构造期 ValueError**);`quantize.py` 增 `QUANT_ATTRS`(8 类末段名)+ `apply_quant(model, mode)`(walk `named_modules`,末段名命中且为 nn.Linear → int8 存储 + `_q_scale` fp16 [N] + `_m7_quant` 打标;**none = 不 walk、模块零触碰**;w4a16 = 段 B 门控,装载期显式 NotImplementedError;253 目标 0.53s 全量转完);`qwen3.py` 增 `dispatch_linear(mod, x)` 模块级帮手,23 处调用点改形(`forward`/`forward_decode`/`forward_prefill_batch`/`forward_extend` 各 4 投影 + MLP 3 + lm_head×4;qwen3_tp.py 零触碰,TP×quant 互斥无外溢面);`engine.from_config` 与 `server._build_engine`(tp==1 腿)装载后 `apply_quant` + `quant_gemm.configure(device)`(**均在 Engine 构造/graph 捕获之前**);server CLI `--quant {none,w8a16,w4a16}`(照 `--attention-backend` 旗标风格,getattr 缺省 = 旧调用方零改动);`m6_ab.py` 增 `--quant`(生产同构:同 `apply_quant`/`configure` 码)+ `ABPREFILL` 行(prefill 计时账)+ `LOADTIME` 行(装载耗时账)。
+
+**cls 分派形态定案(两候选中选调用期 shape 查表)**:`apply_quant` walk 期不打标 cls,`dispatch_linear` 在调用点按 `(N,K)` 查 `quant_gemm._CLS_BY_SHAPE`(五档形状全唯一,host dict 一次 ~0.1µs;graph 捕获期定死,零 host 同步)。理由:apply_quant 保持纯 torch/CPU 可测(walk 单测不需要 GPU/五档形状);调用开销 253 次/decode 步 ≈ 30–50µs(<0.3% TPOT),none 腿实测(M6 带内)证实不可见。输出 `view(*x.shape[:-1], N)` 回填领先维(quant_gemm 内部 2D 化,调用点 `.view()/.float()` 语义不变;等效 m6_ab layout harness 的 make_forward 形态)。
+
+大 M 桶(Task 2 遗留注记落地,**无 bf16 回退可选**,spec §4 单存储全路径走量化):`quant_gemm` 增 `_w8_gemm_kernel_m`(pid_m 瓦片轴 × BM∈{32,64,128},dequant 数学与 decode kernel 逐字同源;**sk1 定死**——大 M 网格 N//BN × cdiv(M,BM) 自足,split-K 的 partials/reduce 无增益,down sk2 先例只属 decode 桶)+ `bucket_for`(d≤16 走 T1 decode 路径零变化;s=17–64 / m=65–256 / l>256 三桶,桶数克制)+ `quant_gemm()` 入口按 M 分流(显式 cfg 在大 M 桶解释为 (BM,BN,BK,warps,stages),BM 首位,与 decode 桶 (BN,BK,warps,stages,SK) 字段序不同)。装载期 autotune 候选面:BM 逐桶 + BN/BK 邻域(s:BM32×4 / m:BM64×4 / l:BM64/128×4,shmem ≤96KB + 整除预过滤),代表 M = 桶上界 {64,256,1024};**warm_s=0.027–0.165s(<2s 预算 ✓;configure total 5.0s 热 / 6.97s 冷含 JIT,T1 的 1.59s 增至 3–4× 系大 M 15 轮 autotune,装载期一次,如实)**。r1 冷轮 FULL 输出(stdout 逐字):
+
+```
+W8 APPLY modules=253 s=0.53
+W8 AUTOTUNE_BEST qo cfg=(64, 128, 4, 3, 1) us=21.99 gb=763 skipped=0
+W8 AUTOTUNE_BEST kv cfg=(64, 128, 4, 3, 1) us=16.49 gb=255 skipped=0
+W8 AUTOTUNE_BEST gate_up cfg=(64, 128, 4, 4, 1) us=63.39 gb=794 skipped=0
+W8 AUTOTUNE_BEST down cfg=(64, 128, 4, 4, 2) us=64.43 gb=781 skipped=0
+W8 AUTOTUNE_BEST lm_head cfg=(64, 128, 4, 3, 1) us=692.54 gb=899 skipped=0
+W8 AUTOTUNE_BEST qo[s] M=64 cfg=(32, 64, 128, 4, 4) us=22.50 gb=746 skipped=0
+W8 AUTOTUNE_BEST qo[m] M=256 cfg=(64, 64, 128, 4, 3) us=62.84 gb=267 skipped=0
+W8 AUTOTUNE_BEST qo[l] M=1024 cfg=(128, 64, 64, 8, 3) us=223.03 gb=75 skipped=0
+W8 AUTOTUNE_BEST kv[s] M=64 cfg=(32, 64, 128, 4, 4) us=19.17 gb=219 skipped=0
+W8 AUTOTUNE_BEST kv[m] M=256 cfg=(64, 64, 128, 8, 3) us=33.58 gb=125 skipped=0
+W8 AUTOTUNE_BEST kv[l] M=1024 cfg=(64, 64, 128, 4, 3) us=59.88 gb=70 skipped=0
+W8 AUTOTUNE_BEST gate_up[s] M=64 cfg=(32, 64, 128, 4, 3) us=61.67 gb=817 skipped=0
+W8 AUTOTUNE_BEST gate_up[m] M=256 cfg=(64, 64, 128, 4, 3) us=186.05 gb=271 skipped=0
+W8 AUTOTUNE_BEST gate_up[l] M=1024 cfg=(128, 64, 64, 8, 3) us=695.71 gb=72 skipped=0
+W8 AUTOTUNE_BEST down[s] M=64 cfg=(32, 64, 128, 4, 4) us=63.51 gb=793 skipped=0
+W8 AUTOTUNE_BEST down[m] M=256 cfg=(64, 64, 128, 4, 3) us=184.44 gb=273 skipped=0
+W8 AUTOTUNE_BEST down[l] M=1024 cfg=(128, 64, 64, 8, 3) us=694.22 gb=73 skipped=0
+W8 AUTOTUNE_BEST lm_head[s] M=64 cfg=(32, 64, 128, 4, 4) us=1388.21 gb=449 skipped=0
+W8 AUTOTUNE_BEST lm_head[m] M=256 cfg=(64, 64, 128, 8, 3) us=2896.92 gb=215 skipped=0
+W8 AUTOTUNE_BEST lm_head[l] M=1024 cfg=(128, 64, 64, 8, 3) us=10648.58 gb=58 skipped=0
+W8 CONFIGURE total_s=6.97 warm_s=0.165 (warm 预算 <2s;…大 M 三桶 autotune_s=5.51) cfgs={五档如上} m_cfgs={15 项如上}
+```
+
+(gb 列在大 M 桶口径失真:M=1024 GEMM 是 flop-bound 非权重流-bound,qo[l] 223µs ≈ 154 TFLOPS bf16 ≈ 93% 峰值——如实注记,大 M 桶的账看 µs/flops 不看 gb。轮转间 autotune 胜者有小幅漂移(kv 曾择 (64,64,4,4,1)/qo s3/s4 互换),均噪声级,装载期实测定。)
+
+大 M TOL 复算(TOL 协议沿用 T1;命令 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python /tmp/opencode/m7b/calib_tol_w8_m.py`,2026-11-02,stdout 归档 `/tmp/opencode/m7b/calib_tol_w8_m.log`):五档 × M∈{64,256,1024} × 桶代表 cfg,误差分布与 M≤16 桶同源(逐元素界 M 无关):maxabs(qo/kv/gate_up/lm_head ≤0.57、down ≤0.84)均在 TOL_W8 原表覆盖内,**紧比 ≤0.43(绑定元素 ≥2.3× 余量;T1 桶 ≤0.38),选值不变、零新桶容差**;`tests/test_quant_gemm.py` 新增大 M 对拍 20(五档 × M∈{17,64,256,257})+ 大 M capture 重放逐位 1 + 路由契约 1 + 桶边界 1。
+
+**A/B 门(GPU 1,`m6_ab.py --quant {none,w8a16}`,n=3 交错 [none,w8a16]×3,生产同构接线;对照 M6 带 graph 17.91–17.96 / 19.87–19.93、eager 19.13–19.35 / 21.11–21.28)**:step_ms 主口径,`AB` 行逐字(三进程 none:ab_none_r1/r2/r3.log;三进程 w8a16:ab_w8a16_r1/r2/r3.log,`/tmp/opencode/m7b/` 归档):
+
+| 腿 | C=1 graph | C=8 graph | C=1 eager | C=8 eager |
+|---|---|---|---|---|
+| none r1 | 17.92 | 19.90 | 19.17 | 21.45 |
+| none r2 | 17.92 | 19.93 | 19.16 | 21.15 |
+| none r3 | 17.92 | 19.89 | 19.15 | 21.12 |
+| **none 中位** | **17.92** | **19.90** | **19.16** | **21.15** |
+| w8a16 r1 | 10.78 | 11.54 | 16.95 | 18.13 |
+| w8a16 r2 | 11.02 | 11.68 | 17.59 | 17.22 |
+| w8a16 r3 | 10.74 | 11.59 | 16.65 | 16.77 |
+| **w8a16 中位** | **10.78** | **11.59** | **16.95** | **17.22** |
+| **graph 收益** | **7.14 ≥ 5.0 ✓** | **8.31 ≥ 4.0 ✓** | eager C=1 **−2.21 ✓** | eager C=8 **−3.93 ✓** |
+
+**判定行:四门全过,且逐轮(r1/r2/r3 各自单独)四门均过——GO,eager 双 C 为改善非劣化。** none 腿 vs M6 带:graph C=1 17.92 带内 / C=8 19.89–19.93 带内 / eager C=1 19.15–19.17 带内 / eager C=8 21.12–21.45(r1 21.45 高出带顶 0.17,r2/r3 带内;中位 21.15 带内——r1 为首跑机器态,如实注记;dispatch 帮手理论开销 ~30–50µs/步,不可见)。锚轨迹(判定行留 Task 5 终仪式):w8a16 graph TPOT C=8 11.53–11.70(锚 ≤14.0,余量 ~20%✓);**C=1 10.74–11.02 vs 锚 ≤10.5——当前带高于锚 0.24–0.52ms,如实呈报控制器**(段 0 推算 ~9.9;差距主要在非 GEMM 面与 kv launch-bound 成本,T5 以仪式口径终判)。
+
+**prefill 账(spec §6 R1;`ABPREFILL` 行逐字,in-process 单步 8×128 token 全准入,sync 前后夹墙钟;二轮取后轮)**:
+
+| 腿 | C=1(M=128,m 桶) | C=8(M=1024,l 桶) |
+|---|---|---|
+| none(r1/r2/r3) | 32.49 / 32.44 / 32.80 | 142.12 / 142.50 / 144.09 |
+| w8a16(r1/r2/r3) | 30.82 / 31.56 / 31.56 | 150.78 / 150.82 / 151.59 |
+| 中位 | 32.49 → **31.56(−2.9%)✓** | 142.50 → **150.82(+5.8%)如实入账** |
+
+C=1 prefill w8a16 更快(M=128 权重流-bound,量化字节优势兑现);C=8 prefill +5.8%(M=1024 flop-bound:dequant ALU + int8→bf16 转换纯增开销,大 M 桶 η 表同证)——**非灾难级(≫2× 阈),R1 允许回退,照实入账不粉饰;chunked prefill(预算切块)下 M 更小,向 C=1 侧移动**。TTFT 影响面:服务端 TTFT ≈ queue + 本步,单请求 128-token 场景为净改善;8 并发到齐场景 +8.3ms。
+
+**parity(margin 门协议,M5 先例;量化 vs bf16 是不同数值域,不逐位)**:①tiny/mini 腿 = 套件内 `test_w8a16_mini_model_decode_margin`(128 倍数 mini 模型端到端 none vs w8a16 decode logits:max|Δ| 打印 + margin 门 argmax 断言,绿);②8B 单请求腿 = `/tmp/opencode/m7b/parity_8b.py`(同 seed prompt 128 token,贪心 16 步,graph 生产同构,双进程 none/w8a16):**token 流 16/16 逐位一致**;逐步 top-1 logit |Δ| ≤ 0.75(量级 |logit| 14–51 的 ~1–2%),top-2 margin 逐步非平局(两腿 min=0.25 同值),无 argmax 翻转。stdout 逐字:
+
+```
+PARITY none  tokens=[2132, 4977, 1075, 498, 3003, 3267, 291, 264, 6514, 315, 4194, 5766, 11, 17738, 11]
+PARITY w8a16 tokens=[2132, 4977, 1075, 498, 3003, 3267, 291, 264, 6514, 315, 4194, 5766, 11, 17738, 11]
+PARITY none  top1=[14.56, 34.5, 34.0, 33.25, 38.0, 39.0, 51.25, 45.25, 38.25, 41.25, 36.0, 41.0, 39.0, 33.75, 41.25]
+PARITY w8a16 top1=[14.69, 35.0, 34.25, 34.0, 38.25, 39.75, 51.5, 45.75, 38.0, 41.0, 36.0, 41.0, 39.25, 33.75, 41.5]
+```
+
+**装载耗时(spec R5 预算 120s;`LOADTIME` 行逐字)**:none 30.8–34.3s(纯 bf16 读盘);w8a16 load 30.7–31.2 + apply 0.53(253 模块 RTN)+ configure 5.0(热)/6.97(冷,含 JIT)≈ **36.2–38.7s 全链,预算 120s 内 ✓**(triton 缓存热后 configure 稳定 5.0s;不做磁盘量化缓存,non-goal 不变)。
+
+**none 硬门证据**:全套件 `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest` → **217 passed, 6 skipped, 17 deselected**(= 基线 185 原样全绿 + 新增 32:quant_wiring 9 + quant_gemm 大 M 23;golden m0–m5 零换金,golden 文件 diff 为零);none 缺省时 `dispatch_linear` 走 `mod(x)` 原路径(CPU 逐位单测 + golden 面),A/B none 腿与 M6 带重合(上表)= 8B 生产级零漂移复核。
+
+测试账(TDD 红绿):红 = `ImportError: cannot import name 'dispatch_linear'` + 大 M `KeyError/NotImplementedError`(实现前,24 failed);绿 = wiring 9 + gemm 49。**对 plan 草稿/关键现实偏离逐条**:①walk 测试不能用 tiny(plan 草稿"CPU/tiny 为主"):tiny hidden=64 触发 quantize_w8 零特例守门(T0 钉死契约)→ 改 128 倍数 mini 配置,none 逐位测仍用 tiny;②草稿 `mod.weight.data = q` 直接换存储实测失败(torch 禁止 requires_grad 的 .data 换非浮点——草稿注③预判命中)→ 换存储前置 `requires_grad_(False)`(int8 权重本就不可训,引擎全推理无 backward,语义无损);③cls 形态在"装载期打标 vs shape 查表"两候选中定 shape 查表(理由见上;两候选均为指令允许面,选型如实报告);④quant×tp 互斥落点 = `server._build_engine`(EngineConfig 无 tp 字段,指令已预授权"以 config.py 现状为准");⑤大 M 桶 split-K 不评估(sk1 结构性定死,网格自足;非"评估后放弃");⑥T1 注记期契约测试 `test_bucket_guard_m_gt16_prefill_note`(NotImplementedError)退役改写为大 M 契约测试;⑦prefill 账仪器 = m6_ab `ABPREFILL`(指令"bench --in-tokens 128 或等价"的等价腿);⑧warm 预算口径从 T1 的 <1s 放宽为本指令 <2s(实测 0.027–0.165s ✓)。lm_head 引擎内大 M 不出现(prefill_batch 只取各行末位,M=N≤8 → decode 桶;大 M lm_head 消费面 = Task 3 ppl window=512 / M0 oracle)。证据归档 `/tmp/opencode/m7b/`(ab_none_r1/r2/r3.log、ab_w8a16_r1/r2/r3.log、calib_tol_w8_m.log、parity 两腿 stdout、baseline_pytest)。本节树 = 6dc7c00 + 本 commit。不打 tag、不 push(留用户)。

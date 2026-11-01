@@ -18,6 +18,35 @@ from acorninfer.config import Qwen3Config
 from acorninfer.weights import load_safetensors
 
 
+def dispatch_linear(mod, x):
+    """线性层分派(M7 段 A 接线;全部投影/lm_head 调用点的唯一入口):
+    - none(缺省,模块无 `_m7_quant` 标记):`mod(x)` —— nn.Linear.__call__
+      旧路径逐字节(F.linear),none 硬门的运行时面;
+    - w8a16:`quant_gemm(x, int8 权重, scale, cls)`,cls 按 (N,K) 查五档表
+      (`_CLS_BY_SHAPE`,host dict 一次查 ~0.1µs,graph 捕获期定死零 host
+      同步;walk 期不打标 → apply_quant 保持纯 torch/CPU 可测,cls 形状
+      不匹配显式报错零静默);
+    输出 view 回 x 领先维形状(调用点 .view()/.float() 语义不变;quant_gemm
+    内部 2D 化,quant 路径等效 m6_ab layout harness 的 make_forward 形态)。
+    其他标记值(w4a16 等)= 显式报错(walk 侧 NotImplementedError 之后
+    的第二道守门)。
+    """
+    mode = getattr(mod, "_m7_quant", None)
+    if mode is None:
+        return mod(x)
+    if mode != "w8a16":
+        raise ValueError(f"dispatch_linear: unsupported _m7_quant={mode!r}")
+    from acorninfer.ops.quant_gemm import _CLS_BY_SHAPE, quant_gemm
+    w = mod.weight.data
+    cls = _CLS_BY_SHAPE.get(tuple(w.shape))
+    if cls is None:
+        raise ValueError(
+            f"dispatch_linear: quantized linear shape {tuple(w.shape)} "
+            f"不在五档 CLASSES(apply_quant 只对生产 8B 形状有效)")
+    out = quant_gemm(x, w, mod._q_scale, cls)
+    return out.view(*x.shape[:-1], w.shape[0])
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float):
         super().__init__()
@@ -90,9 +119,9 @@ class Qwen3Attention(nn.Module):
     def forward(self, hidden, cos, sin, cache=None, layer_idx=0):
         # cos/sin 由 Qwen3ForCausalLM.rope 预计算,全层共享
         b, s, _ = hidden.shape
-        q = self.q_proj(hidden).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = dispatch_linear(self.q_proj, hidden).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+        k = dispatch_linear(self.k_proj, hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = dispatch_linear(self.v_proj, hidden).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -120,7 +149,7 @@ class Qwen3Attention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
         out = out.transpose(1, 2).reshape(b, s, -1)
-        return self.o_proj(out)
+        return dispatch_linear(self.o_proj, out)
 
     def forward_decode(self, hidden, cos, sin, views, layer_idx, *,
                        positions=None, inv_freq=None, fused_ops=False,
@@ -148,9 +177,9 @@ class Qwen3Attention(nn.Module):
                 f"attention_backend must be 'sdpa'|'triton', got {attention_backend!r}"
             )
         B, s, _ = hidden.shape
-        q = self.q_proj(hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = dispatch_linear(self.q_proj, hidden).view(B, s, self.num_heads, self.head_dim).transpose(1, 2)
+        k = dispatch_linear(self.k_proj, hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = dispatch_linear(self.v_proj, hidden).view(B, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -201,7 +230,7 @@ class Qwen3Attention(nn.Module):
                 outs.append(F.scaled_dot_product_attention(q[b : b + 1], k_full, v_full))
             out = torch.cat(outs, dim=0)             # [B, H, 1, D]
         out = out.transpose(1, 2).reshape(B, s, -1)
-        return self.o_proj(out)
+        return dispatch_linear(self.o_proj, out)
 
     def forward_prefill_batch(self, hidden, cos, sin, views, layer_idx, *,
                               real_lens):
@@ -218,9 +247,9 @@ class Qwen3Attention(nn.Module):
         拷贝(形状约定不同)—— 改公式需三处同步;golden 门是安全网。
         """
         N, Lmax, _ = hidden.shape
-        q = self.q_proj(hidden).view(N, Lmax, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = dispatch_linear(self.q_proj, hidden).view(N, Lmax, self.num_heads, self.head_dim).transpose(1, 2)
+        k = dispatch_linear(self.k_proj, hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = dispatch_linear(self.v_proj, hidden).view(N, Lmax, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -246,7 +275,7 @@ class Qwen3Attention(nn.Module):
             outs[b, :, :L] = F.scaled_dot_product_attention(
                 q[b : b + 1, :, :L], k_full, v_full, is_causal=(L > 1))[0]
         out = outs.transpose(1, 2).reshape(N, Lmax, -1)
-        return self.o_proj(out)
+        return dispatch_linear(self.o_proj, out)
 
     def forward_extend(self, hidden, cos, sin, views, layer_idx, *,
                        starts, chunk_lens):
@@ -267,9 +296,9 @@ class Qwen3Attention(nn.Module):
         —— 改公式需四处同步;golden 门是安全网。
         """
         N, Lc_max, _ = hidden.shape
-        q = self.q_proj(hidden).view(N, Lc_max, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = dispatch_linear(self.q_proj, hidden).view(N, Lc_max, self.num_heads, self.head_dim).transpose(1, 2)
+        k = dispatch_linear(self.k_proj, hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = dispatch_linear(self.v_proj, hidden).view(N, Lc_max, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -294,7 +323,7 @@ class Qwen3Attention(nn.Module):
             outs[b, :, :L] = F.scaled_dot_product_attention(
                 q[b : b + 1, :, :L], k_full, v_full, attn_mask=mask)[0]
         out = outs.transpose(1, 2).reshape(N, Lc_max, -1)
-        return self.o_proj(out)
+        return dispatch_linear(self.o_proj, out)
 
 
 class Qwen3MLP(nn.Module):
@@ -305,7 +334,10 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return dispatch_linear(
+            self.down_proj,
+            F.silu(dispatch_linear(self.gate_proj, x)) * dispatch_linear(self.up_proj, x),
+        )
 
 
 class Qwen3Block(nn.Module):
@@ -415,7 +447,7 @@ class Qwen3ForCausalLM(nn.Module):
         hidden = self.norm(hidden)
         if num_logits_to_keep is not None:
             hidden = hidden[:, -num_logits_to_keep:, :]
-        return self.lm_head(hidden).float()
+        return dispatch_linear(self.lm_head, hidden).float()
 
     def forward_decode(self, input_ids: torch.Tensor, views, *, prepared=None) -> torch.Tensor:
         """批量 decode:input_ids [B, 1] + 每序列的 PagedCacheView -> [B, vocab]。
@@ -492,7 +524,7 @@ class Qwen3ForCausalLM(nn.Module):
                 tables=tables, lens=lens, scatter=scatter,
             )
         hidden = self.norm(hidden)
-        return self.lm_head(hidden).float()[:, 0, :]  # [B, vocab]
+        return dispatch_linear(self.lm_head, hidden).float()[:, 0, :]  # [B, vocab]
 
     def forward_prefill_batch(self, input_ids: torch.Tensor, views, *,
                               real_lens) -> torch.Tensor:
@@ -536,7 +568,7 @@ class Qwen3ForCausalLM(nn.Module):
         hidden = self.norm(hidden)
         last = torch.tensor([L - 1 for L in real_lens], device=device)
         hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
-        return self.lm_head(hidden).float()
+        return dispatch_linear(self.lm_head, hidden).float()
 
     def forward_extend(self, input_ids: torch.Tensor, views, *,
                        starts: list[int], chunk_lens: list[int]) -> torch.Tensor:
@@ -583,7 +615,7 @@ class Qwen3ForCausalLM(nn.Module):
         # 末位 token = 绝对位 start+len-1,在 pad 张量中位于第 len-1 列(局部坐标)
         last = torch.tensor([L - 1 for L in chunk_lens], device=device)
         hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
-        return self.lm_head(hidden).float()
+        return dispatch_linear(self.lm_head, hidden).float()
 
 
 def map_hf_state_dict(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

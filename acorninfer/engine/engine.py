@@ -14,6 +14,7 @@ from acorninfer.engine.graph_runner import DecodeGraphRunner
 from acorninfer.engine.scheduler import Scheduler
 from acorninfer.engine.sequence import RequestStatus, Sequence
 from acorninfer.models.qwen3 import Qwen3ForCausalLM, from_pretrained
+from acorninfer.quant.quantize import apply_quant
 from acorninfer.sampler import SamplingParams
 from acorninfer.tokenizer import Tokenizer
 
@@ -86,6 +87,13 @@ class Engine:
         model.attention_backend = cfg.attention_backend
         model.fused_ops = cfg.fused_ops
         model.decode_graph = cfg.decode_graph
+        if cfg.quant != "none":
+            # M7 段 A:装载后现场量化(spec §4 单存储)+ kernel 表装载期 autotune
+            # —— 均在 Engine 构造(graph 捕获)之前;quant×tp 互斥在 server.
+            # _build_engine 构造期把守(from_config 是单卡路径,无 tp 面)
+            apply_quant(model, cfg.quant)
+            from acorninfer.ops import quant_gemm  # triton:仅 quant 路径(局部导入同 qwen3 先例)
+            quant_gemm.configure(device=cfg.device)
         return cls(
             model,
             tokenizer,
