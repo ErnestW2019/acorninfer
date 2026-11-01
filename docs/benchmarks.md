@@ -2342,6 +2342,14 @@ W4(同口径):
 1. **W8:条款不触发,锚维持,段 A GO。** dev −5.9%/−5.1% 在 ±10% 内;C=8 推算 TPOT ~12.3 ≤ 14.0、C=1 ~9.9 ≤ 10.5(推算口径,终仪式实测为准)。Task 1 定档输入 = `bn64_bk128_w4_s4` 主形态 + down `sk2`;qo 类 autotune 开放 sk 评估(同 down 先例);down 类 TOL 单独标定(勿复用 spike atol=1.0);kv 类引擎内真实成本以 Task 2 A/B 为准(微基准为 launch-bound 下界,如实)。
 2. **W4:条款触发,修正权保留不行使。** 理由:①段 0 数据为探索级,段 B 未探面(宽载 unpack、scale 预广播、双 buffer)与引擎内 L2 环境都可能改变终值;②spec §1/§2 的段 B 资格门(kernel η ≥ 0.80)是先行硬门——资格门过则锚 10.5 在 η≥0.80 口径下自动过(4.03GB@0.80 = 5.04ms GEMM → TPOT ≈ 7.9),资格门不过则 NO-GO 入档(M8 台账),锚从未被测试、无修正必要;③一次修正权留作段 B 硬化 kernel 后的生产级数据裁决(届时若资格门边缘 + 锚物理性不可达同时成立,再行使)。段 B 定档输入 = g0(组对齐 BLOCK_K=128)主形态,gather 出局,unpack 两法皆入 autotune,down sk4。
 
+### 段 B 门裁决(2026-11-02,Task 4 = NO-GO close-out,控制器裁)
+
+三条件读数(spec §2):①主锚 C=8:T2 A/B 轨迹 11.53–11.70 ≤ 14.0 ✓(仪式终验留 Task 5;C=1 轨迹 10.74–11.02 暂高 10.5 锚 ~3%,仪式如实裁);②精度:W8 ppl 增量 −0.088%(≤ +1% ✓;负值 = 对称噪声,不解读为量化更优);③**kernel η 资格门:FAIL——段 0 探索级加权 0.472–0.482 vs 门 0.80,缺口 ~67%;主类最高 gate_up 0.62;ALU 税(unpack + 组反量化,×0.50–0.71 of W8)为结构性,未探面合理增益 10–20% 量级,不足以跨越。判定:段 B NO-GO,W4 挪 M8 台账。**
+
+附带否决轴(即使资格门边缘过的世界线):W4 净收益 ≈ 8.45 vs 9.31ms GEMM 面(~0.9ms/步)对已落地的 W8 微薄;精度域 RTN W4 g128 典型 +2~5% ppl,对 W8 的 −0.088% 是数量级劣化。生产判据下 W4 不值得建。
+
+一次锚修正权:未行使,保留闭合(W8 条款未触发;W4 无需修正即 NO-GO,条款自然失效)。M8 台账 W4 复活条件:kernel 形态突破(marlin 级重构)/ 精度算法升级(GPTQ)/ 显存受限场景价值重估。
+
 ### 段 A·kernel 定档:W8 dequant-GEMM(2026-11-01,`tests/test_quant_gemm.py` + `acorninfer/ops/quant_gemm.py`,真机输出)
 
 定档实现(段 0 裁决逐条落地):kernel = spike `_w8_kernel` 胜出形态逐字进产线(核内 dequant:int8 load → fp32 ×scale 行广播 → bf16 → tl.dot fp32 累加;BLOCK_M=16,M≤16 pad,M 为 runtime 参数零重编译);split-K 复用 decode_gemm 的 fp32 partials 常驻 workspace + 确定性 second-pass 归约(零 atomic)。**骨架复用 = `acorninfer/ops/decode_gemm.py` 按现状导入(`_bench_rot`/`_cfg_shmem_ok`/`_workspace`/`_splitk_reduce_kernel`),该文件本任务零改动**(增量幅度 = 0 行,既有 bf16 kernel 与 17 测试行为零变化,`tests/test_decode_gemm.py` 复跑 17 passed)。装配面:`quant_gemm(x, q, scale, cls, cfg=None, out=None)` + `configure()` 装载期入口(Engine 构造/graph 捕获前一次;Task 2 接线调用)+ 逐类 cfg 表 + bucket 分派(M≤16 直判;**`_bucket_for` 归桶不适用本模块,如实偏离**:decode_gemm 表按 (cls, bucket) 记 backend,本模块 cfg 按类一档 —— 段 0 实证 config M-不变,M 守门用 M≤16 直判;prefill 大 M(M>16)路径只留接口注记(`NotImplementedError` 显式报错),接线是 Task 2 范围)。生产路径:qwen3 调用点分派未接(Task 2),`--quant none` 缺省逐字节硬门不动。
