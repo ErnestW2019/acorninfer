@@ -107,6 +107,24 @@ class Executor:
             return [int(t) for t in logits.argmax(dim=1).tolist()]
         return [self._sample(s, logits[i]) for i, s in enumerate(seqs)]
 
+    def verify_batch(self, seqs: list[Sequence], views,
+                     drafts: list[list[int]]) -> torch.Tensor:
+        """spec verify 步(M8 Task 3):ids [B, m] = [已提交末位] + drafts →
+        forward_verify(写 m 位 KV)→ 全窗口 logits [B, m, vocab](float32)。
+
+        零采样:接受逻辑在引擎侧(argmax → greedy_accept);本方法只做前向。
+        K 全批统一(propose 补齐 FILLER)→ m 恒定,右 padding 无。TP 不设
+        分支:spec × tp 构造期互斥(server._build_engine,quant 先例),
+        能走到这里必为单卡;greedy 同理由 spec 腿路由保证(引擎侧降级)。
+        """
+        K = len(drafts[0])
+        assert all(len(d) == K for d in drafts), "全批统一 K(propose 补齐契约)"
+        ids = torch.zeros(len(seqs), 1 + K, dtype=torch.long, device=self.device)
+        for i, (s, d) in enumerate(zip(seqs, drafts)):
+            ids[i, 0] = s.generated_ids[-1]
+            ids[i, 1:] = torch.tensor(d, dtype=torch.long, device=self.device)
+        return self.model.forward_verify(ids, views)  # [B, m, vocab]
+
     @staticmethod
     def _sample(seq: Sequence, logits: torch.Tensor) -> int:
         """temp=0 → greedy(OpenAI 语义,Sampler 拒绝 temp=0,须先分流)。

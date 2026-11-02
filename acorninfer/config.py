@@ -83,6 +83,9 @@ class EngineConfig:
     quant: str = "none"              # "none"|"w8a16"|"w4a16"(M7;w4a16 = 段 B 门控,
                                      # 装载期 apply_quant 硬报错;与 tp>1 互斥——
                                      # tp 在 CLI/server 层,互斥在 _build_engine 把守)
+    spec_ngram: int = 0              # n-gram 草稿阶数(M8;0 = 关 = 现行为逐字节;
+                                     # >0 须 triton 后端且须 eager(decode_graph 互斥))
+    spec_num: int = 4                # 每步草稿 token 数 K(verify 窗口 m = K+1)
 
     def __post_init__(self) -> None:
         # CLI(Task 10 bench/server)直接透传参数,坏值在构造期爆掉而非运行期排队卡死
@@ -104,3 +107,16 @@ class EngineConfig:
             )
         if self.decode_graph and self.attention_backend != "triton":
             raise ValueError("decode_graph requires attention_backend='triton'")
+        # M8 spec 面:范围与组合互斥构造期爆掉(spec §2.4 D1/D4;spec × tp
+        # 在 _build_engine 把守,同 quant 先例 —— EngineConfig 无 tp 字段)
+        if not 0 <= self.spec_ngram <= 8:
+            raise ValueError(f"spec_ngram must be 0..8, got {self.spec_ngram}")
+        if not 1 <= self.spec_num <= 8:
+            raise ValueError(f"spec_num must be 1..8, got {self.spec_num}")
+        if self.spec_ngram > 0 and self.attention_backend != "triton":
+            raise ValueError(
+                "spec_ngram > 0 requires attention_backend='triton'"
+                f" (verify kernel is triton-only), got {self.attention_backend!r}")
+        if self.spec_ngram > 0 and self.decode_graph:
+            raise ValueError(
+                "spec_ngram × decode_graph 互斥(v1 eager verify only,spec §2.4)")

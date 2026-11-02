@@ -2769,3 +2769,87 @@ Qwen3-8B 口径(H=32, KV=8, D=128, P=16, bf16, hist=256, S 按启发式;warm 10 
 1. 微偏离:`test_verify_matches_dense_reference` 在指令矩阵(B×m×len 30 组合)上每序列加变长(hist_b = len + b),比草稿的定长批多覆盖变长表行宽;S 分派表 {1:4, 15:2, 16:1, 17:4, 48:8} 为草稿未定的测试自由度(覆盖 S=1/空 split/多 split 三形态)。
 2. 微偏离:`test_window_causal_exact` 定案为"k≡0 → 严格均匀 → 可见集均值"构造(草稿的"位置编码式唯一值"不可零容差对拍——softmax 非退化时无法解析闭式);tripwire 的 poison×100 + NaN 陷阱页 + 逐行精确均值三重钉满足草稿意图(零泄漏窗口后位/历史外位)。
 3. 微偏离:TDD 过程修三处测试自身笔误(page 张量 token-major 布局赋值、pager 写入需同设备张量、poison 索引误打历史位 `t−hb` → 改位置 `t`);kernel 实现一次成型零返工,两处 kernel 侧测试(device 断言、S= kwarg)按 decode API 同款位置参数修正。
+
+## M8 段 3:引擎 spec 接线 + A1 无损性硬门(2026-11-02,`tests/test_spec_engine.py`,GPU 1 输出)
+
+Task 3(spec §2.2/§2.4):`--spec-ngram/--spec-num` → `EngineConfig`/`Engine` 全链接线:`Qwen3ForCausalLM.forward_verify`(步首 prepare:`ensure_append_capacity_n` → `build_tables(lens_override=[len+m])` → 位置 `len+arange(m)` 展平 rope;层循环 `scatter_verify` + `paged_verify_attention`;全窗口 lm_head `[B,m,vocab]` fp32)→ `executor.verify_batch`(零采样,ids = [已提交末位]+drafts)→ 引擎 `_spec_step`(argmax → `greedy_accept` → 逐 token `_record` → `proposer.extend` → `set_lens` 逐层回退)。
+
+### 接线形态(逐文件)
+
+- `config.py`:`spec_ngram=0` / `spec_num=4` + `__post_init__` 校验(ngram 0..8;num 1..8;spec>0 须 triton;spec × decode_graph ValueError)。
+- `server.py`:`--spec-ngram/--spec-num` CLI;getattr 缺省(旧调用方 args 无字段 = 0/4 逐字节旧行为);spec × tp 构造期 interdict;tp==1 路径透传。
+- `engine.py`:`__init__` 同款守卫(直构面)+ `_proposers` dict(step 期惰性建 `NgramProposer(context=all_ids)`;context 失配自动重建 = 抢占重算后正确性;退休/drop 弃);`step()` spec 分支 → `_spec_step`;retire finally 同步 pop proposer。
+- `executor.py::verify_batch`:ids `[B,1+K]`,K 全批统一(propose 补齐 FILLER)→ m 恒定零 padding;TP 不设分支(构造期互斥保证单卡)。
+- `qwen3.py`:`forward_verify` 三级(Attention/Block/Model);engine 路径恒传 tables/lens/scatter(无自 prepare 回退,显式 ValueError);v1 verify 恒 torch rope(不接 fused_ops)。
+
+### 红绿记录(TDD + A1 硬门抓出真缺陷)
+
+- 红(实现前):`CUDA_VISIBLE_DEVICES=1 .venv/bin/pytest tests/test_spec_engine.py` → 2 passed(config/server CPU 面)/ 4 failed(gpu 腿:接线未实现)。
+- 接线完成后 A1 tiny **失败**:多 seq 批每批恰一 seq 早分歧(哪个 seq 随批成分漂移);spec row0 logits vs decode `max|d|=0.416314`(top-5 集合近似、量值整体压缩 ~0.94——错序特征的典型信号)。
+- 定位(side-by-side 双引擎共享无状态模型,逐层捕获):layer0 全零(block in / post-LN / kernel q row0 / **kernel out row0 = 0.000000**)→ layer1 kernel q row0 `max|d|=0.878`、sa_out(post-o_proj)`0.42` → **kernel 输出与 o_proj 之间**。
+- 根因:`forward_verify` 对 kernel 返回值抄了 decode 的 `out.transpose(1,2).reshape(B,m,-1)`。verify kernel 返回 **(b,j,h,d) 连续**布局(≠ decode 的 (b,h,1,d)),transpose 把 h 变逻辑外层轴,reshape 按逻辑序 h-major 复制 → `m>1 且 H>1` 时 o_proj 输入行 = 多窗口位×单头的错序混合(如 row0 = h0·j0..3)。**T2 kernel 与本缺陷无关**;T2 对拍(逐行 vs 5×decode)不含此步后处理。
+- 修复:`out.reshape(B, m, -1)`(kernel 输出已 (b,j,h,d) 连续,直接合头,行内 = 头拼接与 decode 同序;代码内留"勿改回"注记)。
+- 修后:verify row0 logits vs decode `max|d|=0.000000`(fp32 逐位);测试夹具修 4 处(见偏离清单)后 **6 passed in 1.28s**(`tests/test_spec_engine.py` + `tests/test_spec_ngram.py` 合跑 `11 passed in 1.30s`)。
+
+### A1 无损性证据(逐字)
+
+tiny(硬门,双场景:随机模型三类 prompt + copier rig 真实接受 K+bonus;verify spy 钉防全降级假绿):
+
+```
+tests/test_spec_engine.py::test_spec_greedy_bitwise_tiny PASSED
+tests/test_spec_engine.py::test_spec_multitoken_outputs_order PASSED
+tests/test_spec_engine.py::test_spec_dead_slot_reuse_engine PASSED
+tests/test_spec_engine.py::test_spec_remaining_budget_degrades_to_decode PASSED
+============================== 6 passed in 1.28s ==============================
+```
+
+8B(`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m8_spec_8b.py`,2026-11-02,GPU 1,W8 双腿 greedy,2 wiki 型 + 2 短 chat 型,stdout 逐字):
+
+```
+PROMPT wiki1: 57 tokens
+PROMPT wiki2: 44 tokens
+PROMPT chat1: 7 tokens
+PROMPT chat2: 8 tokens
+A1 wiki1: IDENTICAL (64 tokens, greedy, w8a16 both legs)
+A1 wiki2: IDENTICAL (64 tokens, greedy, w8a16 both legs)
+A1 chat1: IDENTICAL (64 tokens, greedy, w8a16 both legs)
+A1 chat2: IDENTICAL (64 tokens, greedy, w8a16 both legs)
+A1_RESULT PASS (bitwise spec on/off, w8a16, 4 prompts x 64 tokens)
+```
+
+### 回归尾行(零换金)
+
+- fast 单卡(`CUDA_VISIBLE_DEVICES=1 .venv/bin/pytest -q`):**238 passed, 6 skipped, 17 deselected in 15.52s** = 基线 232 + 新增 6,零漂移。
+- slow:`17 passed in 444.28s`。tp 全套(双卡):**13 passed in 19.69s**。
+- `m6_ab --quant w8a16` 带复核:`AB baseline C=1 mode=graph step_ms=10.94` / `C=8 step_ms=11.69`(带 10.7–11.7 ✓,quant 路径零扰动)。
+- 保护面:`git diff HEAD --stat -- ops/paged_attention.py engine/scheduler.py engine/sequence.py engine/graph_runner.py tests/triton_utils.py` = 空输出;golden m0–m7 零触碰。
+
+### 计测表(8B W8,GPU 1,2026-11-02)
+
+| 账 | 值 | 读法 |
+|---|---|---|
+| decode eager 稳态步(C=4,4×128 随机 prompt,24 步均值) | 18.28 ms(p50 18.13) | 与 m6_ab eager C=8 18.13 ms 同量级 |
+| spec verify 稳态步(C=4,m=5,接受 ~0) | 22.34 ms(p50 22.29) | 零接受最坏情形 +22%/步 |
+| tok_s(C=4 同协议) | decode 218.8 / spec 179.0 | 零接受下回本需 mean_emitted ≥ 1.22 |
+| eager W8 tok_s 基线(A2 分母,m6_ab C=8) | 8/18.20 ms ≈ **440 tok/s** | `AB baseline C=8 mode=eager step_ms=18.13 tpot_ms=18.20` |
+| 草稿延迟(NgramProposer,512 位上下文,×2000) | mean **0.3 µs** / p95 0.4 / max 13.3 | 目标 <100 µs,3 个量级余量 |
+| 接受账(随机 prompt 腿,26 次 verify) | mean_a=0.000 / mean_emitted=1.000 | 随机 id 无重复 → FILLER 草稿 → a=0,引擎正确每步 1 发射 |
+
+零接受最坏情形下 spec 每步 +22%:A2(真文本接受率)是收益裁决面;随机内容账仅为下界锚(机制成本如实入账,零粉饰)。
+
+### 边界处理(逐条)
+
+1. 剩余生成预算 `max_tokens − len(generated) < m` → 该 seq 降级 decode 腿(末段 eos/length 截断交久经考验单 token 路径,同步与 verify 腿并存)。
+2. 非贪心(temperature ≠ 0)→ 该 seq 降级 decode 腿(`_sample` 既有逐行采样;零静默 greedy)。
+3. 死槽 `[len+a+1, len+m)`:`set_lens` 只回退不前进(> 现长 ValueError),下步 `ensure_append_capacity_n/scatter_verify` 复写,读侧按 lens 截断天然不可见(死槽复用引擎测试:allocate 次数钉死 + 孪生 cache 逐位)。
+4. 抢占重算:proposer context == all_ids 失配 → 自动重建(索引重扫 O(len) 只发生在 admit/抢占后)。
+5. eos/length 终止:逐 token `_record`,`is_finished` 即断,其后窗口位作废(不外泄)。
+6. 退休/drop:proposer 随视图同步弃(step finally + drop 兜底双面)。
+7. fillers:`FILLER=0` 补齐 K → m 全批统一;filler KV 照写,读侧行依赖 `end_j = len+j+1` 窗口内因果天然遮蔽。
+
+### 对 plan 草稿的偏离(逐条记录)
+
+1. 有意偏离(记录在案):非贪心 seq 的处理取 **step 期按 seq 降级 decode 腿**,而非 spec §2.4 的构造期禁入——采样参数是请求级,构造期不可判;step 分流零静默 greedy,正确性语义与 §2.4 意图一致。
+2. 根因修复(见红绿记录):`forward_verify` 输出 reshape 错序(A1 硬门抓出),`transpose(1,2)` 移除 + 代码注记。草稿未预见此处布局差异(照抄 decode 幂等式在 m=1 时恰不触发)。
+3. TDD 夹具修正 4 处:①budget 降级测试 `max_tokens=3` 恒 < m → verify 永不触发,改 7(两腿都被钉到);②copier 尾重复 4→6 位(n-gram 后继列表须 ≥ K=4 条,drafts 才全真无 FILLER);③eos-spy 改自标定(prefill 生成位会移位 n-gram 键,drafts[0] 不可静态预知 → spy 读真 drafts 强制 a=1);④多发射断言从"末 2 步"改为"任意步"(预算截断后末段必为单发)。
+4. 微偏离:verify 不接 fused_ops(v1 eager-only,torch rope/残差);m=1 剩余预算不进 verify 腿(与 decode 逐字节同路径);tp==1 与单卡路径同码(server._build_engine 一处分支)。

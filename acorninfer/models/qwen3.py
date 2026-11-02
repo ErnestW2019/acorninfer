@@ -232,6 +232,62 @@ class Qwen3Attention(nn.Module):
         out = out.transpose(1, 2).reshape(B, s, -1)
         return dispatch_linear(self.o_proj, out)
 
+    def forward_verify(self, hidden, cos, sin, views, layer_idx, *,
+                       tables=None, lens=None, scatter=None):
+        """verify 步 m 位窗口(spec §2.2,M8 Task 3)。hidden [B, m, hidden];
+        cos/sin [B, m, head_dim](位置 = len+arange(m),Model 级预算)。
+
+        镜像 forward_decode 的 triton 分支结构,三处推广:
+        - KV 写 = scatter_verify(M8 Task 1):[B,kv,m,D] 一次散写于步首
+          ensure_append_capacity_n 目标(pages/slots [B,m]),_lens 提交 +m;
+        - attention = paged_verify_attention(M8 Task 2):q [B,m,H,D],读侧
+          lens = len+m,行 j 可见集 = 历史 len + 窗口前 j+1 位(窗口内因果);
+        - GEMM 全位宽:qkv/o/mlp/lm_head 按 [B*m] 行合批(投影分派复用
+          dispatch_linear —— none 旧路径逐字节 / w8a16 quant 路径;spec_num
+          ≤ 8 → m ≤ 16 落 s 桶,spec × quant 兼容)。
+        投影/归一化/rope 公式与 forward_decode 逐字同源(位置广播形状不同:
+        cos/sin [B,1,m,D] 对 [B,H,m,D])。engine 路径恒传 tables/lens/scatter
+        (步首 prepare,同 forward_decode 合批契约);None 时本方法无自 prepare
+        (verify 只在引擎 spec 分支调用,独立调用方须自带 —— 显式报错防静默
+        错写)。"""
+        if tables is None or lens is None or scatter is None:
+            raise ValueError(
+                "forward_verify requires tables/lens/scatter from a step-start "
+                "prepare (engine spec branch); no self-prepare fallback")
+        B, m, _ = hidden.shape
+        q = dispatch_linear(self.q_proj, hidden).view(B, m, self.num_heads, self.head_dim).transpose(1, 2)
+        k = dispatch_linear(self.k_proj, hidden).view(B, m, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = dispatch_linear(self.v_proj, hidden).view(B, m, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # rope 公式与 forward_decode 非融合分支逐字同源;广播 [B,1,m,D]
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+
+        from acorninfer.ops.paged_attention import num_splits_for
+        from acorninfer.ops.paged_verify import paged_verify_attention
+        cache = views[0].cache  # 契约同 forward_decode:全部 views 共享单一 cache
+        pages, slots = scatter
+        cache.scatter_verify(views, layer_idx, k, v, pages, slots)
+        # q 转置 [B,H,m,D]→[B,m,H,D](kernel 行序 (b,j,h));输出已是
+        # (b,j,h,d) 连续布局,直接 reshape 合头(行内 = 头拼接,与 decode
+        # 的 [B,H,1,D]→transpose→reshape 行序逐位同构)——decode 的
+        # transpose(1,2) 在此不可照抄:kernel 返回 (b,j,h,d) 而非
+        # (b,h,j,d),转置会把 h 变外层轴,reshape 按逻辑序 h-major 复制,
+        # m>1 且 H>1 时 o_proj 输入行 = 多窗口位×单头的错序混合(A1
+        # 无损性硬门抓出的原始缺陷,勿改回)。
+        out = paged_verify_attention(
+            q.transpose(1, 2),
+            cache.k_pages[layer_idx], cache.v_pages[layer_idx],
+            tables, lens, num_splits_for(B * m, self.num_heads),
+        )
+        out = out.reshape(B, m, -1)
+        return dispatch_linear(self.o_proj, out)
+
     def forward_prefill_batch(self, hidden, cos, sin, views, layer_idx, *,
                               real_lens):
         """批量 prefill(M4.1):hidden [N, Lmax, D](右 padding),cos/sin
@@ -402,6 +458,18 @@ class Qwen3Block(nn.Module):
         hidden = hidden + self.self_attn.forward_extend(
             self.input_layernorm(hidden), cos, sin, views, layer_idx,
             starts=starts, chunk_lens=chunk_lens,
+        )
+        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        return hidden
+
+    def forward_verify(self, hidden, cos, sin, views, layer_idx, *,
+                       tables=None, lens=None, scatter=None):
+        """verify 步(M8 Task 3):残差结构照 forward_decode 非融合分支
+        (RMSNorm 逐 token,[B,m] 合批;spec v1 与 fused_ops 解耦 —— verify
+        不接 K1/K2,spec × fused 组合下 verify 腿走 torch rope/残差路径)。"""
+        hidden = hidden + self.self_attn.forward_verify(
+            self.input_layernorm(hidden), cos, sin, views, layer_idx,
+            tables=tables, lens=lens, scatter=scatter,
         )
         hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return hidden
@@ -616,6 +684,67 @@ class Qwen3ForCausalLM(nn.Module):
         last = torch.tensor([L - 1 for L in chunk_lens], device=device)
         hidden = hidden[torch.arange(N, device=device), last]  # [N, hidden]
         return dispatch_linear(self.lm_head, hidden).float()
+
+    def forward_verify(self, input_ids: torch.Tensor, views) -> torch.Tensor:
+        """spec verify 前向(M8 Task 3,spec §2.2):input_ids [B, m]
+        (m = spec_num+1 全批统一;行 = [已提交末位] + K 个草稿)+
+        每序列 PagedCacheView -> 全窗口 logits [B, m, vocab](float32)。
+
+        镜像 forward_decode 的 triton 合批结构,步首一次 prepare:
+        - 各序列 ensure_append_capacity_n(·, m) —— 跨页者在此分新页
+          (返回 m 个游标 (page,slot) 随层下传给 scatter_verify);
+        - build_tables(lens_override=[len+m]):块表/长度含本步全部窗口位
+          (kernel 读侧契约);与 decode 的 lens_override=[len+1] 同源;
+        - 位置 = len + arange(m)(镜像 forward_decode 的 pre-write
+          seq_len 推导;ensure 家族不提交长度,seq_len 仍为 pre-write);
+          展平 [B*m] 一次 rope 调用(M8 verify 不接 fused_ops:spec v1
+          eager-only,torch rope 路径;
+        - lm_head 全 m 位 -> [B, m, vocab](接受逻辑在引擎侧逐行 argmax)。
+        KV 写入在层循环内 scatter_verify(M8 Task 1);attention =
+        paged_verify_attention(M8 Task 2,行 j 可见历史+窗口前缀)。
+        契约:views 非空且与 input_ids 行一一对应;attention_backend 必须
+        已是 triton(verify kernel 只有 triton 路径)。
+        """
+        B, m = input_ids.shape
+        if len(views) != B:
+            raise ValueError(
+                f"views 必须与 batch 维一一对应: got B={B}, len(views)={len(views)}")
+        if self.attention_backend != "triton":
+            raise ValueError(
+                f"forward_verify requires attention_backend='triton', "
+                f"got {self.attention_backend!r}")
+        from acorninfer.ops.paged_attention import build_tables
+        device = input_ids.device
+        # 步首 prepare(层循环之前,同 forward_decode Task 9 形态;layer 0
+        # 保证 —— 层间锁步,table 共享、ensure 按各层等长 lens 推导)
+        targets = [v.ensure_append_capacity_n(0, m) for v in views]
+        scatter = (
+            torch.tensor([[p for p, _ in t] for t in targets],
+                         device=device, dtype=torch.long),
+            torch.tensor([[s for _, s in t] for t in targets],
+                         device=device, dtype=torch.long),
+        )
+        tables, lens = build_tables(
+            views, views[0].cache.page_size, device,
+            lens_override=[int(v.seq_len) + m for v in views],
+        )
+        # 位置 = len + arange(m);展平 [B*m] 一次 rope(与 forward_decode
+        # 的 [B] 单位推导同源;pad 无 —— verify 全批统一 m,零 padding)
+        positions = torch.cat(
+            [torch.arange(int(v.seq_len), int(v.seq_len) + m, device=device)
+             for v in views])
+        dtype = self.embed_tokens.weight.dtype
+        cos, sin = self.rope(positions, dtype, device)      # [B*m, head_dim]
+        cos = cos.view(B, m, -1)
+        sin = sin.view(B, m, -1)
+        hidden = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.forward_verify(
+                hidden, cos, sin, views, i,
+                tables=tables, lens=lens, scatter=scatter,
+            )
+        hidden = self.norm(hidden)
+        return dispatch_linear(self.lm_head, hidden).float()  # [B, m, vocab]
 
 
 def map_hf_state_dict(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

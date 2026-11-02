@@ -514,11 +514,19 @@ def _build_engine(args, link: TPLink | None = None):
     """
     tp = getattr(args, "tp", 1)
     quant = getattr(args, "quant", "none")
+    spec_ngram = getattr(args, "spec_ngram", 0)
+    spec_num = getattr(args, "spec_num", 4)
     if tp != 1 and quant != "none":
         # spec §4:--quant 与 --tp>=2 显式互斥,构造期硬报错(不做静默错误行为;
         # EngineConfig 无 tp 字段,互斥在 tp 已知的本构造点把守)
         raise ValueError(
             f"--quant 与 --tp >= 2 互斥(spec §4): got quant={quant!r}, tp={tp}")
+    if tp != 1 and spec_ngram:
+        # M8 spec §2.4:--spec-ngram 与 --tp>=2 显式互斥(构造期;TP verify
+        # 集合通信面 = M9 台账项,v1 不做静默行为)
+        raise ValueError(
+            f"--spec-ngram 与 --tp >= 2 互斥(spec §2.4): got "
+            f"spec_ngram={spec_ngram!r}, tp={tp}")
     # 后端配方旗标(--attention-backend/--fused-ops/--cuda-graph,bench 同名;
     # getattr 缺省 = CLI 缺省 = 旧调用方(SimpleNamespace 无字段)零改动;
     # --cuda-graph 须 triton 由 EngineConfig.__post_init__ 构造期校验)
@@ -536,6 +544,8 @@ def _build_engine(args, link: TPLink | None = None):
             max_running=args.max_running,
             watermark_blocks=args.watermark_blocks,
             quant=quant,
+            spec_ngram=spec_ngram,
+            spec_num=spec_num,
             **backend,
         )
         model = from_pretrained(cfg.model_dir, cfg.device, cfg.dtype)
@@ -557,6 +567,8 @@ def _build_engine(args, link: TPLink | None = None):
             max_running=cfg.max_running,
             watermark_blocks=cfg.watermark_blocks,
             chunked_budget=args.chunked_budget,
+            spec_ngram=cfg.spec_ngram,
+            spec_num=cfg.spec_num,
         )
     assert link is not None, "--tp >= 2 需要 link(TPLink(rank))"
     cfg = EngineConfig(
@@ -667,6 +679,15 @@ def main() -> None:
         "--quant", default="none", choices=["none", "w8a16", "w4a16"],
         help="权重量化(M7 段 A:w8a16;w4a16 = 段 B 门控,装载期硬报错;"
              "与 --tp>=2 互斥)",
+    )
+    parser.add_argument(
+        "--spec-ngram", type=int, default=0,
+        help="n-gram 草稿阶数(M8 投机解码;0 = 关 = 现行为逐字节;"
+             ">0 须 triton 后端 + eager,与 --cuda-graph/--tp>=2 互斥)",
+    )
+    parser.add_argument(
+        "--spec-num", type=int, default=4,
+        help="每步草稿 token 数 K(M8;verify 窗口 m = K+1)",
     )
     args = parser.parse_args()
 

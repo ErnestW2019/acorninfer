@@ -39,10 +39,29 @@ class Engine:
         watermark_blocks: int = 8,
         chunked_budget: int | None = None,
         tp=None,
+        spec_ngram: int = 0,
+        spec_num: int = 4,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.tp = tp  # TPLink | None:None = 单卡原路径(TP=1 逐字节硬门)
+        if spec_ngram:
+            # spec 直构校验(镜像 EngineConfig.__post_init__;直接构造 Engine
+            # 的测试/脚本不走 config,构造期爆掉而非静默错路径)
+            if not (1 <= spec_ngram <= 8) or not (1 <= spec_num <= 8):
+                raise ValueError(
+                    f"spec_ngram must be 1..8 and spec_num 1..8 when enabled, "
+                    f"got spec_ngram={spec_ngram}, spec_num={spec_num}")
+            if model.attention_backend != "triton":
+                raise ValueError(
+                    f"spec decode requires attention_backend='triton', "
+                    f"got {model.attention_backend!r}")
+            if getattr(model, "decode_graph", False):
+                raise ValueError(
+                    "spec × decode_graph 互斥(v1 eager verify only,spec §2.4)")
+        self.spec_ngram = spec_ngram
+        self.spec_num = spec_num
+        self._proposers: dict[int, "object"] = {}  # seq_id → NgramProposer(spec 模式)
         cfg = model.cfg
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
@@ -101,6 +120,8 @@ class Engine:
             page_size=cfg.page_size,
             max_running=cfg.max_running,
             watermark_blocks=cfg.watermark_blocks,
+            spec_ngram=cfg.spec_ngram,
+            spec_num=cfg.spec_num,
         )
 
     def submit(
@@ -208,11 +229,14 @@ class Engine:
                     if token is not None:
                         self._record(seq, token, outputs)
             if decodes:
-                views = [self._views[s.seq_id] for s in decodes]
-                tokens = self.executor.decode_batch(decodes, views)
-                for seq, token in zip(decodes, tokens):
-                    seq.num_pages = len(self._views[seq.seq_id].table)
-                    self._record(seq, token, outputs)
+                if self.spec_ngram > 0:
+                    self._spec_step(decodes, outputs)
+                else:
+                    views = [self._views[s.seq_id] for s in decodes]
+                    tokens = self.executor.decode_batch(decodes, views)
+                    for seq, token in zip(decodes, tokens):
+                        seq.num_pages = len(self._views[seq.seq_id].table)
+                        self._record(seq, token, outputs)
         finally:
             # 退休放在 finally:即使前向抛异常,已 FINISHED 的序列也必须在本步
             # 出场 —— 否则僵尸序列下轮会被再次 decode(毒循环)
@@ -220,6 +244,7 @@ class Engine:
                 self.scheduler.running.remove(seq)
                 seq.status = RequestStatus.FINISHED
                 self._views.pop(seq.seq_id)  # 视图丢弃;块经共享块表释放
+                self._proposers.pop(seq.seq_id, None)  # 草稿器随退休弃(spec 模式)
                 for b in seq.block_table:
                     self.allocator.free(b)
                 seq.block_table.clear()
@@ -230,12 +255,84 @@ class Engine:
             self.tp.check_views(self._views)
         return outputs
 
+    def _spec_step(self, decodes: list[Sequence], outputs: list[TokenOutput]) -> None:
+        """spec verify 步(M8 Task 3,spec §2.2):decodes 全批按序分流。
+
+        - 草稿:proposers[seq_id].propose()(engine 侧 dict;调度器不动)。
+          生命周期:首进 verify 腿惰性建(context = all_ids;抢占重算后
+          context 失配自动重建 —— 不变式 context == seq.all_ids),退休弃
+          (step finally + drop 兜底)。
+        - 降级 m=1(引擎级,正确性优先):①剩余生成预算 max_tokens −
+          len(generated) < m(窗口尾段的 eos/length 截断交久经考验的单
+          token 路径,末步数值 = decode 路径原样);②非贪心采样(temperature
+          >0;spec §2.4 采样域数学不成立 —— 按 seq 降级由 decode_batch 既有
+          逐行 _sample 正确采样,不做静默 greedy)。降级 seq 走 decode 腿,
+          与 verify 腿同一步并存(批量统一性让位于正确性)。
+        - 验证:verify_batch → argmax(dim=-1) → 逐 seq greedy_accept →
+          发射 token 逐个过 _record(eos/length 终止即断,其后窗口位作废)
+          → proposer.extend(实际提交段)→ set_lens × 全层回 len+已发数
+          (死槽 [len', len+m) 下步复写,spec §2.3)→ num_pages 同步 →
+          退休检查照 step finally。
+        """
+        m = self.spec_num + 1
+        verify_leg: list[Sequence] = []
+        decode_leg: list[Sequence] = []
+        drafts_by_seq: dict[int, list[int]] = {}
+        for seq in decodes:
+            remaining = seq.max_tokens - len(seq.generated_ids)
+            if remaining < m or seq.sampling.temperature != 0:
+                decode_leg.append(seq)
+                continue
+            p = self._proposers.get(seq.seq_id)
+            if p is None or p.context != seq.all_ids:
+                # 惰性建/失配重建:索引重扫 O(len) 仅发生在 admit 与抢占
+                # 重算后(verify 步首尚无新接受 token,键 = 末 n 位已提交
+                # 上下文,与 Task 0 草稿注一致)
+                from acorninfer.spec.ngram import NgramProposer
+                p = NgramProposer(list(seq.all_ids), self.spec_ngram,
+                                  self.spec_num)
+                self._proposers[seq.seq_id] = p
+            drafts_by_seq[seq.seq_id] = p.propose()
+            verify_leg.append(seq)
+        if decode_leg:
+            # 降级腿:纯 decode 路径原样(与 spec_ngram==0 分支逐字同构)
+            views = [self._views[s.seq_id] for s in decode_leg]
+            tokens = self.executor.decode_batch(decode_leg, views)
+            for seq, token in zip(decode_leg, tokens):
+                seq.num_pages = len(self._views[seq.seq_id].table)
+                self._record(seq, token, outputs)
+        if verify_leg:
+            views = [self._views[s.seq_id] for s in verify_leg]
+            lens0 = [int(v.seq_len) for v in views]   # pre-write(ensure 不提交)
+            drafts = [drafts_by_seq[s.seq_id] for s in verify_leg]
+            logits = self.executor.verify_batch(verify_leg, views, drafts)
+            next_ids = logits.argmax(dim=-1).tolist()  # [Bv, m](单次 D2H)
+            from acorninfer.spec.ngram import greedy_accept
+            for i, seq in enumerate(verify_leg):
+                view = self._views[seq.seq_id]
+                seq.num_pages = len(view.table)
+                a, bonus = greedy_accept(next_ids[i], drafts[i])
+                # 发射 = argmax 链前缀 a 位 + bonus(位置序);截断到剩余预算
+                emitted = (next_ids[i][:a] + [bonus])[: seq.max_tokens - len(seq.generated_ids)]
+                n0 = len(seq.generated_ids)
+                for t in emitted:
+                    self._record(seq, t, outputs)   # eos/length 终止判定在 _record
+                    if seq.is_finished:
+                        break                        # 终止 token 已记,其后窗口位作废
+                committed = seq.generated_ids[n0:]   # 实际提交段(含终止 token)
+                self._proposers[seq.seq_id].extend(committed)
+                # KV 回退:接受 a → lens = len+a+1;截断时 = len+已发数。
+                # 死槽 [len', lens0+m) 由下步 ensure_n/scatter 复写(T1 契约)
+                for layer in range(self.cache.num_layers):
+                    view.set_lens(layer, lens0[i] + len(committed))
+
     def drop(self, seq_id: int) -> None:
         """消费完结果后释放序列记录(bench/server 负责调用,防 seqs 无界增长)。"""
         seq = self.seqs.get(seq_id)
         if seq is not None and not seq.is_finished:
             raise ValueError(f"seq {seq_id} is still pending; cannot drop")
         self.seqs.pop(seq_id, None)
+        self._proposers.pop(seq_id, None)  # 防御性(退休已清;drop 面兜底)
 
     def _record(self, seq: Sequence, token_id: int, outputs: list[TokenOutput]) -> None:
         seq.generated_ids.append(token_id)
