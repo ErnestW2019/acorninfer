@@ -2714,3 +2714,58 @@ Task 1(spec §2.3,D3 KV 游标复用):`cache/pager.py` 只加三个增量方法�
 
 1. 微偏离:测试侧 `scatter_verify` 的 `[B,m]` 目标张量从 `ensure_append_capacity_n` 返回值以双重推导式构造(`[[p for p,_ in t] for t in targets]`),plan 草稿未给构造式;TDD 过程中修了三处测试自身笔误(目标张量解包、roundtrip 槽位算术漏计"已分配页未用槽"形态、gather 读侧 `[kv,len,D]` 布局误 permute)——**实现一次成型零返工**,等价钉逐位通过即契约成立的直接证据。
 2. 微偏离:`scatter_verify` 的 assert 面比 plan 草稿多一条 `pages.shape[1] == slots.shape[1] == m`(防 [B,1] 与 [B,m] 混用的静默错位);k/v m 轴一致性 assert 同理。
+
+## M8 段 2:verify attention kernel(只读派生,TOL 新标定)(2026-11-02,`tests/test_paged_verify.py`,GPU 1 输出)
+
+Task 2(spec §2.2):`acorninfer/ops/paged_verify.py` 新文件,`paged_verify_attention(q[B,m,H,D], k/v_pages, tables, seq_lens=len+m, num_splits) -> [B,m,H,D]` —— `paged_decode_attention` 的 m 位窗口推广 + 窗口内因果。**保护原件 `ops/paged_attention.py` 零改动**(只读派生:读源码后新文件实现;combine kernel `_paged_attn_combine_kernel` 直接 import 复用,split kernel `_paged_verify_split_kernel` 新写)。
+
+### 语义差异清单(vs 原 kernel,逐条)
+
+1. **q 形状 / grid**:`[B,H,1,D]` → `[B,m,H,D]`(m = spec_num+1,全批统一),展平 query 行 (b, j),grid 第 0 维 `B → B*m`(row = b*M + j);q 展平 `[B*M*H, D]`(行序 (b, j, h))。
+2. **每行读上限(唯一本质改动)**:decode 的标量 `L = seq_lens[b]` → 行依赖 `L_row = seq_lens[b] − (m−1−j) = len + j + 1`(j 位可见历史 len + 窗口前 j+1 位;窗口内因果;`seq_lens` 契约 = **len+m**)。decode = verify 的 j=m−1 行退化情形。
+3. **不变式同源**:L_row = len+j+1 ≥ 1 → split 0 非空 → combine 首迭代 m_new 有限(decode 的 L ≥ 1 同款);空 split 存 (−inf, 0, 0),combine β=exp(−inf)=0 零贡献 —— 无分支合并照原。
+4. **零改动照抄面**:页对齐分片(start/end 整页、pps 公式)、尾块 slot mask(`slot < end−t`)、k/v 偏移公式 `(((page*P+slot)*KV+kv)*D+d)`、online-softmax 两常数更新、combine kernel 整体、fp32 全程 + 末端单次 cast 数值策略、GQA 映射 kv = hq // REP。
+5. **写读分离**:k/v 写入不在本 kernel(调用方 `scatter_verify` 已写页,本 kernel 只读);死槽(接受后 `set_lens` 回退段)由下步复写,读侧按 lens 截断天然不可见。
+6. eager-only(v1 spec 模式不走 graph,无 capture 要求);split 启发式复用 `paged_attention.num_splits_for`(按 B*m 个 query 行估)。
+
+### 红绿记录(TDD)
+
+- 红:`CUDA_VISIBLE_DEVICES=1 .venv/bin/pytest tests/test_paged_verify.py` → `ModuleNotFoundError: No module named 'acorninfer.ops.paged_verify'`(实现前)。
+- 绿:实现后 **3 passed**(`3 passed in 1.35s`):
+  - `test_verify_matches_dense_reference`:B∈{1,4,7} × m∈{2,5} × len∈{1,15,16,17,48} 全 30 组合(每序列 hist_b = len+b 变长批;S 按 len 分派 {1:4, 15:2, 16:1, 17:4, 48:8} 覆盖 S=1 / S>页数空 split / 多 split),fp32 紧容差(TOL_F32)+ bf16 标定容差双跑;参考 = 本文件 `paged_verify_attention_ref`(独立稠密参考:构造思路复用 `paged_decode_attention_ref` 的 gather-to-dense + fp32 softmax 展开,逐 (b,j) 行按 L_j 截断)。
+  - `test_window_causal_exact`:k ≡ 0 → 可见分数恒 0 → softmax 严格均匀 → 每行输出 = 可见集 v 的精确均值(与 q 无关,独立于 gather 式参考)。三重 tripwire:①窗口后位(hist+j+1..hist+m−1 的 v ×100,行 j 泄漏任一后位 → 均值量级爆炸 ≥15 绝对 vs 容差 1e-2);②lens 外槽位(≥ hist_b+m 页内槽 = NaN + 表填充项指向全 NaN 陷阱页,越 lens 读 → NaN 传播,`isfinite` 断言);③逐行精确均匀均值(fp32,rtol 1e-4/atol 1e-2,可见集组成错即炸)。
+  - `test_rollback_then_reverify_numerics`:真实 pager 路径死槽复用数值闭环(base=13 跨页界,a=2,m=5):verify 写 m=5 → `set_lens` 回 16 → `ensure_n(5)` 复用死槽(p1 槽 0,1,零分配)+ 同页续接 → `scatter_verify` 复写 → verify 读侧 ≡ 从未写过死槽的孪生 cache(**页值 + 输出逐位 `torch.equal`**)≡ 独立稠密参考(TOL_F32,不经页机制的 cat 构造)。
+
+### TOL 标定(新标定,协议:命令/日期写死)
+
+- 标定:2026-11-02,GPU 1,`CUDA_VISIBLE_DEVICES=1 .venv/bin/pytest tests/test_paged_verify.py -v -s`。bf16(q/k/v bf16 输入、fp32 score/累加、输出 bf16,照原 kernel 数值口径):**30 组合中 27 个 max|diff| = 0.000000**(kernel 与参考同 fp32 全程 + 末端单次 cast → 取整后逐位同),worst = **0.001953**(B=7, m=5, len=15;次高 0.000244,B=7, m=5, len=17)= 单 bf16 ulp(@0.5–1.0 值域)。**写死 TOL_VERIFY = (rtol=4e-3, atol=4e-3)**(worst 的 ~2 ulp 余量;attention 是 L 长求和,L 增大漂移上升,扩配置按协议重标定)。逐组合表(maxrel 分母 = 该组合 |ref| 最大值):
+
+| B | m | len | S | maxabs | maxrel |
+|---|---|-----|---|--------|--------|
+| 1/4/7 × m∈{2,5} × len∈{1,15,16,17,48} 的 27 个组合 | | | | 0.000000 | 0(B=4,m=5,len=1 maxrel 5.6e-8) |
+| 7 | 5 | 17 | 4 | 0.000244 | 1.54e-04 |
+| 7 | 5 | 15 | 2 | **0.001953** | 1.32e-03 |
+
+### Sanity 计时(非门,记录;W8 场景 m=5 ≤ 16 与单 decode 同桶)
+
+Qwen3-8B 口径(H=32, KV=8, D=128, P=16, bf16, hist=256, S 按启发式;warm 10 + 30 iter 均值,GPU 1,2026-11-02):
+
+| B | verify(m=5) | 5×单位 decode | 比 | verify vs 5×decode 输出差 |
+|---|---|---|---|---|
+| 1 | 0.037ms(S=1) | 0.352ms(S=4) | **0.10×** | 0.000244(bf16 ulp 级) |
+| 7 | 0.141ms(S=1) | 0.251ms(S=1) | **0.56×** | 0.000000(逐位) |
+
+读法:verify 单调用产出 m=5 个位置的输出,开销远低于 5 次独立 decode(每decode 各自 split+combine 两次 launch ×5);B=7 时 decode 侧 S=1 已单桶、verify 收益比收窄但仍 1.8×。kernel 数值与 5 次单位 decode 交叉一致(ulp 级),与稠密参考对拍独立成立。
+
+### 回归三尾行(零换金)
+
+- fast 全量(本机双卡,6 gpu 用例实跑):**238 passed, 17 deselected** = 基线 235 + 新增 3,零漂移。
+- fast 单卡(`CUDA_VISIBLE_DEVICES=1`):**232 passed, 6 skipped** = 229 + 3(既有 TP=2 skip,非本次改动)。
+- slow **17 passed** / 双卡 tp 全套(`test_tp_eager+engine+server`)**13 passed in 19.57s**(跑后双卡回落 4 MiB)。
+- `git diff c3261b0 -- acorninfer/ops/paged_attention.py` = 空输出(保护原件零变化证据);golden m0–m7 零触碰。
+
+### 对 plan 草稿的偏离(逐条记录)
+
+1. 微偏离:`test_verify_matches_dense_reference` 在指令矩阵(B×m×len 30 组合)上每序列加变长(hist_b = len + b),比草稿的定长批多覆盖变长表行宽;S 分派表 {1:4, 15:2, 16:1, 17:4, 48:8} 为草稿未定的测试自由度(覆盖 S=1/空 split/多 split 三形态)。
+2. 微偏离:`test_window_causal_exact` 定案为"k≡0 → 严格均匀 → 可见集均值"构造(草稿的"位置编码式唯一值"不可零容差对拍——softmax 非退化时无法解析闭式);tripwire 的 poison×100 + NaN 陷阱页 + 逐行精确均值三重钉满足草稿意图(零泄漏窗口后位/历史外位)。
+3. 微偏离:TDD 过程修三处测试自身笔误(page 张量 token-major 布局赋值、pager 写入需同设备张量、poison 索引误打历史位 `t−hb` → 改位置 `t`);kernel 实现一次成型零返工,两处 kernel 侧测试(device 断言、S= kwarg)按 decode API 同款位置参数修正。
