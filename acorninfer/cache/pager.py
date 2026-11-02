@@ -112,6 +112,41 @@ class PagedKVCache:
         for view in views:
             view._lens[layer_idx] = view._lens.get(layer_idx, 0) + 1
 
+    def scatter_verify(
+        self,
+        views: list[PagedCacheView],
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pages: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> None:
+        """verify 步多槽合批写入(M8 Task 1,spec §2.3):单次高级索引 scatter + 逐 view 提交 _lens。
+
+        k/v: [B, kv_heads, m, head_dim];pages/slots: [B, m] long(各序列 m 个
+        连续游标位 [len, len+m),由 PagedCacheView.ensure_append_capacity_n 在
+        步首算好/分配好)。展平法照 scatter_decode 的 [B]→[B*m](token 轴转前,
+        行序 (b, j) 与展平后的 pages/slots 逐位对齐);位值语义 ≡ 逐位 view.write
+        —— 同一 (page,slot) 写入同值,无算术、无 cast 舍入差异(m=1 与
+        scatter_decode 逐位一致,单测钉住)。
+        容量分配不在此发生(步首 ensure_n 已完成),故本方法不可能抛 BlockExhausted;
+        _lens 提交 = 各 view 现长 + m(verify 每层恰写 m 位;接受后死槽回收只靠
+        set_lens 回退,写侧只前进)。层间锁步(各层等长,引擎路径恒成立)由调用方保证。
+        """
+        B = len(views)
+        m = k.shape[2]
+        assert m == v.shape[2], "scatter_verify requires equal k/v window sizes"
+        assert B == k.shape[0] == v.shape[0] == pages.shape[0] == slots.shape[0]
+        assert pages.shape[1] == slots.shape[1] == m, "pages/slots must be [B, m]"
+        # 与 scatter_decode 的逐 token 行对齐同构:token 轴转前 [B, kv, m, D] → [B*m, kv, D]
+        k_flat = k.permute(0, 2, 1, 3).reshape(B * m, k.shape[1], k.shape[3]).to(self.dtype)
+        v_flat = v.permute(0, 2, 1, 3).reshape(B * m, v.shape[1], v.shape[3]).to(self.dtype)
+        flat_pages, flat_slots = pages.reshape(-1), slots.reshape(-1)
+        self.k_pages[layer_idx][flat_pages, flat_slots] = k_flat
+        self.v_pages[layer_idx][flat_pages, flat_slots] = v_flat
+        for view in views:
+            view._lens[layer_idx] = view._lens.get(layer_idx, 0) + m
+
 
 class PagedCacheView:
     """每序列视图:块表 + update()/seq_len,与 M1 KVCache 接口镜像。
@@ -172,6 +207,41 @@ class PagedCacheView:
         while len(self.table) < needed:
             self.table.append(self.cache.allocator.allocate())
         return self.table[base // page], base % page
+
+    def ensure_append_capacity_n(self, layer_idx: int, n: int) -> list[tuple[int, int]]:
+        """verify 步多 token 容量确保(M8 Task 1,spec §2.3):在 _lens[layer_idx] 处
+        追加 n 个 token 需要连续游标位 [base, base+n),先按 write() 的 needed 公式
+        ((base+n+page-1)//page)补齐 table 缺页,再返回逐位 (page_id, slot_id)。
+
+        分配循环/BlockExhausted 语义与 write 一致:中途抛出时已拿到的页留在
+        table、_lens 未提交(释放后重试连贯,同 update 的钉死语义)。
+        ensure 家族不提交长度(提交是 scatter_verify 的职责);跨 block 边界的
+        游标续接照常走 allocator;n=1 与 ensure_append_capacity 逐字节同(单测钉住,
+        旧方法保持原体零动——旧 decode 路径逐字节硬门)。
+        """
+        base = self._lens.get(layer_idx, 0)
+        page = self.cache.page_size
+        needed = (base + n + page - 1) // page  # 同 write() 的 needed 公式
+        while len(self.table) < needed:
+            self.table.append(self.cache.allocator.allocate())
+        return [(self.table[p // page], p % page) for p in range(base, base + n)]
+
+    def set_lens(self, layer_idx: int, new_len: int) -> None:
+        """verify 接受后按 a 回退已写长度(M8 Task 1,spec §2.3):lens = len+a+1,
+        其后死槽 [new_len, 旧 len) 由下步 ensure_append_capacity_n/scatter_verify
+        复写(页表项已在,零 allocator 回滚、free-list 语义不变)。
+
+        只回退不前进:new_len > 现长即 ValueError(前进只属 write/scatter 家族);
+        读侧(triton attention 按 lens 读页)因此天然不可见死槽。
+        层间锁步(36 层等长回退)由调用方逐层调用保证。
+        """
+        cur = self._lens.get(layer_idx, 0)
+        if new_len > cur:
+            raise ValueError(
+                f"set_lens is rollback-only: new_len {new_len} > written {cur}"
+                " (forward progress belongs to write/scatter)"
+            )
+        self._lens[layer_idx] = new_len
 
     def update(
         self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor

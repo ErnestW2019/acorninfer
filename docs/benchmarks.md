@@ -2683,3 +2683,34 @@ M8 开篇。设计定案 = `docs/superpowers/specs/2026-11-02-m08-spec-decode-de
 1. **`greedy_accept` 签名:吃 token ids,非 logits**(plan 草稿 `greedy_accept(next_token_logits, drafts)`;任务指令与测试契约定案 `greedy_accept(next_token_ids, drafts)`)——引擎侧先 `logits.argmax(dim=-1)` 再传入(Task 3 接线);纯 CPU 可测,GPU argmax 属 Task 3。
 2. **确定性定案(spec §2.1 报告口径)**:后继列表 = 纯 list,**按出现序 append、不 dedup**——出现序即唯一顺序来源,无 set 迭代、无任何随机性;propose 输出 = 后继列表前 K 位 + `FILLER` 补齐,同上下文同输出可复现。(备选 stable dedup 弃:不 dedup 更简,且首现后继已含最高频信息,dedup 反而丢弃重复证据的次序权重。)
 3. 微偏离:索引内部属性公开为 `NgramProposer.index`(dict[tuple[int,...], list[int]]),测试直读钉结构(plan 草稿未命名);`propose` 键 = 已提交上下文末 n 位(prompt+已生成,verify 步首尚无新接受 token,与草稿注一致)。
+
+## M8 段 1:pager 多槽游标(唯一保护解禁,TDD 等价钉先行)(2026-11-02,`tests/test_spec_pager.py`,CPU 输出)
+
+Task 1(spec §2.3,D3 KV 游标复用):`cache/pager.py` 只加三个增量方法——`PagedCacheView.ensure_append_capacity_n(layer, n)`(步首容量确保,needed 公式 = write() 的 `(base+n+page-1)//page`,返回 n 个 `(page,slot)` 游标)、`PagedKVCache.scatter_verify(views, layer, k/v[B,kv,m,D], pages/slots[B,m])`(展平 advanced indexing 照 scatter_decode 的 [B]→[B*m] 法,`_lens` 提交 +m)、`PagedCacheView.set_lens(layer, new_len)`(只回退不前进,越界 ValueError)。死槽游标复用闭环:verify 写 m 位 → 接受 a → `set_lens(len+a+1)` → 下步从 len' 起复用死槽(页表项已在,零分配器回滚、free-list 语义不变),读侧按 lens 读页天然不可见死槽。
+
+### 三方法契约(测试钉死)
+
+- **`ensure_append_capacity_n`**:n=1 与旧 `ensure_append_capacity` 逐字节同 `(page,slot)`(空表/页内中段/页尾/恰跨页五形态 × page∈{4,16} 双页径);分配数 = write() 的 needed 公式;BlockExhausted 语义同 write(中途抛时已拿页留 table、`_lens` 未提交,释放后重试连贯);ensure 家族不提交长度。
+- **`scatter_verify`**:m=1 与 `scatter_decode` 对同一输入写页逐位一致 + `_lens` 提交一致(页内尾槽/恰跨页 slot 0/页中槽三形态);m=5、B=3 时写 `[B,kv,5,D]` 于 `[B,5]` 目标,页值逐位核对 `(pages[b,j],slots[b,j]) <- k[b,:,j,:]`,`_lens` 只提交被写层 +m;容量分配不在此发生(不可能抛 BlockExhausted);层间锁步由调用方保证(注释口径同 scatter_decode)。
+- **`set_lens`**:只回退不前进(`new_len ≤` 已写 len,含相等 no-op;前进越界 ValueError,空层同理);回退后 gather 读侧截到新长——死槽位不出现于任何读出张量。
+
+### 红绿记录(TDD,纯 CPU)
+
+- 红:`.venv/bin/pytest tests/test_spec_pager.py` → 7 failed(6 测试函数,`ensure_n_equals_old` × page∈{4,16} 参数化;实现前 AttributeError)。
+- 绿:实现后 7 passed(`7 passed in 0.11s`);6 等价钉逐条落:
+  - `test_ensure_n_equals_old_for_n1`(n=1 ≡ 旧 ensure 逐字节,page∈{4,16})
+  - `test_ensure_n_allocates_across_pages`(n=5、page=4 base=3 起跨 2 页;分配数 = needed 公式;分配行为 ≡ write;BlockExhausted 中途抛:页留 table、lens 未提交、`assert_balanced` 过)
+  - `test_scatter_verify_m1_equals_scatter_decode`(m=1 两方法写页 + `_lens` 逐位一致)
+  - `test_scatter_verify_multislot_and_lens`(m=5 B=3:lens +5、页值逐位、只提交被写层)
+  - `test_set_lens_rollback_guarded`(相等合法/回退合法/前进 ValueError/读侧截断)
+  - `test_dead_slot_reuse_roundtrip`(写 m=5 → set_lens 回 a=2 → ensure_n(5) 从 len'=base+3 起:死槽 (p1,s1)(p1,s2) 直接复用、已分配页未用槽 (p1,s3) 零分配、跨页续接恰新拿 1 页 → 复写 → gather 只到 lens,读出 = pre ∪ k1 存活前缀 ∪ k2 复写,死槽旧值零残留)
+- 既有 KV 对拍零换金:`tests/test_pager.py + tests/test_cache.py` 19 passed;fast 全套件 Task 0 复核口径(本机双卡可见,6 个 gpu 标记 TP=2 用例实跑)**235 passed, 17 deselected** = 基线 228 + 新增 7,零漂移;单卡口径(`CUDA_VISIBLE_DEVICES=1`)229 passed, 6 skipped(TP=2 需双卡的既有 skip,非本次改动)。golden/slow 零触碰。
+
+### 草稿注①裁决:零动(非薄壳化)
+
+旧 `ensure_append_capacity` **保持原体零动**,n=1 等价由 `test_ensure_n_equals_old_for_n1` 钉住,不以 `return self.ensure_append_capacity_n(layer, 1)[0]` 薄壳化。理由:"旧路径逐字节"硬门的最强形态是旧方法体逐字符不变(薄壳化行为等价但引入间接层,需依赖等价推辩;零动则旧 decode 路径与 `6eb1d6e` 逐字节同源,无需论证)。代价:needed 公式在 `write`/`ensure_append_capacity_n` 两处同式并存(各自带注释互引),可接受的重复。pager.py 净增 70 行(三方法 + 契约 docstring),既有方法零改动(diff 纯 +70)。
+
+### 对 plan 草稿的偏离(逐条记录)
+
+1. 微偏离:测试侧 `scatter_verify` 的 `[B,m]` 目标张量从 `ensure_append_capacity_n` 返回值以双重推导式构造(`[[p for p,_ in t] for t in targets]`),plan 草稿未给构造式;TDD 过程中修了三处测试自身笔误(目标张量解包、roundtrip 槽位算术漏计"已分配页未用槽"形态、gather 读侧 `[kv,len,D]` 布局误 permute)——**实现一次成型零返工**,等价钉逐位通过即契约成立的直接证据。
+2. 微偏离:`scatter_verify` 的 assert 面比 plan 草稿多一条 `pages.shape[1] == slots.shape[1] == m`(防 [B,1] 与 [B,m] 混用的静默错位);k/v m 轴一致性 assert 同理。
