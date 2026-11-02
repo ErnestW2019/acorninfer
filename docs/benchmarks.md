@@ -2662,3 +2662,24 @@ none 30.8–34.3s(纯 bf16 读盘;本终bench 两样本 30.9/31.9);w8a16 load 30
 ### 终账·口径注记(照前节同款)
 
 同日同机(RTX 4090 ×2;in-process 终bench 物理 GPU 1、仪式三腿 + gate-basis 腿物理 GPU 0、压测客户端照配方 `CUDA_VISIBLE_DEVICES=1` 零 GPU 占用;每腿跑前/收服后 nvidia-smi 双卡 4 MiB 验净 + 零计算进程双查,前台 timeout ≥1800s);全部腿 seed=20261027、in=128/out=32、temperature=0、max_tokens=32、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);三腿 + gate-basis 腿 + 终bench 五样本同窗口串行,腿间以双卡 4 MiB 验净为界;关服纪律:`ss -tlnp` 取真身 PID(vLLM 55424 / none 70758 / w8a16 102713)定向 kill,无包装壳误伤、无 pkill;vLLM 0.32.0,基线环境 `/home/ernest/vllm-baseline`;7.57GB/步 = W8 权重流口径(bf16 15.13GB ÷ 2,scale 可忽略);证据归档 `/tmp/opencode/m7t5/`(三腿 server+bench stdout、gate-basis 腿、终bench 五样本、slow 尾行);本节树 = 37b528d + 本 commit(docs)。M7 不打 tag、不 push(留用户)。
+
+## M8 段 0:n-gram 草稿器 + 贪心接受(TDD,纯 CPU,零 GPU)(2026-11-02,`tests/test_spec_ngram.py`,CPU 输出)
+
+M8 开篇。设计定案 = `docs/superpowers/specs/2026-11-02-m08-spec-decode-design.md`(锚 A1–A4;草稿器/接受逻辑 = §2.1,verify 前向 = §2.2,KV 游标复用 = §2.3);实施计划 = `docs/superpowers/plans/2026-11-02-m08-spec-decode.md`(5 任务)。本节 = Task 0:PLD 式 n-gram 草稿器 `acorninfer/spec/ngram.py` + 贪心接受 `greedy_accept`(TDD,纯 CPU python,零 torch——草稿器跑引擎热路径,纯列表/dict)。生产其余零触碰。
+
+### 红绿记录(TDD,纯 CPU)
+
+- 红:`.venv/bin/pytest tests/test_spec_ngram.py` → `ModuleNotFoundError: No module named 'acorninfer.spec'`(实现前)。
+- 绿:实现后 5 passed(`5 passed in 0.10s`):
+  - `test_index_build_and_lookup`(键 = N-gram tuple,值 = 后继列表按出现序,重复上下文先后都记录;命中/未命中)
+  - `test_propose_deterministic_and_padded`(同上下文同输出;候选 <K 补 `FILLER=0`;>K 截断到 K)
+  - `test_propose_uses_prompt_plus_generated`(`extend` 增量入索引后 propose 可查到生成 token 参与的新键)
+  - `test_greedy_accept_longest_prefix`(最长前缀;全中 a=K bonus=链尾;零中 a=0 仍产 bonus=首位)
+  - `test_accept_is_exactly_greedy_chain`(黄金性质钉:构造 logits→argmax 链 == drafts → (K, 链尾);断链后巧合相符不计——**前缀语义**,非集合匹配)
+- 全套件:228 passed, 17 deselected(本机含 CUDA,6 个 gpu 标记用例实跑;CPU-only 口径即基线 217+6 skipped+5 新增 = 222 passed, 6 skipped, 17 deselected)——零换金,零既有用例漂移。
+
+### 对 plan 草稿的偏离(逐条记录)
+
+1. **`greedy_accept` 签名:吃 token ids,非 logits**(plan 草稿 `greedy_accept(next_token_logits, drafts)`;任务指令与测试契约定案 `greedy_accept(next_token_ids, drafts)`)——引擎侧先 `logits.argmax(dim=-1)` 再传入(Task 3 接线);纯 CPU 可测,GPU argmax 属 Task 3。
+2. **确定性定案(spec §2.1 报告口径)**:后继列表 = 纯 list,**按出现序 append、不 dedup**——出现序即唯一顺序来源,无 set 迭代、无任何随机性;propose 输出 = 后继列表前 K 位 + `FILLER` 补齐,同上下文同输出可复现。(备选 stable dedup 弃:不 dedup 更简,且首现后继已含最高频信息,dedup 反而丢弃重复证据的次序权重。)
+3. 微偏离:索引内部属性公开为 `NgramProposer.index`(dict[tuple[int,...], list[int]]),测试直读钉结构(plan 草稿未命名);`propose` 键 = 已提交上下文末 n 位(prompt+已生成,verify 步首尚无新接受 token,与草稿注一致)。
