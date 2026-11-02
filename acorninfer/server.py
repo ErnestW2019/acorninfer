@@ -386,6 +386,21 @@ def create_app(engine: Engine) -> FastAPI:
             )
         return {"ok": True}
 
+    @app.get("/spec_stats")
+    async def spec_stats():
+        """投机接受账(M8 Task 4,AcornInfer 专有):引擎侧 verify 步级累计
+        计数。锁内快照(与 pump 的 step 互斥);spec 关闭 = 恒零值。"""
+        async with state["lock"]:
+            st = engine.spec_stats
+            return {
+                "spec_ngram": engine.spec_ngram,
+                "spec_num": engine.spec_num,
+                "verify_steps": st["verify_steps"],
+                "accepted": st["accepted"],
+                "committed": st["committed"],
+                "hist": dict(st["hist"]),
+            }
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         prompt_ids = engine.tokenizer.encode(render_chat(req.messages))

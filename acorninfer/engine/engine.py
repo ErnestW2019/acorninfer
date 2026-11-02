@@ -61,6 +61,12 @@ class Engine:
                     "spec × decode_graph 互斥(v1 eager verify only,spec §2.4)")
         self.spec_ngram = spec_ngram
         self.spec_num = spec_num
+        # M8 Task 4 接受率计量(引擎侧步级计数;spec 关闭时恒零值、零开销,
+        # 缺省路径逐字节不变):verify_steps = verify 腿步数(seq 级计),
+        # accepted = Σ a(greedy_accept 接受数),committed = 实际入流 token
+        # (eos 截断可 < a+1),hist = committed/步 分布(键 ≤ m 有界)。
+        self.spec_stats = {"verify_steps": 0, "accepted": 0, "committed": 0,
+                           "hist": {}}
         self._proposers: dict[int, "object"] = {}  # seq_id → NgramProposer(spec 模式)
         cfg = model.cfg
         device = next(model.parameters()).device
@@ -320,6 +326,13 @@ class Engine:
                     if seq.is_finished:
                         break                        # 终止 token 已记,其后窗口位作废
                 committed = seq.generated_ids[n0:]   # 实际提交段(含终止 token)
+                # 接受账(M8 Task 4):a = greedy 接受数;committed = 实际
+                # 入流 token(eos 中断可 < a+1,如实分列;hist 键 ≤ m 有界)
+                st = self.spec_stats
+                st["verify_steps"] += 1
+                st["accepted"] += a
+                st["committed"] += len(committed)
+                st["hist"][len(committed)] = st["hist"].get(len(committed), 0) + 1
                 self._proposers[seq.seq_id].extend(committed)
                 # KV 回退:接受 a → lens = len+a+1;截断时 = len+已发数。
                 # 死槽 [len', lens0+m) 由下步 ensure_n/scatter 复写(T1 契约)
