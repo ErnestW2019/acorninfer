@@ -2853,3 +2853,261 @@ A1_RESULT PASS (bitwise spec on/off, w8a16, 4 prompts x 64 tokens)
 2. 根因修复(见红绿记录):`forward_verify` 输出 reshape 错序(A1 硬门抓出),`transpose(1,2)` 移除 + 代码注记。草稿未预见此处布局差异(照抄 decode 幂等式在 m=1 时恰不触发)。
 3. TDD 夹具修正 4 处:①budget 降级测试 `max_tokens=3` 恒 < m → verify 永不触发,改 7(两腿都被钉到);②copier 尾重复 4→6 位(n-gram 后继列表须 ≥ K=4 条,drafts 才全真无 FILLER);③eos-spy 改自标定(prefill 生成位会移位 n-gram 键,drafts[0] 不可静态预知 → spy 读真 drafts 强制 a=1);④多发射断言从"末 2 步"改为"任意步"(预算截断后末段必为单发)。
 4. 微偏离:verify 不接 fused_ops(v1 eager-only,torch rope/残差);m=1 剩余预算不进 verify 腿(与 decode 逐字节同路径);tp==1 与单卡路径同码(server._build_engine 一处分支)。
+
+## M8 Task 4 终账(2026-11-02,收官:语料 + 参数扫 + 仪式 + 判定行落笔,真机输出)
+
+Task 4 = 语料切分(`make_spec_prompts.py`)+ bench 扩展(`--prompts-file` + 接受率计量)+ 施工期参数扫(N×K × 双 workload,GPU 1)+ 收官仪式(GPU 0,vLLM bf16 / W8 graph 生产参照 / W8 eager 同模式基线 / W8 spec eager 双语料;可选 vLLM ngram 腿**在场**)+ 判定行。**锚在选定配置上判:参数扫先行(两 pass),选定 N=1,K=4,仪式全程未换锚。** 本任务生产代码改动三面:`acorninfer/engine/engine.py`(spec_stats 步级计数,spec 关闭恒零值零写入)、`acorninfer/server.py`(GET /spec_stats)、`scripts/bench_remote.py`(--prompts-file/--spec-stats,缺省行为不变);新建 `scripts/make_spec_prompts.py`、`scripts/m8_param_sweep.py`、`data/spec_prompts_wiki.json`。`engine/scheduler.py`、`engine/sequence.py`、`engine/graph_runner.py`、`ops/paged_attention.py`、golden m0–m7、`tests/triton_utils.py` 零触碰(`git diff HEAD --stat` 该清单 = 空输出)。
+
+### 终账·语料(Step 1,纯 CPU)
+
+命令(原样):`.venv/bin/python scripts/make_spec_prompts.py`(缺省 = source `data/wikitext-2-raw/wiki.test.raw`、block 128、count 64、seed 20261102)。stdout 逐字:
+
+```
+CORPUS source=data/wikitext-2-raw/wiki.test.raw total_tokens=299078 blocks=2336 block=128 count=64 seed=20261102 eos_replaced=0 out=data/spec_prompts_wiki.json
+```
+
+口径(spec §6):全文按行保序拼接(perplexity.py 同款)→ 自家 Tokenizer 全文 encode 一次性(299,078 token,**与 M7 ppl 账同数** = 同源互证)→ 连续 128-token 块 2336 块 → `random.Random(20261102).sample` 无放回抽 64 块、索引升序(确定性,可复现)→ prompt 内 EOS 置换照 `bench._prompts` 同款(eos→(eos+1)%vocab;实测 eos_replaced=0,样本块零命中)→ JSON token-id 数组(`bench_remote --prompts-file` 直投 `/v1/completions`,不做重分词)。数量 ≥32 ✓(64)。
+
+### 终账·bench 扩展与接受率计量口径(Step 1)
+
+- `bench_remote.py --prompts-file data/spec_prompts_wiki.json`:各档用语料前 C 条 prompt(1⊂4⊂8 跨档可比);缺省随机语料行为逐字节不变(A4)。wiki 腿 `--out-tokens 64`(口径:64 而非 spec §6 草拟的 32,为稳住接受率统计的每请求 verify 步数,派单建议口径,如实记录;spec/eager/graph/vLLM 同腿同 out 对齐)。
+- **接受率计量 = 引擎侧步级计数**(现状最顺路径,一次计数面贯穿 in-process/HTTP 双口径):`Engine._spec_step` 逐 verify 步累加 `spec_stats = {verify_steps, accepted(Σa), committed(实际入流 token), hist(committed/步分布,键 ≤ m 有界)}`;server 暴露 `GET /spec_stats`(state 锁内快照);`bench_remote --spec-stats` 每档压测后取增量打 `SPEC-STATS` 行(E_acc1 = accepted/verify_steps + 1 = E[接受+1];mean_committed;hist);参数扫脚本直读引擎计数增量。warmup 后先取基线快照 → warmup 的 verify 步(如有)不落任何档位增量。spec 关闭 = 计数面恒零值零写入,缺省路径逐字节(fast 238 证据)。
+- wiki spec 腿 warmup 改用语料首条 + out=8(≥ m=7):强制服务端进程内 ≥1 个 verify 步,triton verify kernel JIT 预热,不落档位计时。
+
+### 终账·参数扫(Step 2,GPU 1,in-process W8 生产同构接线,同口径两 pass)
+
+命令(原样):`CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/m8_param_sweep.py`(模型装载一次 W8 = apply_quant + quant_gemm.configure;engine 按行重建;每行先 warmup seq(8-token × out=8 ≥ m,强制 verify 腿 JIT 预热,不计入)→ 计测 seq C=1(tok_s = bench 同款引擎记账口径 gen/(last−created),非 HTTP);N=0 行 = eager W8 参照同口径)。两 pass 全表(tok_s 单位 tok/s;E_acc1 与 hist 两 pass 逐位相同 = 接受账确定性):
+
+**wiki workload(C=1,in=128,out=64,prompt0):**
+
+| N | K | pass1 tok_s | pass2 tok_s | 两 pass 均值 | E_acc1 | hist(committed/步) |
+|---|---|---|---|---|---|---|
+| 0(eager) | – | 55.66 | 52.89 | 54.28 | – | – |
+| 1 | 2 | 44.99 | 47.28 | 46.14 | 1.070 | {1:53, 2:4} |
+| **1** | **4** | **50.19** | **47.21** | **48.70** | **1.073** | {1:51, 2:4} |
+| 1 | 6 | 45.24 | 47.27 | 46.26 | 1.075 | {1:49, 2:4} |
+| 2 | 2 | 46.07 | 44.55 | 45.31 | 1.070 | {1:53, 2:4} |
+| 2 | 4 | 49.12 | 47.19 | 48.16 | 1.073 | {1:51, 2:4} |
+| 2 | 6 | 48.96 | 46.65 | 47.81 | 1.075 | {1:49, 2:4} |
+| 3 | 2 | 47.77 | 46.56 | 47.17 | 1.052 | {1:55, 2:3} |
+| 3 | 4 | 45.77 | 46.89 | 46.33 | 1.054 | {1:53, 2:3} |
+| 3 | 6 | 47.02 | 46.78 | 46.90 | 1.056 | {1:51, 2:3} |
+
+**chat workload(C=1,in=128 随机,out=32,prompt0):**
+
+| N | K | pass1 tok_s | pass2 tok_s | 两 pass 均值 | E_acc1 | hist |
+|---|---|---|---|---|---|---|
+| 0(eager) | – | 54.42 | 52.28 | 53.35 | – | – |
+| 1 | 2 | 46.87 | 44.02 | 45.45 | 1.000 | {1:29} |
+| 1 | 4 | 42.22 | 40.33 | 41.28 | 1.000 | {1:27} |
+| 1 | 6 | 47.10 | 45.07 | 46.09 | 1.000 | {1:25} |
+| 2 | 2 | 46.60 | 44.26 | 45.43 | 1.000 | {1:29} |
+| 2 | 4 | 46.85 | 44.65 | 45.75 | 1.000 | {1:27} |
+| 2 | 6 | 47.39 | 45.95 | 46.67 | 1.000 | {1:25} |
+| 3 | 2 | 46.39 | 45.05 | 45.72 | 1.000 | {1:29} |
+| 3 | 4 | 46.67 | 45.27 | 45.97 | 1.000 | {1:27} |
+| 3 | 6 | 47.33 | 45.83 | 46.58 | 1.000 | {1:25} |
+
+判读(如实):①**E_acc1 全表 ∈ [1.052, 1.075](wiki)/ = 1.000(chat),两 pass 逐位相同**——接受账由草稿器查表与 prompt 内容决定,确定性复现;②所有 9 组合 tok_s 均低于同口径 eager 行(wiki 均值 45.3–48.7 vs 54.3;chat 同向),**扫表内无一组合兑现加速**;③tok_s pass 间噪声 ±5%(pass1 N1K4 50.19 为噪声级,均值守序稳定);④N=3 一致最差(键越长命中率越低);K 增大 E_acc1 微升但 m=K+1 verify 税同步升,净效果 K=4–6 打平。
+
+### 终账·选定缺省配置(锚判配置,仪式不许换锚——已执行)
+
+**N=1,K=4(m=5)。** 理由:准则是「tok_s 最高,并列取 K 小者」——两 pass wiki 均值 48.70 全表最高(次高 N2K4 48.16,差 1.1% 噪声级;pass1 原始行同为 N1K4 最高);E_acc1=1.073 处 N∈{1,2} 并列组;m=5 与 T3 计测参考口径(verify 22.34ms)同窗口;K=4 = 既有 `--spec-num` 缺省,CLI 零意外。 Ceremony 全程按此配置,未换锚。
+
+### 终账·机制上限探针(归因证据,非门)
+
+强复制型 prompt(同句 ×16,128 token,选定配置 N=1 K=4,GPU 1,`/tmp/opencode/m8t4/ceiling_probe.py`):
+
+```
+CEILING workload=copy N=1 K=4 gen=64 verify_steps=33 E_acc1=1.879 mean_committed=1.879 hist={1: 4, 2: 29}
+```
+
+读法:纯复制输入下 E_acc1 = 1.879 ≈ 设计上限 2.0——**草稿→verify→接受→死槽复用全链机制工作正常**。wiki 1.073 的缺口是结构性而非接线 bug:本设计 `propose` 返回**同一键的前 K 个后继(备选)**而非链式续查,前缀接受语义下实际可用只有位置 0(位置 ≥1 拿备选对链尾,恰中属巧合;T3 copier rig 的全中链是构造特例)→ 实用上限 a≤1;自然 wiki 续写的首后继命中率 ~7% → E_acc1 ≈ 1.07。
+
+### 终账·全量回归三尾行(零换金)+ A4 复核带
+
+| 套件 | 命令 | 尾行(逐字) | 判定 |
+|---|---|---|---|
+| fast 单卡 | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q` | `238 passed, 6 skipped, 17 deselected, 1 warning in 15.46s` | = T3 后基线,零漂移 ✓ |
+| slow | `CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -q -m slow` | `17 passed, 244 deselected in 444.59s (0:07:24)` | golden 17 原样,零换金 ✓ |
+| 双卡 tp 全套 | `CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m pytest -q tests/test_tp_eager.py tests/test_tp_engine.py tests/test_tp_server.py` | `13 passed in 18.95s` | 全绿 ✓,跑后双卡回落 4 MiB |
+
+A4 复核带(m6_ab,GPU 1,本任务改动后):none graph C=1 **17.93**(带 17.91–17.96 ✓)/ C=8 **19.90**(带 19.87–19.93 ✓);w8a16 graph C=1 **10.93** / C=8 **11.68**(带 10.7–11.7 ✓)。eager 腿如实:none eager C=1 19.45 略高于历史带顶 19.35(+0.10,该档带宽 + 单样本噪声,M7 终账同款先例;graph 主口径不受影响)/ C=8 21.21 带内;w8a16 eager C=1 18.27(T5 带 17.49–19.25 带内)/ C=8 18.04(T5 带底 18.14 下缘 −0.10,噪声级)。`ABPREFILL`:none 32.92/144.53,w8a16 32.14/152.73(M7 终账同带)。
+
+### 终账·仪式(Step 3,GPU 0;必选四腿 + R7 可选腿在场 + 口径腿 A2)
+
+配方注记(照 M5/M6/M7 配方原样):命令/端口/GPU 0/seed=20261027 协议照旧;压测客户端 `CUDA_VISIBLE_DEVICES=1`(零 GPU 占用);每腿起服前 nvidia-smi 双卡 4 MiB 实录;**关服纪律全程 `ss -tlnp` 取真身 PID 定向 kill(无 pkill)**:vLLM plain 2613472 / vLLM ngram 2655017 / vLLM plain(口径腿)2985366 / graph 3044461 / eager 3148484 / spec 3201100,均 SIGTERM 后端口闭、双卡 4 MiB 复验(终态双查 nvidia-smi 全表零计算进程);AcornInfer 各腿就绪 ~40s,vLLM ~40–75s。注记:`ss -tlnp | grep 8200` 曾误中 nginx `0.0.0.0:18200` 行(机器常驻服务,非本仪式进程),真身以 `127.0.0.1:8200` 行 python PID 为准,未误伤。
+
+腿构成(命令原样):
+
+```bash
+# leg A:vLLM bf16 8100(chat 缺省语料)
+CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90 --dtype bfloat16
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/bench_remote.py --base http://127.0.0.1:8100 --concurrency 1 4 8
+
+# leg E(R7 可选腿,在场):vLLM bf16 + ngram spec(K=4,lookup 1–4;0.32.0 SpeculativeConfig 支持性先验兑现)
+CUDA_VISIBLE_DEVICES=0 /home/ernest/vllm-baseline/bin/vllm serve /home/ernest/model-weight/Qwen3-8B --port 8100 --max-model-len 512 --gpu-memory-utilization 0.90 --dtype bfloat16 --speculative-config '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4, "prompt_lookup_min": 1}'
+# 压测:chat 缺省语料 + wiki 语料两条(命令同款,--prompts-file data/spec_prompts_wiki.json --out-tokens 64)
+
+# leg A2(口径腿):vLLM plain wiki 语料(与 leg E wiki 读数同基线对照;非验收腿)
+# server 命令同 leg A;压测:--prompts-file data/spec_prompts_wiki.json --out-tokens 64
+
+# leg B:AcornInfer W8 graph 8200(生产参照)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --attention-backend triton --fused-ops --cuda-graph --quant w8a16
+# 压测:chat 缺省 + wiki(--prompts-file data/spec_prompts_wiki.json --out-tokens 64)各 C=1 4 8
+
+# leg C:AcornInfer W8 eager 8200(同模式基线)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --attention-backend triton --fused-ops --quant w8a16
+# 压测:wiki(--prompts-file --out-tokens 64)+ chat 缺省,各 C=1 4 8,均带 --spec-stats
+
+# leg D:AcornInfer W8 spec eager 8200(选定配置 N=1 K=4)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m acorninfer.server --model-dir /home/ernest/model-weight/Qwen3-8B --port 8200 --attention-backend triton --fused-ops --quant w8a16 --spec-ngram 1 --spec-num 4
+# 压测:wiki(--prompts-file --out-tokens 64)+ chat 缺省,各 C=1 4 8,均带 --spec-stats
+```
+
+逐腿 stdout 逐字(server 全文与 bench stdout 归档 `/tmp/opencode/m8t4/`;`RESULT-VLLM` 前缀为 bench_remote 固定标签):
+
+```
+# leg A:vLLM bf16 8100(chat)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0269s ttft_mean=0.0269s tpot_mean=16.89ms tok_s=58.12
+RESULT-VLLM C=4 ttft_p50=0.0659s ttft_mean=0.0566s tpot_mean=17.80ms tok_s=208.57
+RESULT-VLLM C=8 ttft_p50=0.0805s ttft_mean=0.0738s tpot_mean=17.85ms tok_s=356.17
+
+# leg E:vLLM ngram spec(chat)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0274s ttft_mean=0.0274s tpot_mean=18.41ms tok_s=53.49
+RESULT-VLLM C=4 ttft_p50=0.0704s ttft_mean=0.0592s tpot_mean=17.73ms tok_s=191.93
+RESULT-VLLM C=8 ttft_p50=0.0838s ttft_mean=0.0764s tpot_mean=17.62ms tok_s=315.55
+
+# leg E:vLLM ngram spec(wiki,out=64)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0232s ttft_mean=0.0232s tpot_mean=15.85ms tok_s=62.64
+RESULT-VLLM C=4 ttft_p50=0.0723s ttft_mean=0.0611s tpot_mean=14.50ms tok_s=225.18
+RESULT-VLLM C=8 ttft_p50=0.0867s ttft_mean=0.0790s tpot_mean=14.60ms tok_s=423.23
+
+# leg A2:vLLM plain(wiki,out=64)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0230s ttft_mean=0.0230s tpot_mean=16.88ms tok_s=58.89
+RESULT-VLLM C=4 ttft_p50=0.0681s ttft_mean=0.0575s tpot_mean=17.77ms tok_s=216.49
+RESULT-VLLM C=8 ttft_p50=0.0809s ttft_mean=0.0739s tpot_mean=17.97ms tok_s=422.92
+
+# leg B:AcornInfer W8 graph(chat)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0449s ttft_mean=0.0449s tpot_mean=11.28ms tok_s=81.09
+RESULT-VLLM C=4 ttft_p50=0.1202s ttft_mean=0.0997s tpot_mean=12.21ms tok_s=265.51
+RESULT-VLLM C=8 ttft_p50=0.1941s ttft_mean=0.1748s tpot_mean=12.90ms tok_s=397.40
+
+# leg B:AcornInfer W8 graph(wiki,out=64)
+warmup done (1 request, not measured)
+RESULT-VLLM C=1 ttft_p50=0.0357s ttft_mean=0.0357s tpot_mean=10.96ms tok_s=88.10
+RESULT-VLLM C=4 ttft_p50=0.1175s ttft_mean=0.0974s tpot_mean=11.89ms tok_s=301.03
+RESULT-VLLM C=8 ttft_p50=0.1907s ttft_mean=0.1720s tpot_mean=12.29ms tok_s=538.79
+
+# leg C:AcornInfer W8 eager(wiki,out=64)
+warmup done (1 request, not measured)
+SPEC-STATS C=warmup verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=1 ttft_p50=0.0340s ttft_mean=0.0340s tpot_mean=18.08ms tok_s=54.56
+SPEC-STATS C=1 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=4 ttft_p50=0.1211s ttft_mean=0.0997s tpot_mean=18.45ms tok_s=201.82
+SPEC-STATS C=4 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=8 ttft_p50=0.1937s ttft_mean=0.1740s tpot_mean=18.39ms tok_s=382.80
+SPEC-STATS C=8 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+
+# leg C:AcornInfer W8 eager(chat)
+warmup done (1 request, not measured)
+SPEC-STATS C=warmup verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=1 ttft_p50=0.0340s ttft_mean=0.0340s tpot_mean=17.54ms tok_s=55.39
+SPEC-STATS C=1 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=4 ttft_p50=0.1211s ttft_mean=0.0997s tpot_mean=18.54ms tok_s=188.26
+SPEC-STATS C=4 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+RESULT-VLLM C=8 ttft_p50=0.1927s ttft_mean=0.1731s tpot_mean=19.26ms tok_s=291.08
+SPEC-STATS C=8 verify_steps=0 E_acc1=n/a mean_committed=n/a hist={}
+
+# leg D:AcornInfer W8 spec eager N=1 K=4(wiki,out=64)
+warmup done (1 request, not measured)
+SPEC-STATS C=warmup verify_steps=3 E_acc1=1.000 mean_committed=1.000 hist={'1': 3}
+RESULT-VLLM C=1 ttft_p50=0.0343s ttft_mean=0.0343s tpot_mean=21.53ms tok_s=46.03
+SPEC-STATS C=1 verify_steps=55 E_acc1=1.073 mean_committed=1.073 hist={'1': 51, '2': 4}
+RESULT-VLLM C=4 ttft_p50=0.1272s ttft_mean=0.1044s tpot_mean=21.85ms tok_s=160.82
+SPEC-STATS C=4 verify_steps=201 E_acc1=1.184 mean_committed=1.184 hist={'1': 165, '2': 35, '3': 1}
+RESULT-VLLM C=8 ttft_p50=0.2033s ttft_mean=0.1825s tpot_mean=22.41ms tok_s=289.41
+SPEC-STATS C=8 verify_steps=390 E_acc1=1.218 mean_committed=1.218 hist={'1': 308, '2': 79, '3': 3}
+
+# leg D:AcornInfer W8 spec eager N=1 K=4(chat)
+warmup done (1 request, not measured)
+SPEC-STATS C=warmup verify_steps=649 E_acc1=1.194 mean_committed=1.194 hist={'1': 527, '2': 118, '3': 4}
+RESULT-VLLM C=1 ttft_p50=0.0349s ttft_mean=0.0349s tpot_mean=24.58ms tok_s=40.16
+SPEC-STATS C=1 verify_steps=27 E_acc1=1.000 mean_committed=1.000 hist={'1': 27}
+RESULT-VLLM C=4 ttft_p50=0.1347s ttft_mean=0.1108s tpot_mean=25.54ms tok_s=136.56
+SPEC-STATS C=4 verify_steps=103 E_acc1=1.049 mean_committed=1.049 hist={'1': 98, '2': 5}
+RESULT-VLLM C=8 ttft_p50=0.2004s ttft_mean=0.1800s tpot_mean=25.95ms tok_s=208.30
+SPEC-STATS C=8 verify_steps=165 E_acc1=1.152 mean_committed=1.152 hist={'1': 154, '2': 6, '4': 1, '5': 4}
+```
+
+(注记:leg D chat warmup 行的 649 = 服务端累计计数含此前 wiki 各档,增量口径以每档快照差分为准,chat 各档 verify_steps 27/103/165 为干净增量;全表 mean_committed 与 E_acc1 逐位相等 = 零 eos 截断损耗,committed ≡ accepted+1。)
+
+### 终账·仪式表(GPU 0,tok_s;TTFT/TPOT 见上 stdout 原样)
+
+| 腿 | 语料(out) | C=1 | C=4 | C=8 |
+|---|---|---|---|---|
+| vLLM bf16(chat) | chat(32) | 58.12 | 208.57 | 356.17 |
+| vLLM bf16 plain(口径腿) | wiki(64) | 58.89 | 216.49 | 422.92 |
+| vLLM ngram spec K=4 | chat(32) | 53.49 | 191.93 | 315.55 |
+| vLLM ngram spec K=4 | wiki(64) | 62.64 | 225.18 | 423.23 |
+| AcornInfer W8 graph(生产参照) | chat(32) | 81.09 | 265.51 | 397.40 |
+| AcornInfer W8 graph(生产参照) | wiki(64) | 88.10 | 301.03 | 538.79 |
+| AcornInfer W8 eager(A2 分母) | wiki(64) | **54.56** | 201.82 | 382.80 |
+| AcornInfer W8 eager | chat(32) | 55.39 | 188.26 | 291.08 |
+| AcornInfer W8 spec eager N1K4 | wiki(64) | **46.03** | 160.82 | 289.41 |
+| AcornInfer W8 spec eager N1K4 | chat(32) | 40.16 | 136.56 | 208.30 |
+
+达标率逐档(chat 语料,AcornInfer ÷ vLLM bf16):
+
+- **graph(生产参照)**:C=1 81.09/58.12 = **139.5%**、C=4 265.51/208.57 = **127.3%**、C=8 397.40/356.17 = **111.6%**(M7 终账 147.4/128.4/112.8:C=1 低 7.9pp 主体为我方 C=1 TTFT 单样本波动 0.0449 vs M7 0.0358(out=32 短输出下 TTFT 全额进 tok_s span;vLLM 侧 +0.0% 零漂移;decode-only TPOT 比 17.85/11.28 = ×1.58 与 M7 ×1.42 同向强健),如实注记,非 decode 面回退);
+- **eager(同模式基线)**:95.3% / 90.3% / 81.7%(graph−eager gap ≈ M6/M7 已入档的 eager 模式代价,口径自洽);
+- **spec eager(选定配置)**:69.1% / 65.5% / 58.5%(A3 如实,归因见判定行)。
+
+### 终账·锚判定行(如实,本里程碑最重要的一行)
+
+**A1 无损性(硬门):过(证据引用 T3 + 本任务零回归)。** tiny 全量逐位(`test_spec_greedy_bitwise_tiny` 等 6 passed)+ 8B 抽样 4 prompts × 64 tokens 逐位 `A1_RESULT PASS`(M8 段 3 节原样);本任务对 spec/verify/接受链零算法改动(仅步级计数旁路),fast 238 零漂移 + `test_spec_engine.py` 全绿为延续证据。
+
+**A2 加速(硬门):未过,如实裁 = NO-GO(特性保留,缺省关不变)。** 判定值(同模式同语料新鲜测,同窗口 GPU 0):spec(wiki)C=1 tok_s **46.03** ÷ eager W8(wiki)C=1 **54.56**(A2 分母,新鲜测)= **×0.844**,对锚 ×1.4 缺口 −39.7%(且方向为负:spec 比 eager 慢 15.6%)。配 E[接受+1]:**1.073**(仪式 HTTP 与参数扫 in-process 两口径逐位同值,55 verify 步同 hist),对 E ≥ ~1.45 的锚推算需求缺 −26%;E_acc1=1.073 下即使零开销也到不了 ×1.4(几何上限 ×1.073)。**vs 生产 graph W8 的比值(如实)**:wiki C=1 46.03/88.10 = **×0.522**(C=4 ×0.534 / C=8 ×0.537)。归因(数据闭环,三层):①**草稿器设计上限**——备选式 propose + 前缀接受语义 → 实用 a≤1 → E_acc1 上限 ~2.0(机制上限探针 1.879 兑现),锚推算的文献带 1.8–2.8 属**链式/span 式草稿器**(PLD 原法)的接受率,本设计的备选式结构拿不到;②**workload 敏感性兑现**——wiki.test.raw 自然续写的首后继命中率 ~7%(E_acc1 1.07),非复制型任务;外部对照:**vLLM 0.32.0 自带链式 ngram(lookup 1–4,K=4)同语料同协议只到 ×1.064**(62.64/58.89)——独立实现同向证实该 workload + ngram 系草稿的收益天花板远低于锚,非本工程实现质量所致(chat 语料 vLLM ngram 同样 ×0.92 负收益);③**verify 步税兑现**——spec wiki C=1 TPOT 21.53ms vs eager 18.08ms = **+19.1%**(T3 计测 18.28→22.34 = +22.3% 同带),E_acc1 增益 1.073 < 税 1.19 → 净 ×0.84,算术闭环(46.03/54.56 = 1.073/1.191 × 档位轮廓项)。**判定:spec eager v1 在选定配置上不达 A2;W8 graph(生产参照)仍是唯一正收益 decode 面;缺省 `--spec-ngram 0` 不变(A4);特性保留为显式 opt-in。**
+
+**A3 workload 敏感性(如实):chat 全矩阵 <1,归因 = 接受率。** spec/eager:×0.725 / ×0.725 / ×0.716(C=1/4/8);spec/graph:×0.495 / ×0.514 / ×0.524。chat E_acc1:C=1 **1.000**(随机 prompt 零命中,hist 全 1)/ C=4 1.049 / C=8 1.152(均匀随机 id 的偶然 n-gram 重合,hist 出现 4/5 token 步);零命中 + 全额 verify 税(TPOT 17.54→24.58 = +40%)= 负收益算术。工作负载选择指引(spec R4 兑现):ngram 系投机只值得在**强复制型**(摘要/改写/代码续写/受限域名)显式开启;通用 chat / 自然续写不开。
+
+**A4 缺省不变(硬门):过。** fast 238 零漂移 + slow 17 / tp 13 零换金(三尾行在档);m6_ab none/w8a16 双带复核带内;`bench_remote --prompts-file/--spec-stats` 均显式 flag、缺省路径逐字节;`/spec_stats` 端点只读;`spec_stats` 计数面 spec 关闭恒零值零写入。
+
+### 终账·接受率矩阵(E[接受+1] = accepted/verify_steps + 1;committed/步分布)
+
+| workload × C | verify 步数 | E[接受+1] | hist(committed/步) |
+|---|---|---|---|
+| wiki C=1(HTTP) | 55 | 1.073 | {1:51, 2:4} |
+| wiki C=4(HTTP) | 201 | 1.184 | {1:165, 2:35, 3:1} |
+| wiki C=8(HTTP) | 390 | 1.218 | {1:308, 2:79, 3:3} |
+| chat C=1(HTTP) | 27 | 1.000 | {1:27} |
+| chat C=4(HTTP) | 103 | 1.049 | {1:98, 2:5} |
+| chat C=8(HTTP) | 165 | 1.152 | {1:154, 2:6, 4:1, 5:4} |
+| wiki C=1(in-process 扫,两 pass 同) | 55 | 1.073 | {1:51, 2:4} |
+| chat C=1(in-process 扫) | 27–29 | 1.000 | {1: 全} |
+| copy 探针 C=1(N1K4,机制上限) | 33 | 1.879 | {1:4, 2:29} |
+
+判读:wiki C 增大 E_acc1 上升(1.073→1.218)= 不同档位取用不同语料块(前 1/4/8 条)的内容差异,非并发效应(草稿器按 seq 独立);C=8 档 hist 出现 4/5-token 步(chat)= 随机 id 偶然重合;**全表零 eos 截断损耗**(mean_committed ≡ E_acc1)。机制税恒定面:verify 步 +19~22%(TPOT 对 eager 同语料),E_acc1 ≤ 1.22 的任何配置净收益为负——这就是本终账判定行的算术核心。
+
+### 终账·kernel/草稿器开销账(引用 + 互证)
+
+- T3 计测(M8 段 3 节原样引用):eager decode C=4 18.28ms/步;verify m=5 零接受 22.34ms(最坏 +22%/步);draft 延迟 mean 0.3µs(p95 0.4,目标 <100µs,3 个量级余量)——**草稿器 CPU 面与 verify 税相比是无关量级,开销账主体 = verify 前向 m=5 本身**。
+- 本仪式互证:eager wiki C=1 TPOT 18.08 → spec 21.53(+19.1%),eager chat C=1 17.54 → spec 24.58(+40%,零接受纯税);与 T3 +22% 同带——8B HTTP 全链下 verify 税稳定复现,零粉饰。
+
+### 终账·M9 台账(承 M6/M7 台账 + 本里程碑移入/新立)
+
+- **链式/span 式草稿器(本终账新立,A2 翻案的唯一主路径)**:现备选式 propose(同键前 K 后继)的实用上限 E_acc1≈2.0(探针 1.879);改链式续查(PLD 原法:末缀匹配 → 复制后续 span)后 wiki 型 E_acc1 有望进 1.8–2.8 文献带——外部佐证 = vLLM ngram(链式)同语料 ×1.064 虽低但结构占优;若届时 E_acc1 ≥ 1.45,A2 须按新配置重开判定(本终账锚对备选式结构闭合,不自动外推);
+- **自适应 k**(承 plan):低接受率档自动降 m(E_acc1 <1.1 时 m=5 纯亏,自适应可把 chat 负收益收窄,但救不了方向);
+- **graph verify**(承 spec §2.4):verify 前向进 CUDA graph,收 verify 税的 launch 面(税 19% 中的 host/launch 分量;T2 kernel 面 0.037ms 已证 GPU 面非瓶颈);
+- **采样域投机**(承 spec §2.4)/ **draft-model 系**(Eagle/Medusa,承 spec §5)/ **TP×spec**(构造期互斥已落地,解禁需 TP verify 通信面评估);
+- 承 M7 原样:**W4 复活条件**(kernel 形态突破 / GPTQ / 显存受限重估)、**KV 量化**、**C=1 非 GEMM 面收账**、**GPTQ/AWQ**、**磁盘量化缓存**;
+- 承 M6 原样:**双存储 down_t**、**连续到达 bench 协议**、**半宽 GEMM**、**custom allreduce**、**rank0 快失败**、triton decode_gemm 模块(入库未接线)。
+
+### 终账·口径注记(照前节同款)
+
+同日同机(RTX 4090 ×2;参数扫/回归/复核带物理 GPU 1、仪式六腿物理 GPU 0、压测客户端 `CUDA_VISIBLE_DEVICES=1` 零 GPU 占用;每腿跑前/收服后 nvidia-smi 双卡 4 MiB 验净 + 零计算进程双查,前台 timeout ≥1800s);chat 腿 seed=20261027、in=128/out=32;wiki 腿 in=128(语料块)/out=64(`--prompts-file` 各档取前 C 条);temperature=0、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);tok_s = 总生成 token / span(含 TTFT 全额,out=64 腿 TTFT 占比低于 out=32);参数扫 tok_s 为 in-process 引擎记账口径(gen/(last−created),非 HTTP),与仪式 HTTP 口径不可直比(仪式 wiki C=1 spec 46.03 vs 扫表 48.70,差 = HTTP/SSE 全程流式开销,M6/M7 同款 ×0.93 带内);接受率口径 = E[accepted+1]/verify 步(E_acc1),committed ≡ accepted+1 全表成立(零截断);eager 腿 SPEC-STATS verify_steps=0 = 计量面未接 spec 路径的活证;E_acc1 跨口径复现(HTTP 55 步 = in-process 55 步,hist 逐位同)= 草稿器确定性活证;关服纪律:`ss -tlnp` 真身 PID 定向 kill 六次(nginx 18200 误匹配已注记,未误伤),终态双卡 4 MiB;vLLM 0.32.0(ngram spec 腿经 `--speculative-config` 在场,R7 兑现),基线环境 `/home/ernest/vllm-baseline`;证据归档 `/tmp/opencode/m8t4/`(六腿 server+bench stdout、参数扫两 pass、ceiling probe、回归三尾行);本节树 = 36a63ed + 本任务 commit。M8 不打 tag、不 push(留用户)。
