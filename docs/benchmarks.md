@@ -3111,3 +3111,154 @@ SPEC-STATS C=8 verify_steps=165 E_acc1=1.152 mean_committed=1.152 hist={'1': 154
 ### 终账·口径注记(照前节同款)
 
 同日同机(RTX 4090 ×2;参数扫/回归/复核带物理 GPU 1、仪式六腿物理 GPU 0、压测客户端 `CUDA_VISIBLE_DEVICES=1` 零 GPU 占用;每腿跑前/收服后 nvidia-smi 双卡 4 MiB 验净 + 零计算进程双查,前台 timeout ≥1800s);chat 腿 seed=20261027、in=128/out=32;wiki 腿 in=128(语料块)/out=64(`--prompts-file` 各档取前 C 条);temperature=0、计时前 1 条 warmup 不计入;HTTP TTFT 含客户端→服务端上行与 SSE 流式首包回传全程(`bench_remote._run_one` 口径);tok_s = 总生成 token / span(含 TTFT 全额,out=64 腿 TTFT 占比低于 out=32);参数扫 tok_s 为 in-process 引擎记账口径(gen/(last−created),非 HTTP),与仪式 HTTP 口径不可直比(仪式 wiki C=1 spec 46.03 vs 扫表 48.70,差 = HTTP/SSE 全程流式开销,M6/M7 同款 ×0.93 带内);接受率口径 = E[accepted+1]/verify 步(E_acc1),committed ≡ accepted+1 全表成立(零截断);eager 腿 SPEC-STATS verify_steps=0 = 计量面未接 spec 路径的活证;E_acc1 跨口径复现(HTTP 55 步 = in-process 55 步,hist 逐位同)= 草稿器确定性活证;关服纪律:`ss -tlnp` 真身 PID 定向 kill 六次(nginx 18200 误匹配已注记,未误伤),终态双卡 4 MiB;vLLM 0.32.0(ngram spec 腿经 `--speculative-config` 在场,R7 兑现),基线环境 `/home/ernest/vllm-baseline`;证据归档 `/tmp/opencode/m8t4/`(六腿 server+bench stdout、参数扫两 pass、ceiling probe、回归三尾行);本节树 = 36a63ed + 本任务 commit。M8 不打 tag、不 push(留用户)。
+
+## M9 段 0:prefill spike 归因 + before 成绩单(2026-11-02,`scripts/profile_prefill.py` 扩展三 pass + `scripts/m9_gqa_probe.py` / `scripts/m9_chain_probe.py` / `scripts/m9_capture_proxy.py`,GPU 1 归因 / GPU 0 before,真机输出)
+
+> **状态注记(节点事故,如实,先行)**:before 全 λ 扫进行中(vLLM 侧 λ=1 完成后),**17:08:42 物理节点 GPU 0(PCI 0000:b1:00)Xid 79 "GPU has fallen off the bus"**,同刻 Xid 154 "GPU recovery action … 0x2 (Node Reboot Required)"(b1:00 与 c7:00 双卡),17:08:55 vLLM 服务端进程崩溃关停;当前 nvidia-smi 仅见 GPU 1(4 MiB)、GPU 0 句柄丢失,CUDA 全机不可初始化(torch `CUDA unknown error`)。**故本节 before 成绩单暂只有 vLLM λ=1 一档有效官方数据;λ=2 档(20 成功/236 失败,服务端中段死亡)作废原样存档;λ∈{4,8,16,32} 未跑;AcornInfer 全侧(R5 acorn 捕获 + 全 λ 扫)未跑,待节点重启后续测并在本节续写。**已测部分(归因/探针/链路拆账/R5 vLLM 侧捕获)全部有效,逐字入档如下。证据归档 `/tmp/opencode/m9t0/` 并已持久化副本至 `/home/ernest/m9t0_archive/`(防重启丢失 tmpfs)。
+
+### M9 §0 口径定案追记(spec §0 用户定案兑现;对 M6–M8 headline 的形式更正留 T5 统一动笔)
+
+1. **对比口径 = 业界标准**(spec §0 定案第 1 条,凌驾既往协议):M9 起双方 bf16、同模型、同卡、同负载,官方 `vllm bench serve` 为验收仪;**量化(W8A16/W4)退出对比口径**,M7 成果保留为可选部署模式不再投入。**既往 headline"全三档跑赢 vLLM(147/128/112%)"按此口径降级为无效 headline**(系 AcornInfer W8 对 vLLM bf16 的跨口径比),docs 形式更正追记留 T5 统一落笔(本段 0 先立口径,不动历史段落)。
+2. **M9 主 goal = 引擎优化**:TTFT/prefill 面为首个施工目标(差距最大、从未被攻过的墙:M8-era C=8 TTFT p50 ~0.19 s vs vLLM ~0.08 s ≈ ×2.4);测量只是尺子不单独立里程碑。
+3. **A1 主锚(预案,spike 后定硬数)**:官方 `vllm bench serve` 同参同载,**TTFT p50 @C=8 ≤ vLLM ×1.3**;预案不科学时行使一次修正权(M7 段 0 先例)。**本段 0 因事故缺 vLLM λ≥4 官方数,硬数定稿推迟至 before 扫描补全(见 A1 提案小节)。**
+
+### 归因表(torch profiler,N=8×L=128 bf16,GPU 1,`scripts/profile_prefill.py` 三 pass)
+
+方法(为 T1 复现注记):pass1 = kernel 名桶分类(gemm/sdpa/memcpy/elementwise+other);pass2 = `record_function` 打点复刻 `forward_prefill_batch`(产线零改动,monkeypatch 副本)+ chrome trace 解析,**每面 GPU kernel 时间按 kernel External-id → cpu_op → 最内层注解的包含关系归属**(弃 `gpu_user_annotation`:其含面内 GPU idle,测得 88.9ms 为伪值;弃 CUDA event 对:其含 host 间隙);pass3 = 无 profiler 干净跑 `perf_counter` host 分面。
+
+**GPU kernel 面(pass2,/ms 每步;GPU busy = 105.4 ms)**:
+
+| 面 | kernel ms/步 | 占 GPU busy |
+|---|---|---|
+| GEMM 合计(qkv 10.8 + o_proj 7.4 + MLP/lm_head 67.0) | **84.6** | **80.3%** |
+| attention·`view.update` gather | 2.95 | 2.8% |
+| attention·`_repeat_kv` 物化拷贝 | 1.33 | 1.3% |
+| attention·SDPA kernel | 2.32 | 2.2% |
+| norm + rope | 5.57 | 5.3% |
+| elementwise/其他(GEMM 外) | 8.3 | 7.9% |
+| attention 面合计(gather+repeat+sdpa+norm/rope) | 12.2 | 11.6% |
+| **GPU busy 合计** | **105.4** | 100% |
+
+**Host 分面(pass3,干净跑,wall/step = 158.6 ms)**:
+
+| host 面 | ms/步 | 占 wall |
+|---|---|---|
+| **`view.update`(逐 seq gather,288 次调用)** | **124.5** | **≈78%** |
+| `_repeat_kv` | 9.1 | 5.7% |
+| SDPA 调用(逐 seq) | 11.8 | 7.4% |
+| norm+rope | 10.1 | 6.4% |
+
+窗口注记:profiler 窗口 wall 187–195 ms/步(profiler 附加开销),干净 wall 158.6 ms/步;profiler 下 host 间隙 82–89 ms/步。**判读:TTFT 大头不在纯计算——GPU busy 仅 ~105 ms,而 host 面 `view.update` 单面 124.5 ms ≈ 78% wall(结构性逐 seq Python 循环 gather,非 kernel 时间);这是 M8-era C=8 TTFT ×2.4 的主因候选,也是 T1 的靶心。**
+
+### 探针腿(spike,临时不进产线,`scripts/m9_gqa_probe.py` / `m9_chain_probe.py`,GPU 1)
+
+**(a) SDPA `enable_gqa=True` vs `_repeat_kv`(逐位对拍 + 同函数计时)**:
+
+| 腿 | 逐位(torch.equal) | 计时 | 结论 |
+|---|---|---|---|
+| prefill(`is_causal`) | **PASS**(L∈{1,15,16,17,128} × 5 seeds 全过) | 364.7 → 192.6 µs(×1.9) | **可替换**:省 172.1 µs/层 × 36 层 ≈ **6.2 ms/prefill** |
+| extend(`attn_mask`+enable_gqa) | **FAIL**(maxdiff 0.0078) | 1295 vs 643.8 µs(更慢) | mem-efficient 后端拒 gqa → 回落 math 后端;同后端 math-vs-math 对照逐位相等(排除不确定性)→ **extend 保留 repeat 路径** |
+| batched 单调用(N=8 等长 L=128,enable_gqa+is_causal) | **PASS** | 18.3 µs(较逐 seq ~×20) | **可替换**:等长批内一次调用,吃掉逐 seq SDPA host 面(归因 11.8 ms/步) |
+
+**(b) gather-free 直读页可行性(只测,不写 kernel)**:`view.update` 单次调用搬运 ~1 MB(gather 512 KB 读 + scatter 512 KB 写);288 次调用/步(8 seq × 36 层)≈ 288 MB/步;实测 kernel 2.95 ms ≈ 98 GB/s 有效带宽(远低于 4090 HBM 峰值,访存形态劣化)。直读页变体可省 ≈3 ms GPU kernel,且向量化 scatter 可结构性消除 host 124.5 ms 面——**可行,收益上界明确**。
+
+**(c) chunked 拆块行为审计(C=8 满载)**:`chunked_budget=None` → 每请求 chunks=1;burst 全 8 请求 step 0 一次准入,单次 `prefill_batch` N=8 = 167.8 ms。**拆块路径现空转,无油水。**
+
+### 全链拆账(TTFT 链,`scripts/m9_chain_probe.py`,probe server GPU 1 :8201)
+
+- **encode 独立测**:tokenizer batch=8 = **1.44 ms**(可忽略)。
+- **engine 层**:burst C=8 全员 TTFT_server ≈167.8 ms(= prefill N=8 全额,step 0 一次准入);poisson λ=8:零排队,TTFT_server 34.7–65.3 ms(prefill N=1 ≈43 ms;N=7 批 ≈160–167 ms;decode 步 19.8–20 ms)。
+- **HTTP 全链**(8-burst client):TTFT p50 ≈214.6–254.7 ms;分段 = encode 0.2–1.7 ms / **lock 等待(enc_end→submit)≈42–68 ms**(pump 持 asyncio lock 跨整个 step,结构性)/ submit→admit 0.5–1.2 ms / **admit→first_tok_step 166.8 ms(N=7 prefill wave,主项)** / SSE flush+回传 3–5 ms;单请求对照全程 46.9 ms(prefill 43.4 + 3)。
+- 原始 JSONL 活证:同 step 混步(`prefill_batch` 159.65 ms + `decode_batch` 18.6 ms 同 step k=1);decode→re-encode prompt 长度 129–141(非严格 128,tokenizer 边界)。
+
+### before 成绩单(官方 `vllm bench serve`;**事故中断,部分待续**)
+
+**命令模板(plan 原文含 `--random-range-ratio 1`)偏差注记(如实)**:本 build(vllm 0.32.0)**结构性拒绝 ratio 1.0**(`input_range_ratio must be in [0, 1)`,`datasets/utils.py:_resolve_range_ratios`;`RandomDataset.sample` 校验 min_sampled_input ≥1;报错原文存档 `r5_bench_vllm_ratio1_fail.out`)→ **改用 `--random-range-ratio 0`** = 固定 128 token 输入(`get_sampling_params`:input_low=input_high=real_input_len;R5 案 Total input tokens 2048 = 16×128 验证),与 plan 意图(定长 128)一致且更贴合;偏差双侧对称,不影响对比公平。其余同 plan 原文:`--backend openai --dataset-name random --random-input-len 128 --random-output-len 32 --num-prompts 256 --seed 42 --percentile-metrics ttft,itl,e2e`;服务端 GPU 0 :8100 vLLM 0.32.0 bf16(M8 腿 A 命令原样),客户端 `CUDA_VISIBLE_DEVICES=1`,计时前 1 条 warmup 不计入(官方工具默认 num_warmups=0,已注记)。
+
+**R5 首跑哈希(红线;vLLM 侧已完成)**:16 prompts(λ=2 × 16,seed 42)经 capture 代理 :8901(`scripts/m9_capture_proxy.py`)抓取,`/v1/completions` prompt sha256 依序 = `8905a8320ce9c436, 3b7e4620f7de9860, 8c8cf497401dc432, 2a180d08690dadf3, 9856e6615e69abf5, e6e965079c04267a, 55f39a13e2350255, 5a0c856bb9b0f8a8, 60459e1089574422, aba3cd52b6245c27, 1fba83b89dc1caa4, 7403ccb30c9b5c1f, e1bb796133f23622, e68d44ada729bdd8, 5cdd4224ab6305db, 750836bcc7fa3396`(存档 `r5_vllm_seq.json`;代理日志首条为 warmup sha `c6cf1309cd700e5a` 已剔除)。**AcornInfer 侧同序捕获待重启后补,序列逐位比对后 R5 方闭环。**
+
+R5 run 官方输出(λ=2 × 16,vLLM 侧,17:03:17 服务端健康期):
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     16
+Failed requests:                         0
+Request rate configured (RPS):           2.00
+Benchmark duration (s):                  8.60
+Total input tokens:                      2048
+Total generated tokens:                  512
+Request throughput (req/s):              1.86
+Output token throughput (tok/s):         59.53
+Peak output token throughput (tok/s):    92.00
+Peak concurrent requests:                6.00
+Total token throughput (tok/s):          297.64
+---------------Time to First Token----------------
+Mean TTFT (ms):                          43.30
+Median TTFT (ms):                        46.83
+P99 TTFT (ms):                           58.08
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           17.52
+Median ITL (ms):                         17.50
+P99 ITL (ms):                            21.56
+==================================================
+```
+
+before 全 λ 扫(256 prompts,seed 42;**仅 λ=1 有效,余待重启后补**):
+
+- **λ=1(有效,256/256,17:08:36 完成)**:
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     256
+Failed requests:                         0
+Request rate configured (RPS):           1.00
+Benchmark duration (s):                  256.56
+Total input tokens:                      32768
+Total generated tokens:                  8192
+Request throughput (req/s):              1.00
+Output token throughput (tok/s):         31.93
+Peak output token throughput (tok/s):    135.00
+Peak concurrent requests:                6.00
+Total token throughput (tok/s):          159.65
+---------------Time to First Token----------------
+Mean TTFT (ms):                          39.03
+Median TTFT (ms):                        28.94
+P99 TTFT (ms):                           61.64
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           17.34
+Median ITL (ms):                         17.15
+P99 ITL (ms):                            21.73
+==================================================
+```
+
+- **λ=2(作废)**:Xid 79(17:08:42)中段服务端崩溃,20 成功/236 失败;原样存档 `sweep_vllm_l2.out`,不入成绩单。
+- **λ=4/8/16/32(未跑)**:客户端启动期 NVML `NVMLError_Unknown`(同事故驱动态);存档 `sweep_vllm_l{4,8,16,32}.out`。
+- **AcornInfer 全 λ(未跑)**:服务端未及部署(事故);待重启后双侧补齐本小节。
+
+**事故记录(dmesg 原样 + 时间线)**:
+
+```
+[Mon Nov  2 17:08:42 2026] NVRM: Xid (PCI:0000:b1:00): 79, GPU has fallen off the bus.
+[Mon Nov  2 17:08:42 2026] NVRM: GPU 0000:b1:00.0: GPU has fallen off the bus.
+[Mon Nov  2 17:08:42 2026] NVRM: Xid (PCI:0000:b1:00): 154, GPU recovery action changed from 0x0 (None) to 0x2 (Node Reboot Required)
+[Mon Nov  2 17:08:42 2026] NVRM: Xid (PCI:0000:c7:00): 154, GPU recovery action changed from 0x0 (None) to 0x2 (Node Reboot Required)
+```
+
+时间线:17:03:17 R5 捕获完成(服务端健康)→ 17:04–17:08:36 λ=1 跑完(256/256)→ 17:08:42 Xid 79/154 → 17:08:55 vLLM APIServer 500 后关停(EngineCore force kill)→ 17:11 nvidia-smi 仅见 GPU 1(4 MiB)、GPU 0 句柄丢失;CUDA 全机 `cuda available: False`(torch `CUDA unknown error`)。前史注记(如实):GPU 1(PCI c7:00)近 27 h 内两起**无关进程** Xid 31 MMU fault(11-01 14:11 pid 3680790、11-02 11:13 pid 2940142)——本机 GPU 稳定性此前已有征兆;本事故负载(128×32 小请求,λ≤2)与归因脚本均无软件诱因指向。处置:不动电、不重启(共享节点,留用户),证据持久化 `/home/ernest/m9t0_archive/`,待重启后双侧补测续写。
+
+### A1 硬数定稿提案(段 0 材料;**因事故缺 λ≥4 官方数,推迟定稿**)
+
+证据方向(已测):官方 λ=1 vLLM TTFT p50 = **28.94 ms**;引擎层 λ=8 poisson TTFT_server p50 ≈ **53 ms**(零排队);HTTP 全链 C=8 burst p50 ≈ **214.6 ms**(其中 lock 等待 42–68 ms + N=7 prefill wave 166.8 ms 为主项)。归因上界:host `view.update` 124.5 ms ≈ 78% wall + gqa −6.2 ms + batched SDPA host −11.8 ms + gather-free kernel −3 ms → T1 全兑现理论上可把满载 TTFT 从 ~215 ms 量级压至 ~50–60 ms 量级,即接近 vLLM λ=8 p50 的 1.0–1.2×。**判断:预案 ×1.3 锚在 T1 兑现后大概率科学,M8-era ×2.4 现状下不可达;修正权行使与否待 before 扫描补全(vLLM λ=8 p50 官方数到手)由控制器段 0 裁决,仪式当日不许换锚(M7 先例)。**
+
+### 条件任务激活建议(激活条款 = 归因占比 ≥10% 且预期收益 ≥5 ms,AND)
+
+| 任务 | 占比 | 预期收益 | 建议 |
+|---|---|---|---|
+| **T1 prefill/extend attention 改造** | GPU attention 面 12.2/105.4 = **11.6% ≥10%** ✓;host 面 `view.update` 124.5 ms ≈78% wall(结构性) | gqa 逐位安全替换 −6.2 ms kernel + batched SDPA host −11.8 ms + gather-free −3 ms kernel/消除 host 面 → **合计 ≥5 ms 明确** ✓ | **建议激活(本段 0 唯一激活项)** |
+| T2 GEMM 面 | 84.6/105.4 = 80.3% ≥10% ✓ | 已近硬件峰值(有效 ~168 TFLOPS,等长无 padding 浪费),预期 <5 ms ✗(AND 不满足) | 不激活 |
+| T3 chunked 拆块 | chunks=1 空转,占比 0 ✗ | 无收益面 ✗ | 不激活 |
+| T4 全链 host/flush 面 | encode 0.2–1.7 ms、flush 3–5 ms,各 <5 ms ✗ | lock 等待 42–68 ms 为 step 时长结构性副产物(prefill wave 本身即 T1 靶),单独收无锚收益 ✗ | 不激活 |
+
+### M9 段 0 口径注记(照前节同款)
+
+同日同机(RTX 4090 ×2):归因/探针/链路 probe 物理 GPU 1(零产线改动,`record_function` monkeypatch 副本复刻 `qwen3.py:291-334` 契约,产线 diff 仅 scripts/);before 服务端物理 GPU 0(vLLM 0.32.0 bf16 :8100,M8 腿 A 命令原样;AcornInfer :8200 全配方 `--attention-backend triton --fused-ops --cuda-graph` 待重启后部署),压测客户端 `CUDA_VISIBLE_DEVICES=1` 零 GPU 占用;timeout ≥1800 s;关服纪律 `ss -tlnp` 真身 PID 定向 kill(nginx 18200 / lq-server 18201 为驻留服务不碰);bench 口径 = 官方 `vllm bench serve` 原文,`--random-range-ratio 0` 偏差已注记(上文);R5 = capture 代理 sha256 序列双侧比对;证据归档 `/tmp/opencode/m9t0/` + 持久副本 `/home/ernest/m9t0_archive/`;本节树 = 3f22d49 + 本任务 commit。
